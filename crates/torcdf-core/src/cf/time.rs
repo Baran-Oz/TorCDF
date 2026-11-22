@@ -242,6 +242,10 @@ fn parse_epoch(s: &str) -> Option<(i64, i64, i64, f64)> {
         let sign = if z.starts_with('-') { -1.0 } else { 1.0 };
         // Accepted: hh, hhmm, hh:mm.
         let digits = z[1..].trim();
+        // ASCII-only first, so the byte slicing below cannot split a char.
+        if !digits.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+            return None;
+        }
         let (zh, zm): (f64, f64) = match digits.split_once(':') {
             Some((h, m)) if h.len() <= 2 && m.len() == 2 => (h.parse().ok()?, m.parse().ok()?),
             Some(_) => return None,
@@ -249,7 +253,7 @@ fn parse_epoch(s: &str) -> Option<(i64, i64, i64, f64)> {
             None if (1..=2).contains(&digits.len()) => (digits.parse().ok()?, 0.0),
             None => return None,
         };
-        if !digits.bytes().all(|b| b.is_ascii_digit() || b == b':') || zh > 23.0 || zm > 59.0 {
+        if zh > 23.0 || zm > 59.0 {
             return None;
         }
         offset_secs = sign * (zh * 3600.0 + zm * 60.0);
