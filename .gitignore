@@ -1,0 +1,5 @@
+/target/
+.superpowers/
+*.nc
+*.h5
+*.hdf5
