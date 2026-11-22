@@ -311,3 +311,20 @@ fn calendar_round_trip() {
         }
     }
 }
+
+#[test]
+fn non_ascii_whitespace_separator_does_not_panic() {
+    // U+00A0 and U+3000 are multi-byte Unicode whitespace; must never panic.
+    for sep in ["\u{a0}", "\u{3000}"] {
+        let u = format!("days since 2000-01-01{sep}00:00:00");
+        assert_eq!(dt(&u, None, 1.0), "2000-01-02 00:00", "{u:?}");
+    }
+}
+
+#[test]
+fn milliseconds_unit() {
+    for u in ["milliseconds", "millisecond", "msec", "ms"] {
+        assert_eq!(dt(&format!("{u} since 2000-01-01"), None, 86_400_000.0), "2000-01-02 00:00", "{u}");
+    }
+    assert_eq!(dt("ms since 2000-01-01", None, 1500.0), "2000-01-01 00:00:01.500");
+}

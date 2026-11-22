@@ -171,6 +171,7 @@ impl TimeUnits {
         let lower = units.trim().to_ascii_lowercase();
         let (unit, epoch) = lower.split_once(" since ")?;
         let unit_secs = match unit.trim() {
+            "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => 0.001,
             "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
             "min" | "mins" | "minute" | "minutes" => 60.0,
             "h" | "hr" | "hrs" | "hour" | "hours" => 3600.0,
@@ -218,8 +219,10 @@ impl TimeUnits {
 /// (year, month, day, seconds-of-day in UTC).
 fn parse_epoch(s: &str) -> Option<(i64, i64, i64, f64)> {
     let s = s.trim();
-    let (date, rest) = match s.find(|c: char| c == 't' || c.is_whitespace()) {
-        Some(i) => (&s[..i], s[i + 1..].trim()),
+    let sep = s.char_indices().find(|&(_, c)| c == 't' || c.is_whitespace());
+    let (date, rest) = match sep {
+        // Skip the separator by its own UTF-8 length (it may be multi-byte).
+        Some((i, c)) => (&s[..i], s[i + c.len_utf8()..].trim()),
         None => (s, ""),
     };
     let mut dp = date.split('-');
