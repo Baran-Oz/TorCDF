@@ -1,0 +1,8 @@
+[package]
+name = "torcdf-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+netcdf = { version = "0.12", features = ["static"] }
+netcdf-sys = "0.9"
