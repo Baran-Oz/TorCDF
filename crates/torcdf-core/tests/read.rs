@@ -125,3 +125,54 @@ fn reads_coordinates() {
     let n: usize = v.shape.iter().product();
     assert_eq!(c.read_coord(&v.path.clone()).unwrap().len(), n);
 }
+
+#[test]
+fn read_strings_nc_string() {
+    let (_d, f) = nc4();
+    let all = f.read_strings("/ocean/label", &[0], &[24]).unwrap();
+    let want: Vec<String> = (0..24).map(|i| format!("step-{i}")).collect();
+    assert_eq!(all, want);
+    assert_eq!(f.read_strings("/ocean/label", &[5], &[3]).unwrap(), ["step-5", "step-6", "step-7"]);
+}
+
+/// NC_CHAR element for writing a char-array fixture.
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct NcChar(u8);
+unsafe impl netcdf::types::NcTypeDescriptor for NcChar {
+    fn type_descriptor() -> netcdf::types::NcVariableType {
+        netcdf::types::NcVariableType::Char
+    }
+}
+
+#[test]
+fn read_strings_char_array() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("chars.nc");
+    {
+        let mut nc = netcdf::create(&path).unwrap();
+        nc.add_dimension("n", 3).unwrap();
+        nc.add_dimension("strlen", 5).unwrap();
+        let mut v = nc.add_variable::<NcChar>("names", &["n", "strlen"]).unwrap();
+        // NUL-padded rows; the last uses the full width.
+        let raw = b"ab\0\0\0xyz\0\0hello";
+        let vals: Vec<NcChar> = raw.iter().map(|&b| NcChar(b)).collect();
+        v.put_values(&vals, ..).unwrap();
+    }
+    let f = NcFile::open(&path).unwrap();
+    assert_eq!(f.read_strings("/names", &[0, 0], &[3, 5]).unwrap(), ["ab", "xyz", "hello"]);
+    assert_eq!(f.read_strings("/names", &[1, 0], &[2, 5]).unwrap(), ["xyz", "hello"]);
+}
+
+#[test]
+fn read_strings_rejects_numeric_and_bad_requests() {
+    let (_d, f) = nc4();
+    assert!(matches!(
+        f.read_strings("/ocean/uo", &[0, 0, 0], &[1, 1, 1]),
+        Err(CoreError::Unsupported(_))
+    ));
+    assert!(f.read_strings("/ocean/label", &[20], &[5]).is_err()); // past end
+    assert!(f.read_strings("/ocean/label", &[0, 0], &[1, 1]).is_err()); // wrong rank
+    assert!(f.read_strings("/ocean/label", &[0], &[0]).is_err()); // zero count
+    assert!(f.read_strings("/nope", &[0], &[1]).is_err());
+}

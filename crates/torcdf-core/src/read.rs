@@ -5,8 +5,9 @@
 //! hyperslabs and thinning along the last dimension here in Rust.
 
 use crate::cf::Unpack;
-use crate::{CoreError, NcFile, VarInfo};
+use crate::{CoreError, DType, NcFile, VarInfo};
 use netcdf::Extent;
+use std::os::raw::c_char;
 
 /// Largest f64 read buffer, in bytes, used for one netCDF call.
 const BATCH_BYTES: usize = 64 * 1024 * 1024;
@@ -185,6 +186,87 @@ impl NcFile {
         self.read_raw(var_path, &start, &count)
     }
 
+    /// Reads text values of a string (`NC_STRING`) or char (`NC_CHAR`)
+    /// variable over the hyperslab `start`/`count` (stride 1).
+    ///
+    /// A string variable gives one `String` per element. A char variable is
+    /// an array of fixed-width strings whose last dimension is the string
+    /// length: each run of `count[last]` characters becomes one `String`,
+    /// with trailing NULs removed (a scalar char variable gives one string).
+    /// Invalid UTF-8 is replaced, not rejected.
+    pub fn read_strings(
+        &self,
+        var_path: &str,
+        start: &[usize],
+        count: &[usize],
+    ) -> Result<Vec<String>, CoreError> {
+        let err = |msg: String| CoreError::Read { var: var_path.into(), msg };
+        let info = self.meta.var(var_path).ok_or_else(|| err("no such variable".into()))?;
+        if !matches!(info.dtype, DType::Str | DType::Char) {
+            return Err(CoreError::Unsupported(format!(
+                "{var_path}: {:?} variables are not text",
+                info.dtype
+            )));
+        }
+        let n = info.shape.len();
+        if start.len() != n || count.len() != n {
+            return Err(err(format!("request has the wrong rank (variable has {n} dimensions)")));
+        }
+        for d in 0..n {
+            if count[d] == 0 {
+                return Err(err("count must be at least 1".into()));
+            }
+            if start[d].checked_add(count[d]).is_none_or(|end| end > info.shape[d]) {
+                return Err(err(format!(
+                    "dimension {d}: start {} + count {} exceeds length {}",
+                    start[d], count[d], info.shape[d]
+                )));
+            }
+        }
+        let total = count
+            .iter()
+            .try_fold(1usize, |a, &b| a.checked_mul(b))
+            .ok_or_else(|| err("request is too large".into()))?;
+        let extents: Vec<Extent> = start
+            .iter()
+            .zip(count)
+            .map(|(&start, &count)| Extent::SliceCount { start, count, stride: 1 })
+            .collect();
+        let is_str = info.dtype == DType::Str;
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let var = self
+                .file
+                .variable(var_path.trim_start_matches('/'))
+                .ok_or_else(|| "variable not found".to_string())?;
+            let elem = if is_str { std::mem::size_of::<*mut c_char>() } else { 1 };
+            let mut raw = vec![0u8; total * elem];
+            if extents.is_empty() {
+                var.get_raw_values_into(&mut raw, ..)
+            } else {
+                var.get_raw_values_into(&mut raw, extents)
+            }
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(if is_str {
+                // SAFETY: netCDF filled `raw` with `total` string pointers that
+                // it allocated; each is read once, then all are freed.
+                unsafe { take_nc_strings(&raw) }
+            } else {
+                let width = count.last().copied().unwrap_or(1);
+                raw.chunks(width)
+                    .map(|s| {
+                        let end = s.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                        String::from_utf8_lossy(&s[..end]).into_owned()
+                    })
+                    .collect()
+            })
+        }));
+        match res {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(msg)) => Err(err(msg)),
+            Err(_) => Err(err("netCDF read failed unexpectedly".into())),
+        }
+    }
+
     fn numeric_var(&self, path: &str) -> Result<&VarInfo, CoreError> {
         let info = self.meta.var(path).ok_or_else(|| CoreError::Read {
             var: path.into(),
@@ -239,6 +321,33 @@ impl NcFile {
             Err(_) => Err(err("netCDF read failed unexpectedly".into())),
         }
     }
+}
+
+/// Converts a buffer of netCDF-allocated `char*` (native-endian pointer
+/// words) to owned strings and frees them with `nc_free_string`.
+///
+/// # Safety
+/// `raw` must hold only pointers returned by a netCDF string read that have
+/// not been freed yet; null pointers are allowed and read as "".
+unsafe fn take_nc_strings(raw: &[u8]) -> Vec<String> {
+    const W: usize = std::mem::size_of::<*mut c_char>();
+    let mut ptrs: Vec<*mut c_char> = raw
+        .chunks_exact(W)
+        .map(|c| usize::from_ne_bytes(c.try_into().expect("pointer-sized chunk")) as *mut c_char)
+        .collect();
+    let out = ptrs
+        .iter()
+        .map(|&p| {
+            if p.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            }
+        })
+        .collect();
+    let _g = netcdf_sys::libnetcdf_lock.lock();
+    unsafe { netcdf_sys::nc_free_string(ptrs.len(), ptrs.as_mut_ptr()) };
+    out
 }
 
 #[cfg(test)]
