@@ -1,0 +1,237 @@
+//! Background slice reads with an LRU cache and cancellation.
+//!
+//! The UI thread never reads files: it calls [`SliceService::request`], keeps
+//! the returned [`RequestHandle`], and polls it with [`RequestHandle::try_take`]
+//! when `on_ready` wakes it. Dropping a handle cancels its job if no worker has
+//! started it yet.
+
+use crate::{CoreError, NcFile, Slice, SliceRequest};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
+use lru::LruCache;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+
+/// Worker count used when the caller has no preference. netCDF-C serialises
+/// reads, but a second worker overlaps unpacking with the next read.
+pub const DEFAULT_WORKERS: usize = 2;
+
+/// Default cache budget: a quarter of physical RAM (1 GiB if RAM cannot be determined).
+pub fn default_cache_budget_bytes() -> usize {
+    const FALLBACK: u64 = 4 << 30;
+    let total = sysinfo::System::new()
+        .map(|mut s| {
+            s.refresh_memory();
+            s.total_memory()
+        })
+        .unwrap_or(0);
+    let total = if total == 0 { FALLBACK } else { total };
+    usize::try_from(total / 4).unwrap_or(usize::MAX)
+}
+
+type Key = (PathBuf, SliceRequest);
+type Outcome = Result<Arc<Slice>, CoreError>;
+
+/// LRU map plus a running byte total.
+struct Cache {
+    lru: LruCache<Key, Arc<Slice>>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl Cache {
+    fn get(&mut self, key: &Key) -> Option<Arc<Slice>> {
+        self.lru.get(key).cloned()
+    }
+
+    /// Inserts `slice`, evicting least-recently-used entries until the total
+    /// is within budget. A slice larger than the budget is not stored.
+    fn insert(&mut self, key: Key, slice: Arc<Slice>) {
+        let size = slice.byte_size();
+        if size > self.budget {
+            return;
+        }
+        if let Some(old) = self.lru.put(key, slice) {
+            self.bytes -= old.byte_size();
+        }
+        self.bytes += size;
+        while self.bytes > self.budget {
+            match self.lru.pop_lru() {
+                Some((_, old)) => self.bytes -= old.byte_size(),
+                None => break,
+            }
+        }
+    }
+}
+
+struct Job {
+    file: Arc<NcFile>,
+    req: SliceRequest,
+    cancelled: Arc<AtomicBool>,
+    reply: Sender<Outcome>,
+}
+
+struct Shared {
+    cache: Mutex<Cache>,
+    reads: AtomicUsize,
+    on_ready: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Shared {
+    /// A poisoned lock only means another thread panicked; the cache itself
+    /// is always left consistent, so keep using it.
+    fn lock(&self) -> MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+pub struct SliceService {
+    shared: Arc<Shared>,
+    jobs: Option<Sender<Job>>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl SliceService {
+    pub fn new(
+        cache_budget_bytes: usize,
+        workers: usize,
+        on_ready: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let shared = Arc::new(Shared {
+            cache: Mutex::new(Cache {
+                lru: LruCache::unbounded(),
+                bytes: 0,
+                budget: cache_budget_bytes,
+            }),
+            reads: AtomicUsize::new(0),
+            on_ready,
+        });
+        let (tx, rx) = unbounded::<Job>();
+        let workers = (0..workers.max(1))
+            .map(|i| {
+                let (shared, rx) = (shared.clone(), rx.clone());
+                std::thread::Builder::new()
+                    .name(format!("torcdf-slice-{i}"))
+                    .spawn(move || worker(&shared, &rx))
+                    .expect("spawn slice worker")
+            })
+            .collect();
+        SliceService { shared, jobs: Some(tx), workers }
+    }
+
+    /// Queues a read. A cache hit resolves the handle at once, without
+    /// involving a worker. Dropping the handle cancels the job if it has not
+    /// started.
+    pub fn request(&self, file: &Arc<NcFile>, req: SliceRequest) -> RequestHandle {
+        let (reply, rx) = bounded::<Outcome>(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let key = (file.meta.path.clone(), req.clone());
+        if let Some(hit) = self.shared.lock().get(&key) {
+            let _ = reply.send(Ok(hit));
+        } else if let Some(jobs) = &self.jobs {
+            let job = Job { file: file.clone(), req: req.clone(), cancelled: cancelled.clone(), reply };
+            let _ = jobs.send(job);
+        }
+        RequestHandle { req, cancelled, rx, finished: false }
+    }
+
+    /// The cached slice for `req`, if present (marks it recently used).
+    pub fn cached(&self, file: &NcFile, req: &SliceRequest) -> Option<Arc<Slice>> {
+        self.shared.lock().get(&(file.meta.path.clone(), req.clone()))
+    }
+
+    /// Number of reads actually performed against files (cache hits and
+    /// cancelled jobs excluded).
+    pub fn reads_performed(&self) -> usize {
+        self.shared.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SliceService {
+    fn drop(&mut self) {
+        // Closing the channel ends each worker's loop once the queue drains
+        // (queued jobs are skipped quickly if their handles are gone).
+        self.jobs.take();
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
+
+fn worker(shared: &Shared, rx: &Receiver<Job>) {
+    while let Ok(job) = rx.recv() {
+        if job.cancelled.load(Ordering::SeqCst) {
+            continue;
+        }
+        let key = (job.file.meta.path.clone(), job.req.clone());
+        // Another job for the same slice may have finished while this waited.
+        let hit = shared.lock().get(&key);
+        let outcome = match hit {
+            Some(s) => Ok(s),
+            None => {
+                shared.reads.fetch_add(1, Ordering::SeqCst);
+                // No lock is held during the read.
+                let read = catch_unwind(AssertUnwindSafe(|| job.file.read_slice(&job.req)));
+                match read {
+                    Ok(Ok(slice)) => {
+                        let slice = Arc::new(slice);
+                        shared.lock().insert(key, slice.clone());
+                        Ok(slice)
+                    }
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(CoreError::Read {
+                        var: job.req.var.clone(),
+                        msg: "the read failed unexpectedly".into(),
+                    }),
+                }
+            }
+        };
+        let _ = job.reply.send(outcome);
+        // A panicking callback must not kill the worker.
+        let _ = catch_unwind(AssertUnwindSafe(|| (shared.on_ready)()));
+    }
+}
+
+/// Pending result of a [`SliceService::request`]. Dropping it cancels the
+/// request if a worker has not started it.
+pub struct RequestHandle {
+    req: SliceRequest,
+    cancelled: Arc<AtomicBool>,
+    rx: Receiver<Outcome>,
+    finished: bool,
+}
+
+impl RequestHandle {
+    /// The result, once ready. Returns `Some` exactly once; `None` while the
+    /// read is pending (and after the result was taken).
+    pub fn try_take(&mut self) -> Option<Result<Arc<Slice>, CoreError>> {
+        match self.rx.try_recv() {
+            Ok(r) => {
+                self.finished = true;
+                Some(r)
+            }
+            Err(TryRecvError::Empty) => None,
+            // The job was dropped without a reply (service shut down).
+            Err(TryRecvError::Disconnected) if !self.finished => {
+                self.finished = true;
+                Some(Err(CoreError::Read {
+                    var: self.req.var.clone(),
+                    msg: "the read was abandoned".into(),
+                }))
+            }
+            Err(TryRecvError::Disconnected) => None,
+        }
+    }
+
+    pub fn req(&self) -> &SliceRequest {
+        &self.req
+    }
+}
+
+impl Drop for RequestHandle {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
