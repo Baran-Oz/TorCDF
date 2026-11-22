@@ -1,5 +1,7 @@
 //! Drawing of the main window's panels, plus small formatting helpers.
 
+#[allow(dead_code)] // used from Task 10
+pub mod colorbar;
 pub mod inspector;
 pub mod plot_area;
 pub mod tree;
