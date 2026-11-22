@@ -65,57 +65,6 @@ impl Colormap {
 }
 
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn near(c: [u8; 4], want: [i32; 3]) -> bool {
-        (0..3).all(|i| (c[i] as i32 - want[i]).abs() <= 2) && c[3] == 255
-    }
-
-    #[test]
-    fn viridis_known_entries() {
-        let l = Colormap::Viridis.lut();
-        assert!(near(l[0], [68, 1, 84]), "{:?}", l[0]);
-        assert!(near(l[128], [33, 145, 140]), "{:?}", l[128]);
-        assert!(near(l[255], [253, 231, 37]), "{:?}", l[255]);
-    }
-
-    #[test]
-    fn diverging_blue_low_red_high_light_middle() {
-        let l = Colormap::Diverging.lut();
-        assert!(l[0][2] > l[0][0] + 50, "low should be blue: {:?}", l[0]);
-        assert!(l[255][0] > l[255][2] + 50, "high should be red: {:?}", l[255]);
-        let m = l[128];
-        assert!(m[0] > 200 && m[1] > 200 && m[2] > 200, "middle should be near white: {m:?}");
-    }
-
-    #[test]
-    fn topo_blue_below_land_above() {
-        let l = Colormap::Topo.lut();
-        for c in &l[..128] {
-            assert!(c[2] > c[0] && c[2] >= c[1], "below 128 must be blue: {c:?}");
-        }
-        assert!(l[0][2] < l[127][2] || l[0][0] < l[127][0], "deep darker than shallow");
-        let low_land = l[130];
-        assert!(low_land[1] > low_land[0] && low_land[1] > low_land[2], "greenish: {low_land:?}");
-        let top = l[255];
-        assert!(top[0] > 230 && top[1] > 230 && top[2] > 230, "white at top: {top:?}");
-        let mid = l[192];
-        assert!(mid[0] > mid[2], "brownish between: {mid:?}");
-    }
-
-    #[test]
-    fn all_opaque_named_and_listed() {
-        assert_eq!(Colormap::all().len(), 3);
-        for c in Colormap::all() {
-            assert!(!c.name().is_empty());
-            assert!(c.lut().iter().all(|e| e[3] == 255));
-        }
-        assert_eq!(Colormap::all()[0], Colormap::Viridis);
-    }
-}
-
 // Matplotlib's `_viridis_data` (256 entries, Stefan van der Walt and Nathaniel
 // Smith, CC0), rounded to 8 bits. Data only.
 const VIRIDIS: [[u8; 3]; 256] = [
@@ -376,3 +325,54 @@ const VIRIDIS: [[u8; 3]; 256] = [
     [251, 231, 35],
     [253, 231, 37],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn near(c: [u8; 4], want: [i32; 3]) -> bool {
+        (0..3).all(|i| (c[i] as i32 - want[i]).abs() <= 2) && c[3] == 255
+    }
+
+    #[test]
+    fn viridis_known_entries() {
+        let l = Colormap::Viridis.lut();
+        assert!(near(l[0], [68, 1, 84]), "{:?}", l[0]);
+        assert!(near(l[128], [33, 145, 140]), "{:?}", l[128]);
+        assert!(near(l[255], [253, 231, 37]), "{:?}", l[255]);
+    }
+
+    #[test]
+    fn diverging_blue_low_red_high_light_middle() {
+        let l = Colormap::Diverging.lut();
+        assert!(l[0][2] > l[0][0] + 50, "low should be blue: {:?}", l[0]);
+        assert!(l[255][0] > l[255][2] + 50, "high should be red: {:?}", l[255]);
+        let m = l[128];
+        assert!(m[0] > 200 && m[1] > 200 && m[2] > 200, "middle should be near white: {m:?}");
+    }
+
+    #[test]
+    fn topo_blue_below_land_above() {
+        let l = Colormap::Topo.lut();
+        for c in &l[..128] {
+            assert!(c[2] > c[0] && c[2] >= c[1], "below 128 must be blue: {c:?}");
+        }
+        assert!(l[0][2] < l[127][2] || l[0][0] < l[127][0], "deep darker than shallow");
+        let low_land = l[130];
+        assert!(low_land[1] > low_land[0] && low_land[1] > low_land[2], "greenish: {low_land:?}");
+        let top = l[255];
+        assert!(top[0] > 230 && top[1] > 230 && top[2] > 230, "white at top: {top:?}");
+        let mid = l[192];
+        assert!(mid[0] > mid[2], "brownish between: {mid:?}");
+    }
+
+    #[test]
+    fn all_opaque_named_and_listed() {
+        assert_eq!(Colormap::all().len(), 3);
+        for c in Colormap::all() {
+            assert!(!c.name().is_empty());
+            assert!(c.lut().iter().all(|e| e[3] == 255));
+        }
+        assert_eq!(Colormap::all()[0], Colormap::Viridis);
+    }
+}

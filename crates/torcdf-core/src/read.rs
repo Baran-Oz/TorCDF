@@ -135,10 +135,8 @@ impl NcFile {
                 start[d] = r.start[d] + idx[d] * r.stride[d];
                 count[d] = 1;
             }
-            for d in m..last {
-                start[d] = r.start[d];
-                count[d] = r.count[d];
-            }
+            start[m..last].copy_from_slice(&r.start[m..last]);
+            count[m..last].copy_from_slice(&r.count[m..last]);
             let base = outer * block_out;
             let mut done = 0;
             while done < shape[last] {
@@ -332,8 +330,10 @@ impl NcFile {
 unsafe fn take_nc_strings(raw: &[u8]) -> Vec<String> {
     const W: usize = std::mem::size_of::<*mut c_char>();
     let mut ptrs: Vec<*mut c_char> = raw
-        .chunks_exact(W)
-        .map(|c| usize::from_ne_bytes(c.try_into().expect("pointer-sized chunk")) as *mut c_char)
+        .as_chunks::<W>()
+        .0
+        .iter()
+        .map(|c| usize::from_ne_bytes(*c) as *mut c_char)
         .collect();
     let out = ptrs
         .iter()

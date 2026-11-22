@@ -85,13 +85,14 @@ fn classify(c: &VarInfo) -> Option<Kind> {
     let conflicting_std = attr_str(c, "standard_name").is_some();
     let conflicting_units = attr_str(c, "units")
         .is_some_and(|u| !u.to_ascii_lowercase().starts_with("degree"));
-    if !conflicting_std && !conflicting_units {
-        if let Some(axis) = attr_str(c, "axis") {
-            match axis.to_ascii_uppercase().as_str() {
-                "Y" => return Some(Kind::Lat),
-                "X" => return Some(Kind::Lon),
-                _ => {}
-            }
+    if !conflicting_std
+        && !conflicting_units
+        && let Some(axis) = attr_str(c, "axis")
+    {
+        match axis.to_ascii_uppercase().as_str() {
+            "Y" => return Some(Kind::Lat),
+            "X" => return Some(Kind::Lon),
+            _ => {}
         }
     }
     match c.name.to_ascii_lowercase().as_str() {

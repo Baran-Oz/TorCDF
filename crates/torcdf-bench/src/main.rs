@@ -276,8 +276,7 @@ fn cmd_gen(out: &str, like: &str, var: &str, target_gb: u64) -> Res<()> {
                 let ph = (t + dt) as f64 / 24.0;
                 let (sp, cp) = (ph.sin(), ph.cos());
                 let slab = &mut buf[dt * lat * lon..(dt + 1) * lat * lon];
-                for i in 0..lat {
-                    let ls = lat_s[i];
+                for (i, &ls) in lat_s.iter().enumerate().take(lat) {
                     for j in 0..lon {
                         let idx = i * lon + j;
                         slab[idx] = if land[idx] {

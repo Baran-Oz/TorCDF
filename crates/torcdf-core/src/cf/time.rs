@@ -45,7 +45,7 @@ impl Calendar {
         }
     }
 
-    fn from_days(self, n: i64) -> (i64, i64, i64) {
+    fn days_to_date(self, n: i64) -> (i64, i64, i64) {
         match self {
             Calendar::ProlepticGregorian => jdn_to_gregorian(n),
             Calendar::Julian => jdn_to_julian(n),
@@ -198,7 +198,7 @@ impl TimeUnits {
             sod -= SECS_PER_DAY;
             days += 1.0;
         }
-        let (y, m, d) = self.calendar.from_days(self.epoch_day + days as i64);
+        let (y, m, d) = self.calendar.days_to_date(self.epoch_day + days as i64);
         let whole = sod.floor();
         let hour = (whole / 3600.0) as u8;
         let minute = ((whole - hour as f64 * 3600.0) / 60.0) as u8;

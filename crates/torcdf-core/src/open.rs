@@ -192,19 +192,6 @@ fn u64s_to_attr(v: Vec<u64>) -> AttrValue {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn u64_attrs_do_not_wrap() {
-        assert_eq!(u64s_to_attr(vec![5, 7]), AttrValue::Ints(vec![5, 7]));
-        assert_eq!(u64s_to_attr(vec![i64::MAX as u64]), AttrValue::Ints(vec![i64::MAX]));
-        let big = u64::MAX - 1;
-        assert_eq!(u64s_to_attr(vec![1, big]), AttrValue::Floats(vec![1.0, big as f64]));
-    }
-}
-
 // ---- format and storage via the raw C API ---------------------------------
 //
 // The netcdf crate exposes neither the file format nor deflate/filter info,
@@ -308,4 +295,17 @@ fn nc_message(code: c_int) -> String {
         return format!("netCDF error {code}");
     }
     unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u64_attrs_do_not_wrap() {
+        assert_eq!(u64s_to_attr(vec![5, 7]), AttrValue::Ints(vec![5, 7]));
+        assert_eq!(u64s_to_attr(vec![i64::MAX as u64]), AttrValue::Ints(vec![i64::MAX]));
+        let big = u64::MAX - 1;
+        assert_eq!(u64s_to_attr(vec![1, big]), AttrValue::Floats(vec![1.0, big as f64]));
+    }
 }
