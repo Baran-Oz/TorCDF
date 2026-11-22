@@ -335,7 +335,9 @@ impl MapState {
     }
 
     /// Plans the detail tiles for the resting camera; the plan is kept for
-    /// `VarView::start_detail` unless it equals the current one.
+    /// `VarView::start_detail` unless it equals the current one or the
+    /// current tiles already cover it (same stride, every visible window
+    /// inside a current tile: a pan within the margin re-reads nothing).
     pub fn plan_detail_for(
         &mut self,
         full: [usize; 2],
@@ -345,10 +347,12 @@ impl MapState {
     ) {
         let Some(loc) = &self.locator else { return };
         let t = Instant::now();
-        let mut plan = plan_detail(loc, full, &self.camera, rect, ppp, overview);
+        let detail = plan_detail(loc, full, &self.camera, rect, ppp, overview);
+        let covered = detail.covered_by(&self.plan);
+        let mut plan = detail.tiles;
         plan.truncate(MAP_DETAIL_IDS.len());
         self.activity = "detail plan";
-        if plan != self.plan {
+        if plan != self.plan && !covered {
             self.note(|| {
                 format!("detail plan {plan:?} ({:.1} ms)", t.elapsed().as_secs_f64() * 1e3)
             });
@@ -1308,7 +1312,7 @@ mod tests {
             let mut cam = MapCamera::new(Projection::Equirectangular);
             cam.fit(&[(lo0, la0), (lo1, la1)], rect);
             let t = Instant::now();
-            let plan = plan_detail(&loc, full, &cam, rect, 1.0, &overview);
+            let plan = plan_detail(&loc, full, &cam, rect, 1.0, &overview).tiles;
             println!("{name}: plan {plan:?} in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             for spec in plan {
                 let req = tile_request(&var, &axes, &vec![0; var.shape.len()], &spec);
@@ -1377,6 +1381,39 @@ mod tests {
         assert!(!m.detail_due(&ctx, rect()), "moving restarts the clock");
         std::thread::sleep(DETAIL_DELAY + Duration::from_millis(20));
         assert!(m.detail_due(&ctx, rect()));
+    }
+
+    #[test]
+    fn small_pan_keeps_the_detail_plan() {
+        let geo = Geo::Regular { lat_dim: 0, lon_dim: 1, lat_var: "/lat".into(), lon_var: "/lon".into() };
+        let mut m = MapState::new(&geo);
+        let (ny, nx) = (43200, 86400);
+        let lat = (0..ny).map(|i| -90.0 + i as f64 / 240.0).collect();
+        let lon = (0..nx).map(|i| -180.0 + i as f64 / 240.0).collect();
+        m.locator = CellLocator::regular(lat, lon);
+        let (full, ov) = ([ny, nx], TileSpec::overview(ny, nx));
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0));
+        m.camera = MapCamera::new(Projection::Equirectangular);
+        m.camera.fit(&[(5.0, 40.0), (15.0, 50.0)], r);
+        m.plan_detail_for(full, r, 1.0, &ov);
+        let first = m.take_wanted().expect("zoomed in: detail wanted");
+        assert_eq!(first.len(), 1);
+        m.set_plan(first.clone());
+        // Small pan: the held tile covers the view, nothing is re-read.
+        m.camera.pan(vec2(20.0, -15.0));
+        m.plan_detail_for(full, r, 1.0, &ov);
+        assert_eq!(m.take_wanted(), None);
+        // Pan beyond the held tile: a new read.
+        m.camera.pan(vec2(300.0, 0.0));
+        m.plan_detail_for(full, r, 1.0, &ov);
+        let moved = m.take_wanted().expect("pan beyond the tile re-plans");
+        assert_eq!(moved[0].stride, first[0].stride);
+        m.set_plan(moved.clone());
+        // Zoom in: a finer stride is needed.
+        m.camera.zoom_at(r.center(), 3.0, r);
+        m.plan_detail_for(full, r, 1.0, &ov);
+        let zoomed = m.take_wanted().expect("zoom in re-plans");
+        assert!(zoomed[0].stride[0] < moved[0].stride[0], "{zoomed:?} vs {moved:?}");
     }
 
     #[test]

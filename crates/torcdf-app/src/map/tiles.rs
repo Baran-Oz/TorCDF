@@ -30,6 +30,14 @@ impl TileSpec {
         [0, 1].map(|a| self.count[a].div_ceil(self.stride[a].max(1)))
     }
 
+    /// True when `other`'s index window lies inside this tile's.
+    pub fn contains(&self, other: &TileSpec) -> bool {
+        (0..2).all(|a| {
+            self.start[a] <= other.start[a]
+                && other.start[a] + other.count[a] <= self.start[a] + self.count[a]
+        })
+    }
+
     /// Tile texel nearest to full-resolution cell `(iy, ix)`, if the cell is
     /// inside the tile's extent.
     pub fn nearest_texel(&self, iy: usize, ix: usize) -> Option<[usize; 2]> {
@@ -53,6 +61,7 @@ pub const DETAIL_TRIGGER: f64 = 1.5;
 
 /// Largest texture side of a tile.
 const MAX_SIDE: usize = 2048;
+const _: () = assert!(OVERVIEW_TARGET <= MAX_SIDE);
 /// Sample points per screen axis (edges included).
 const SAMPLES: usize = 33;
 
@@ -62,7 +71,8 @@ const SAMPLES: usize = 33;
 /// included) through the camera and `loc.nearest`; misses are skipped. The
 /// window is the hit bounding box (on a lon-wrapping grid: the complement of
 /// the largest circular gap in the hit columns, split in two when it crosses
-/// the seam), widened by 10% per side and clamped to `full`.
+/// the seam), widened by 10% per side and clamped to `full`. The plan also
+/// keeps each tile's window before the margin (`core`).
 ///
 /// `window_px`, the framebuffer extent the window covers on an axis, is
 /// `rect_px * hit_fraction * window_cells / hit_cells`, where `hit_fraction`
@@ -74,12 +84,12 @@ pub fn plan_detail(
     rect: Rect,
     pixels_per_point: f32,
     overview: &TileSpec,
-) -> Vec<TileSpec> {
+) -> DetailPlan {
     let ppp = pixels_per_point as f64;
     let rect_px = [rect.height() as f64 * ppp, rect.width() as f64 * ppp];
     let sane = |v: f64| v.is_finite() && v > 0.0;
     if full.contains(&0) || !sane(rect_px[0]) || !sane(rect_px[1]) {
-        return Vec::new();
+        return DetailPlan::default();
     }
     let (mut ys, mut xs) = (Vec::new(), Vec::new());
     // Sample rows / columns that hit: [min, max].
@@ -104,7 +114,7 @@ pub fn plan_detail(
         }
     }
     if ys.is_empty() {
-        return Vec::new();
+        return DetailPlan::default();
     }
     let frac = |a: usize| (span[a][1] - span[a][0] + 1) as f64 / SAMPLES as f64;
 
@@ -145,21 +155,44 @@ pub fn plan_detail(
     for a in 0..2 {
         let px = (rect_px[a] * frac(a) * win_cells[a] as f64 / core_cells[a] as f64).max(1.0);
         stride[a] = ((win_cells[a] as f64 / px).floor() as usize).max(1);
+        // Never coarser than the overview on any axis, then the texture cap.
+        // For the app's overview (OVERVIEW_TARGET <= MAX_SIDE per side) the
+        // cap cannot undo the first: the window lies inside the grid.
+        stride[a] = stride[a].min(overview.stride[a].max(1));
         stride[a] = stride[a].max(longest[a].div_ceil(MAX_SIDE));
     }
 
     let needed = (0..2).any(|a| overview.stride[a] as f64 > DETAIL_TRIGGER * stride[a] as f64);
     if !needed {
-        return Vec::new();
+        return DetailPlan::default();
     }
-    x_win
-        .into_iter()
-        .map(|(l, h)| TileSpec {
-            start: [y_win.0, l],
-            count: [y_win.1 - y_win.0 + 1, h - l + 1],
-            stride,
-        })
-        .collect()
+    let spec = |y: (usize, usize), (l, h): (usize, usize)| TileSpec {
+        start: [y.0, l],
+        count: [y.1 - y.0 + 1, h - l + 1],
+        stride,
+    };
+    DetailPlan {
+        tiles: x_win.iter().map(|&x| spec(y_win, x)).collect(),
+        core: x_core.iter().map(|&x| spec(y_core, x)).collect(),
+    }
+}
+
+/// The detail tiles to read and, for each, the window it must cover: the
+/// same tile before the 10% margin.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DetailPlan {
+    pub tiles: Vec<TileSpec>,
+    pub core: Vec<TileSpec>,
+}
+
+impl DetailPlan {
+    /// True when the tiles `held` (planned earlier) already give what this
+    /// plan needs: every core window lies inside a held tile of the same
+    /// stride. Reading this plan would then add no detail.
+    pub fn covered_by(&self, held: &[TileSpec]) -> bool {
+        !self.core.is_empty()
+            && self.core.iter().all(|c| held.iter().any(|h| h.stride == c.stride && h.contains(c)))
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +220,7 @@ mod tests {
         let mut cam = MapCamera::new(Projection::Equirectangular);
         cam.fit(&[(-180.0, -90.0), (179.99, 90.0)], r);
         let ov = TileSpec::overview(full[0], full[1]);
-        assert!(plan_detail(&loc, full, &cam, r, 1.0, &ov).is_empty());
+        assert!(plan_detail(&loc, full, &cam, r, 1.0, &ov).tiles.is_empty());
     }
 
     #[test]
@@ -198,7 +231,7 @@ mod tests {
         let mut cam = MapCamera::new(Projection::Equirectangular);
         cam.fit(&[(5.0, 40.0), (15.0, 50.0)], r);
         let ov = TileSpec::overview(full[0], full[1]);
-        let t = plan_detail(&loc, full, &cam, r, 1.0, &ov);
+        let t = plan_detail(&loc, full, &cam, r, 1.0, &ov).tiles;
         assert_eq!(t.len(), 1);
         let t = t[0];
         // lat 40..50 is rows 31200..33600; margin is about 10% of the window.
@@ -218,7 +251,7 @@ mod tests {
         cam.scale = 1000.0 / 20f64.to_radians();
         let ov = TileSpec::overview(full[0], full[1]);
         assert_eq!(ov.stride, [9, 18]);
-        let t = plan_detail(&loc, full, &cam, r, 1.0, &ov);
+        let t = plan_detail(&loc, full, &cam, r, 1.0, &ov).tiles;
         assert_eq!(t.len(), 2, "{t:?}");
         assert!(t.iter().any(|t| t.start[1] == 0), "{t:?}");
         assert!(t.iter().any(|t| t.start[1] + t.count[1] == 36000), "{t:?}");
@@ -235,7 +268,7 @@ mod tests {
         cam.zoom_at(r.center(), 10.0, r);
         let ov = TileSpec::overview(full[0], full[1]);
         assert_eq!(ov.stride, [1, 1]);
-        assert!(plan_detail(&loc, full, &cam, r, 1.0, &ov).is_empty());
+        assert!(plan_detail(&loc, full, &cam, r, 1.0, &ov).tiles.is_empty());
     }
 
     #[test]
@@ -243,9 +276,9 @@ mod tests {
         let loc = regular(10, 10, 1.0, 0.0, 1.0, 0.0);
         let cam = MapCamera::new(Projection::Equirectangular);
         let ov = TileSpec::overview(10, 10);
-        assert!(plan_detail(&loc, [10, 10], &cam, rect(0.0, 0.0), 1.0, &ov).is_empty());
-        assert!(plan_detail(&loc, [0, 0], &cam, rect(100.0, 100.0), 1.0, &ov).is_empty());
-        assert!(plan_detail(&loc, [10, 10], &cam, rect(100.0, 100.0), 0.0, &ov).is_empty());
+        assert!(plan_detail(&loc, [10, 10], &cam, rect(0.0, 0.0), 1.0, &ov).tiles.is_empty());
+        assert!(plan_detail(&loc, [0, 0], &cam, rect(100.0, 100.0), 1.0, &ov).tiles.is_empty());
+        assert!(plan_detail(&loc, [10, 10], &cam, rect(100.0, 100.0), 0.0, &ov).tiles.is_empty());
     }
 
     #[test]
@@ -256,5 +289,56 @@ mod tests {
         assert_eq!(t.nearest_texel(23, 44), Some([1, 1]));
         assert_eq!(t.nearest_texel(43200, 0), None);
         assert!(t.shape().iter().all(|&n| n <= OVERVIEW_TARGET));
+    }
+
+    #[test]
+    fn detail_stride_never_coarser_than_overview() {
+        // Rows dense (1/240 degree, overview stride 22), columns sparse
+        // enough for the overview to hold them all (2000 of 0.005 degree):
+        // at 50 px per degree the rows need detail; the columns, several per pixel,
+        // must not get a tile coarser than the overview.
+        let loc = regular(43200, 2000, 1.0 / 240.0, 0.0, 0.005, -90.0);
+        let full = [43200, 2000];
+        let r = rect(1000.0, 800.0);
+        let mut cam = MapCamera::new(Projection::Equirectangular);
+        cam.centre = [10f64.to_radians(), 0.0];
+        cam.scale = 1000.0 / 20f64.to_radians();
+        let ov = TileSpec::overview(full[0], full[1]);
+        assert_eq!(ov.stride, [22, 1]);
+        let t = plan_detail(&loc, full, &cam, r, 1.0, &ov).tiles;
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert!(t[0].stride[0] < 22, "{t:?}");
+        assert_eq!(t[0].stride[1], 1, "{t:?}");
+        assert!(t[0].shape().iter().all(|&n| n <= MAX_SIDE), "{t:?}");
+    }
+
+    #[test]
+    fn held_tiles_cover_small_pans_only() {
+        let loc = regular(43200, 86400, 1.0 / 240.0, -180.0, 1.0 / 240.0, -90.0);
+        let full = [43200, 86400];
+        let r = rect(1000.0, 800.0);
+        let ov = TileSpec::overview(full[0], full[1]);
+        let mut cam = MapCamera::new(Projection::Equirectangular);
+        cam.fit(&[(5.0, 40.0), (15.0, 50.0)], r);
+        let held = plan_detail(&loc, full, &cam, r, 1.0, &ov);
+        assert_eq!(held.tiles.len(), 1);
+        assert!(held.covered_by(&held.tiles));
+        assert!(!DetailPlan::default().covered_by(&held.tiles), "an empty plan clears");
+        // A small pan moves the window but stays inside the margin.
+        let mut c = cam;
+        c.pan(eframe::egui::vec2(20.0, -15.0));
+        let p = plan_detail(&loc, full, &c, r, 1.0, &ov);
+        assert_ne!(p.tiles, held.tiles);
+        assert!(p.covered_by(&held.tiles), "{p:?} vs {held:?}");
+        // A pan beyond the held tile needs a read.
+        let mut c = cam;
+        c.pan(eframe::egui::vec2(300.0, 0.0));
+        assert!(!plan_detail(&loc, full, &c, r, 1.0, &ov).covered_by(&held.tiles));
+        // Zooming in needs a finer stride.
+        let mut c = cam;
+        c.zoom_at(r.center(), 3.0, r);
+        let p = plan_detail(&loc, full, &c, r, 1.0, &ov);
+        assert!(p.tiles[0].stride[0] < held.tiles[0].stride[0], "{p:?} vs {held:?}");
+        assert!(!p.covered_by(&held.tiles));
     }
 }
