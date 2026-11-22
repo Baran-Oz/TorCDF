@@ -36,6 +36,22 @@ pub struct Curvi {
     /// Great-circle distance (radians) from each cell to its nearest valid
     /// 4-neighbour (up/down/left/right); 0 for isolated or invalid cells.
     nn: Vec<f32>,
+    /// Search radius (radians): twice the 99.9th-percentile `nn`. A lookup
+    /// finds the true nearest cell whenever it lies within this radius, and
+    /// nothing otherwise. A percentile, not the maximum, so a few cells with
+    /// junk coordinates cannot widen every search to the whole grid.
+    reach: f64,
+}
+
+/// [`Curvi::reach`] of the neighbour distances `nn`.
+fn reach_of(nn: &[f32]) -> f64 {
+    let mut d: Vec<f32> = nn.iter().copied().filter(|&v| v > 0.0).collect();
+    if d.is_empty() {
+        return 0.0;
+    }
+    let k = ((d.len() - 1) as f64 * 0.999).round() as usize;
+    let (_, v, _) = d.select_nth_unstable_by(k, f32::total_cmp);
+    2.0 * *v as f64
 }
 
 /// Fill values (1e20 and friends) and NaN count as missing coordinates.
@@ -186,6 +202,7 @@ impl CellLocator {
             .collect();
         c.start = start;
         c.cells = cells;
+        c.reach = reach_of(&nn);
         c.nn = nn;
         c.lat = lat;
         c.lon = lon;
@@ -269,30 +286,81 @@ impl Curvi {
             start: vec![0, 0],
             cells: Vec::new(),
             nn: Vec::new(),
+            reach: 0.0,
         }
     }
 
     fn bucket_of(&self, lon: f64, lat: f64) -> usize {
-        let (by, bx) = self.axes(lon, lat);
-        by * self.nb + bx
+        self.lat_bucket(lat) * self.nb + self.lon_bucket(wrap180(lon))
     }
 
-    fn axes(&self, lon: f64, lat: f64) -> (usize, usize) {
-        let ax = |v: f64, v0: f64, step: f64| (((v - v0) / step).floor().max(0.0) as usize).min(self.nb - 1);
-        (ax(lat, self.lat0, self.lat_step), ax(wrap180(lon), self.lon0, self.lon_step))
+    /// Bucket index of `v` on an axis starting at `v0`, clamped to the grid.
+    fn ax(&self, v: f64, v0: f64, step: f64) -> usize {
+        (((v - v0) / step).floor().max(0.0) as usize).min(self.nb - 1)
     }
 
+    fn lat_bucket(&self, lat: f64) -> usize {
+        self.ax(lat, self.lat0, self.lat_step)
+    }
+
+    /// `lon` already wrapped into [-180, 180).
+    fn lon_bucket(&self, lon: f64) -> usize {
+        self.ax(lon, self.lon0, self.lon_step)
+    }
+
+    /// Bucket columns (inclusive ranges, at most two) holding every cell
+    /// within `r` degrees of (`lon`, `lat`). Buckets are fixed in degrees,
+    /// so the lon half-width grows towards the poles: a point within `r` of
+    /// the query has `sin(dlon/2) <= sin(r/2) / sqrt(cos(lat) cos(lat'))`,
+    /// `lat'` the band edge nearer the pole. A band reaching a pole, or a
+    /// half-width of 180 or more, takes all columns. Otherwise the lon
+    /// window is split at the dateline, so the last and first columns of a
+    /// grid crossing it are searched together.
+    fn lon_ranges(&self, lon: f64, lat: f64, r: f64) -> Vec<(usize, usize)> {
+        let all = vec![(0, self.nb - 1)];
+        let edge = lat.abs() + r;
+        if edge >= 90.0 {
+            return all;
+        }
+        let c = (lat.to_radians().cos() * edge.to_radians().cos()).sqrt();
+        let s = (0.5 * r.to_radians()).sin() / c;
+        if s >= 1.0 {
+            return all;
+        }
+        let half = 2.0 * s.asin().to_degrees();
+        if half >= 180.0 {
+            return all;
+        }
+        let lon = wrap180(lon);
+        let (a, b) = (lon - half, lon + half);
+        let span = |lo: f64, hi: f64| (self.lon_bucket(lo), self.lon_bucket(hi));
+        if a < -180.0 {
+            vec![span(a + 360.0, 180.0), span(-180.0, b)]
+        } else if b >= 180.0 {
+            vec![span(a, 180.0), span(-180.0, b - 360.0)]
+        } else {
+            vec![span(a, b)]
+        }
+    }
+
+    /// The valid cell nearest (`lon`, `lat`), searched within [`Curvi::reach`]
+    /// (see [`Curvi::lon_ranges`]), and accepted only within twice its own
+    /// neighbour distance.
     fn nearest(&self, lon: f64, lat: f64) -> Option<(usize, usize)> {
         if self.cells.is_empty() {
             return None;
         }
         let q = unit(lon, lat);
-        let (by, bx) = self.axes(lon, lat);
+        let r = self.reach.to_degrees();
+        let rows = self.lat_bucket(lat - r)..=self.lat_bucket(lat + r);
+        let cols = self.lon_ranges(lon, lat, r);
         let mut best: Option<(f64, usize)> = None;
-        for y in by.saturating_sub(1)..=(by + 1).min(self.nb - 1) {
-            for x in bx.saturating_sub(1)..=(bx + 1).min(self.nb - 1) {
-                let b = y * self.nb + x;
-                for &i in &self.cells[self.start[b] as usize..self.start[b + 1] as usize] {
+        for y in rows {
+            for &(x0, x1) in &cols {
+                let b0 = y * self.nb + x0;
+                let b1 = y * self.nb + x1;
+                // Buckets x0..=x1 of a row are contiguous in the CSR layout.
+                for &i in &self.cells[self.start[b0] as usize..self.start[b1 + 1] as usize] {
                     let i = i as usize;
                     let d = angle(q, unit(self.lon[i], self.lat[i]));
                     if best.is_none_or(|(bd, _)| d < bd) {
@@ -301,8 +369,9 @@ impl Curvi {
                 }
             }
         }
+        // Beyond `reach` a nearer cell may lie in a bucket not searched.
         let (d, i) = best?;
-        (d <= 2.0 * self.nn[i] as f64).then_some((i / self.nx, i % self.nx))
+        (d <= self.reach.min(2.0 * self.nn[i] as f64)).then_some((i / self.nx, i % self.nx))
     }
 }
 
@@ -431,11 +500,77 @@ mod tests {
 
     #[test]
     fn curvilinear_crossing_dateline() {
-        // 1 x 4 row of cells at lon 178, 179, 180 (= -180), 181 (= -179).
-        let lon = vec![178.0, 179.0, 180.0, 181.0];
-        let l = CellLocator::curvilinear(vec![0.0; 4], lon, 1, 4);
-        assert_eq!(l.nearest(-179.0, 0.0), Some((0, 3)));
-        assert_eq!(l.nearest(179.1, 0.0), Some((0, 1)));
+        // 4 x 40 cells of 1 degree, lon 160..199 (180 and beyond wrap to
+        // -180..-161): 13 x 13 buckets, so lon 179 and 180 sit in the first
+        // and last bucket columns.
+        let (ny, nx) = (4, 40);
+        let (mut lat, mut lon) = (Vec::new(), Vec::new());
+        for iy in 0..ny {
+            for ix in 0..nx {
+                lat.push(iy as f64);
+                lon.push(160.0 + ix as f64);
+            }
+        }
+        let l = CellLocator::curvilinear(lat.clone(), lon.clone(), ny, nx);
+        let CellLocator::Curvilinear(c) = &l else { unreachable!() };
+        assert!(c.nb > 3, "nb = {}", c.nb);
+        for i in 0..ny * nx {
+            assert_eq!(l.nearest(lon[i], lat[i]), Some((i / nx, i % nx)));
+        }
+        assert_eq!(l.nearest(179.6, 1.0), Some((1, 20)));
+        assert_eq!(l.nearest(-179.6, 1.0), Some((1, 20)));
+        assert_eq!(l.nearest(179.4, 1.0), Some((1, 19)));
+        assert_eq!(l.nearest(179.4 - 360.0, 2.0), Some((2, 19)));
+    }
+
+    /// Spherical north polar stereographic grid: `n` x `n` cells of `km`
+    /// kilometres centred on the pole (an even `n` puts the pole between
+    /// four cells), as sea-ice products ship it.
+    fn polar_stereo(n: usize, km: f64) -> (Vec<f64>, Vec<f64>) {
+        let r = 6371.0;
+        let (mut lat, mut lon) = (Vec::new(), Vec::new());
+        for iy in 0..n {
+            for ix in 0..n {
+                let x = (ix as f64 - (n as f64 - 1.0) / 2.0) * km;
+                let y = (iy as f64 - (n as f64 - 1.0) / 2.0) * km;
+                let c = 2.0 * (x.hypot(y) / (2.0 * r)).atan();
+                lat.push(90.0 - c.to_degrees());
+                lon.push(x.atan2(-y).to_degrees());
+            }
+        }
+        (lat, lon)
+    }
+
+    /// Distance (radians) from (`lon`, `lat`) to the nearest valid cell, by
+    /// brute force.
+    fn brute(c: &Curvi, lon: f64, lat: f64) -> f64 {
+        let q = unit(lon, lat);
+        (0..c.lat.len())
+            .filter(|&i| valid(c.lon[i], c.lat[i]))
+            .map(|i| angle(q, unit(c.lon[i], c.lat[i])))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    #[test]
+    fn curvilinear_polar_stereo_near_pole() {
+        let n = 100;
+        let (lat, lon) = polar_stereo(n, 25.0);
+        assert!(lat.iter().filter(|&&la| la > 85.0).count() > 100);
+        let l = CellLocator::curvilinear(lat.clone(), lon.clone(), n, n);
+        for i in 0..n * n {
+            assert_eq!(l.nearest(lon[i], lat[i]), Some((i / n, i % n)), "cell at lat {}", lat[i]);
+        }
+        // Points between cells, all around the pole, find a nearest cell (by
+        // distance: at the pole itself four cells tie).
+        let CellLocator::Curvilinear(c) = &l else { unreachable!() };
+        for la in [84.0, 87.5, 89.0, 89.7, 89.95, 90.0] {
+            for k in 0..72 {
+                let lo = -180.0 + 5.0 * k as f64 + 0.3;
+                let (iy, ix) = l.nearest(lo, la).unwrap_or_else(|| panic!("({lo}, {la}) found nothing"));
+                let got = angle(unit(lo, la), unit(lon[iy * n + ix], lat[iy * n + ix]));
+                assert!((got - brute(c, lo, la)).abs() < 1e-12, "({lo}, {la}) -> ({iy}, {ix})");
+            }
+        }
     }
 
     #[test]
