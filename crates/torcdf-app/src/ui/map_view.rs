@@ -103,9 +103,11 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
     }
 
     // Detail tiles: planned once the camera has rested, then read and
-    // uploaded as a set. Moving the camera never reads anything.
-    let due = map.detail_due(ui.ctx(), rect);
-    if let (true, Some(spec)) = (due, spec) {
+    // uploaded as a set. Moving the camera never reads anything. The rest is
+    // only consumed once there is an overview to plan against.
+    if let Some(spec) = spec
+        && map.detail_due(ui.ctx(), rect)
+    {
         map.plan_detail_for(full, rect, ui.ctx().pixels_per_point(), &spec);
     }
     map.prepare_detail(ui.ctx(), rs, axes, &v.coords, full);
