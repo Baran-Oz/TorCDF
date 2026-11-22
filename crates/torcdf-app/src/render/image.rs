@@ -65,6 +65,8 @@ pub enum UploadError {
     Empty,
     TooLarge { ny: usize, nx: usize, max: usize },
     LengthMismatch { expected: usize, got: usize },
+    /// A coordinate axis is not finite and strictly monotonic, or has the wrong length.
+    BadCoords(&'static str),
 }
 
 impl std::fmt::Display for UploadError {
@@ -77,6 +79,7 @@ impl std::fmt::Display for UploadError {
             UploadError::LengthMismatch { expected, got } => {
                 write!(f, "image data has {got} values, expected {expected}")
             }
+            UploadError::BadCoords(why) => write!(f, "bad coordinates: {why}"),
         }
     }
 }
@@ -122,7 +125,7 @@ pub fn paint(ui: &mut egui::Ui, rect: egui::Rect, layer: &ImageLayer, p: &ImageP
     ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, callback));
 }
 
-fn check_shape(len: usize, ny: usize, nx: usize, max: usize) -> Result<(), UploadError> {
+pub(super) fn check_shape(len: usize, ny: usize, nx: usize, max: usize) -> Result<(), UploadError> {
     if ny == 0 || nx == 0 {
         return Err(UploadError::Empty);
     }
@@ -138,7 +141,7 @@ fn check_shape(len: usize, ny: usize, nx: usize, max: usize) -> Result<(), Uploa
 /// `(offset, scale)` such that `t = (w - offset) * scale`, where `w` is the
 /// value, or its log2 in log mode (normalising log2 equals normalising log10).
 /// A degenerate range gives scale 0, mapping every valid value to `t = 0`.
-fn normalisation(range: (f32, f32), log: bool) -> (f32, f32) {
+pub(super) fn normalisation(range: (f32, f32), log: bool) -> (f32, f32) {
     let (lo, hi) = if log { (range.0.log2(), range.1.log2()) } else { range };
     let span = hi - lo;
     if lo.is_finite() && span.is_finite() && span != 0.0 {
