@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 /// An open file: its structure plus the netCDF handle used for later reads.
 pub struct NcFile {
     pub meta: Dataset,
-    // Read by the slice-reading code added in a later task.
-    #[allow(dead_code)]
-    file: netcdf::File,
+    pub(crate) file: netcdf::File,
 }
 
 impl NcFile {
