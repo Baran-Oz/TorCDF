@@ -4,6 +4,7 @@
 
 use rayon::prelude::*;
 
+use super::valid_lonlat as valid;
 use crate::render::map_regular::{lon_window_start, strictly_monotonic, unwrap_lon};
 
 /// Finds the cell containing or nearest to a lon/lat.
@@ -52,11 +53,6 @@ fn reach_of(nn: &[f32]) -> f64 {
     let k = ((d.len() - 1) as f64 * 0.999).round() as usize;
     let (_, v, _) = d.select_nth_unstable_by(k, f32::total_cmp);
     2.0 * *v as f64
-}
-
-/// Fill values (1e20 and friends) and NaN count as missing coordinates.
-fn valid(lon: f64, lat: f64) -> bool {
-    lon.is_finite() && lat.is_finite() && lat.abs() <= 90.0
 }
 
 /// Longitude wrapped into [-180, 180).
@@ -495,6 +491,10 @@ mod tests {
         // Fill values are missing, not coordinates.
         let l = CellLocator::curvilinear(vec![1e20, 0.0], vec![1e20, 0.0], 1, 2);
         assert_eq!(l.nearest(0.0, 0.0), Some((0, 1)));
+        assert_eq!(l.sample_lonlat(4), vec![(0.0, 0.0)]);
+        // A fill longitude with a plausible latitude is missing too (as in
+        // the mesh).
+        let l = CellLocator::curvilinear(vec![0.0, 0.0], vec![1e20, 0.0], 1, 2);
         assert_eq!(l.sample_lonlat(4), vec![(0.0, 0.0)]);
     }
 

@@ -6,12 +6,10 @@ use std::f64::consts::{PI, TAU};
 
 use super::projection::Projection;
 use super::tiles::TileSpec;
+use super::valid_lonlat as valid;
 
 /// Largest mesh side (vertices) the app builds: at most 257 x 257 vertices.
 pub const MESH_MAX_SIDE: usize = 257;
-
-/// Longitudes beyond this are fill values, not coordinates.
-const MAX_ABS_LON: f64 = 720.0;
 
 /// Mesh in geographic coordinates. `lonlat` is `[lon, lat]` degrees, `texel`
 /// is the vertex's tile-texture coordinate `[x, y]` (column, row; the texel
@@ -35,10 +33,6 @@ fn lattice(n: usize, max_side: usize) -> Vec<usize> {
     let mut v: Vec<usize> = (0..n - 1).step_by(k).collect();
     v.push(n - 1);
     v
-}
-
-fn valid(lon: f64, lat: f64) -> bool {
-    lon.is_finite() && lat.is_finite() && lat.abs() <= 90.0 && lon.abs() <= MAX_ABS_LON
 }
 
 /// Builds the mesh of `tile` from the full-resolution row-major `lat`/`lon`
