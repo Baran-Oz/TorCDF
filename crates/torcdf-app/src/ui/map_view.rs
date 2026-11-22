@@ -58,6 +58,7 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
     let loading = v.loading();
     let (Some(axes), Some(map)) = (v.axes, v.map.as_mut()) else { return false };
     v.hover = None;
+    map.activity = "";
     map.hovering = false;
     map.pointer = None;
     if map.locator.is_none() {
@@ -98,6 +99,14 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
         }
     }
 
+    // Detail tiles: planned once the camera has rested, then read and
+    // uploaded as a set. Moving the camera never reads anything.
+    let due = map.detail_due(ui.ctx(), rect);
+    if let (true, Some(spec)) = (due, spec) {
+        map.plan_detail_for(full, rect, ui.ctx().pixels_per_point(), &spec);
+    }
+    map.prepare_detail(ui.ctx(), rs, axes, &v.coords, full);
+
     // Hover: pointer -> lon/lat -> cell -> value.
     if let Some(pos) = resp.hover_pos() {
         map.hovering = true;
@@ -119,6 +128,16 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
             paint_curvilinear(ui, rect, &t.gpu, &p);
         } else {
             paint_regular(ui, rect, &t.gpu, &p);
+        }
+    }
+    if let Some(range) = range {
+        let p = MapParams { range, colormap: display.colormap, log: display.log, camera };
+        for t in map.drawable_details() {
+            if map.is_curvilinear() {
+                paint_curvilinear(ui, rect, &t.gpu, &p);
+            } else {
+                paint_regular(ui, rect, &t.gpu, &p);
+            }
         }
     }
     let wrap = map.camera.proj.wraps_x();

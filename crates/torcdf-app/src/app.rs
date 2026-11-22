@@ -21,7 +21,7 @@ use crate::view::defaults::ViewKind;
 use crate::view::var_view::{Display, ImageState, VarView};
 
 /// Frames slower than this are logged (UI-thread stalls).
-const SLOW_FRAME_MS: f64 = 30.0;
+const SLOW_FRAME_MS: f64 = 20.0;
 
 /// A result produced on a helper thread.
 pub struct Job<T> {
@@ -80,6 +80,10 @@ impl DebugLog {
         });
         let select = std::env::var("TORCDF_SELECT").ok().filter(|_| tx.is_some());
         DebugLog { tx, t0: Instant::now(), select }
+    }
+
+    fn enabled(&self) -> bool {
+        self.tx.is_some()
     }
 
     fn log(&mut self, msg: impl std::fmt::Display) {
@@ -264,6 +268,9 @@ impl TorApp {
             if let Some((nc, var)) = var {
                 self.log.log(format_args!("select {}", var.path));
                 let mut v = VarView::new(&self.ctx, *id, nc, var);
+                if let (true, Some(m)) = (self.log.enabled(), &mut v.map) {
+                    m.events = Some(Vec::new());
+                }
                 v.refresh(&self.ctx, &self.service);
                 self.view = Some(v);
                 self.display.lock = false;
@@ -407,6 +414,10 @@ impl eframe::App for TorApp {
             })
             .inner;
         ui::drop_overlay(ui.ctx());
+        // Detail reads start only after the map has planned them for a resting camera.
+        if let Some(v) = &mut self.view {
+            v.start_detail(&self.service);
+        }
 
         if uploaded && !self.first_image_logged {
             self.first_image_logged = true;
@@ -433,8 +444,19 @@ impl eframe::App for TorApp {
             self.apply(a);
         }
         let took = ms(frame_start);
-        if took > SLOW_FRAME_MS {
-            self.log.log(format_args!("slow frame: {took:.1} ms"));
+        if let Some(m) = self.view.as_mut().and_then(|v| v.map.as_mut())
+            && let Some(events) = m.events.as_mut()
+        {
+            for e in std::mem::take(events) {
+                self.log.log(e);
+            }
+        }
+        if took > SLOW_FRAME_MS && self.log.enabled() {
+            let doing = self.view.as_ref().map_or(String::new(), |v| {
+                let activity = v.map.as_ref().map_or("", |m| m.activity);
+                format!("view {:?}, map activity \"{activity}\", uploaded {uploaded}", v.kind)
+            });
+            self.log.log(format_args!("slow frame: {took:.1} ms ({doing})"));
         }
     }
 }

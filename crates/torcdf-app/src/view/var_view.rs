@@ -350,6 +350,32 @@ impl VarView {
             // Keeping the handle keeps the request alive.
             None => self.pending = Some(handle),
         }
+        // A slider move re-reads the detail tiles for the new position.
+        self.request_detail(service);
+    }
+
+    /// Requests the detail plan the map just made, if any (the map is shown
+    /// and the camera has rested). Reads run on the service's workers.
+    pub fn start_detail(&mut self, service: &SliceService) {
+        let Some(map) = self.map.as_mut() else { return };
+        let Some(plan) = map.take_wanted() else { return };
+        map.set_plan(plan);
+        self.request_detail(service);
+    }
+
+    /// (Re)requests every tile of the map's current detail plan at the
+    /// current slider position. Tiles on show stay until the new ones arrive.
+    fn request_detail(&mut self, service: &SliceService) {
+        let (Some(map), Some(axes)) = (self.map.as_mut(), self.axes) else { return };
+        if self.kind != ViewKind::Map {
+            return;
+        }
+        let plan = map.restart_detail();
+        map.detail_requested_now();
+        for spec in plan {
+            let req = tile_request(&self.var, &axes, &self.slider_pos, &spec);
+            map.track_detail(spec, service.request(&self.nc, req));
+        }
     }
 
     /// Takes a finished read; true if it went on show at once.
@@ -423,6 +449,9 @@ impl VarView {
         };
         if let Some(why) = self.map.as_mut().and_then(MapState::poll_locator) {
             self.fall_back_to_image(&why);
+        }
+        if let Some(m) = &mut self.map {
+            m.poll_detail();
         }
         if let Some(r) = self.text_job.as_ref().and_then(Job::poll) {
             self.text_job = None;

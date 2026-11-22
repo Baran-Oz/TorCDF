@@ -6,11 +6,12 @@
 //! uploads finished results. Panning and zooming change `camera` alone.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{Rect, pos2};
 use eframe::egui_wgpu::RenderState;
-use torcdf_core::Slice;
 use torcdf_core::cf::Geo;
+use torcdf_core::{RequestHandle, Slice};
 
 use crate::app::Job;
 use crate::map::basemap::{borders, coastlines};
@@ -19,7 +20,7 @@ use crate::map::graticule::{graticule_step, graticule_window};
 use crate::map::locate::CellLocator;
 use crate::map::mesh::{CurvMesh, MESH_MAX_SIDE, MeshVertex, build_mesh, project_mesh};
 use crate::map::projection::Projection;
-use crate::map::tiles::TileSpec;
+use crate::map::tiles::{TileSpec, plan_detail};
 use crate::render::image::UploadError;
 use crate::render::lines::{project_polylines, upload_lines};
 use crate::render::map_curv::{set_curvilinear_mesh, upload_curvilinear};
@@ -27,8 +28,9 @@ use crate::render::map_regular::{MapTile, upload_regular};
 use crate::view::defaults::AxisChoice;
 use crate::view::var_view::Coords;
 
+/// The camera must rest this long before detail tiles are planned.
+pub const DETAIL_DELAY: Duration = Duration::from_millis(300);
 pub const MAP_OVERVIEW_ID: u64 = 10;
-#[allow(dead_code)] // used from Task 11
 pub const MAP_DETAIL_IDS: [u64; 2] = [11, 12];
 pub const COAST_ID: u64 = 20;
 pub const BORDERS_ID: u64 = 21;
@@ -222,6 +224,35 @@ pub struct MapState {
     pub hovering: bool,
     /// Lon/lat under the pointer, when it is on the globe.
     pub pointer: Option<(f64, f64)>,
+    /// The detail tiles asked for (at most 2), whether or not they arrived.
+    plan: Vec<TileSpec>,
+    /// Reads in flight for `plan`; dropping them cancels the unstarted ones.
+    handles: Vec<(TileSpec, RequestHandle)>,
+    /// Tiles of `plan` read but not yet on the GPU (uploaded together).
+    arrived: Vec<(TileSpec, Arc<Slice>)>,
+    detail_requested: Instant,
+    /// Detail tiles on screen; held until the next plan's tiles all arrive.
+    detail: Vec<DetailTile>,
+    detail_meshes: Vec<MeshSet>,
+    detail_mesh_jobs: Vec<((TileSpec, Projection), Job<MeshSet>)>,
+    detail_mesh_failed: Vec<(TileSpec, Projection)>,
+    /// Camera and rect size last seen, and when they last changed.
+    seen: Option<(MapCamera, [f32; 2])>,
+    seen_at: Instant,
+    /// The plan for the current resting camera was made.
+    planned: bool,
+    /// A plan waiting for `VarView::start_detail` to request it.
+    wanted: Option<Vec<TileSpec>>,
+    /// Debug log lines (`TORCDF_LOG`); `None` when logging is off.
+    pub events: Option<Vec<String>>,
+    /// What the map last did this frame, for the slow-frame log.
+    pub activity: &'static str,
+}
+
+/// A detail tile on the GPU, with the projection of its mesh (curvilinear).
+struct DetailTile {
+    tile: Tile,
+    mesh_proj: Option<Projection>,
 }
 
 impl MapState {
@@ -252,7 +283,157 @@ impl MapState {
             overlay_problem: None,
             hovering: false,
             pointer: None,
+            plan: Vec::new(),
+            handles: Vec::new(),
+            arrived: Vec::new(),
+            detail_requested: Instant::now(),
+            detail: Vec::new(),
+            detail_meshes: Vec::new(),
+            detail_mesh_jobs: Vec::new(),
+            detail_mesh_failed: Vec::new(),
+            seen: None,
+            seen_at: Instant::now(),
+            planned: false,
+            wanted: None,
+            events: None,
+            activity: "",
         }
+    }
+
+    fn note(&mut self, msg: impl FnOnce() -> String) {
+        if let Some(e) = &mut self.events {
+            e.push(msg());
+        }
+    }
+
+    /// True once per rest: [`DETAIL_DELAY`] after the camera (or the rect)
+    /// last changed. Until then a repaint is scheduled for that moment.
+    pub fn detail_due(&mut self, ctx: &eframe::egui::Context, rect: Rect) -> bool {
+        let now = (self.camera, [rect.width(), rect.height()]);
+        if self.seen != Some(now) {
+            self.seen = Some(now);
+            self.seen_at = Instant::now();
+            self.planned = false;
+        }
+        if self.planned {
+            return false;
+        }
+        let left = DETAIL_DELAY.saturating_sub(self.seen_at.elapsed());
+        if left.is_zero() {
+            self.planned = true;
+            true
+        } else {
+            ctx.request_repaint_after(left);
+            false
+        }
+    }
+
+    /// Plans the detail tiles for the resting camera; the plan is kept for
+    /// `VarView::start_detail` unless it equals the current one.
+    pub fn plan_detail_for(
+        &mut self,
+        full: [usize; 2],
+        rect: Rect,
+        ppp: f32,
+        overview: &TileSpec,
+    ) {
+        let Some(loc) = &self.locator else { return };
+        let t = Instant::now();
+        let mut plan = plan_detail(loc, full, &self.camera, rect, ppp, overview);
+        plan.truncate(MAP_DETAIL_IDS.len());
+        self.activity = "detail plan";
+        if plan != self.plan {
+            self.note(|| {
+                format!("detail plan {plan:?} ({:.1} ms)", t.elapsed().as_secs_f64() * 1e3)
+            });
+            self.wanted = Some(plan);
+        }
+    }
+
+    pub fn take_wanted(&mut self) -> Option<Vec<TileSpec>> {
+        self.wanted.take()
+    }
+
+    /// Makes `plan` current: reads for the old one are dropped. The tiles on
+    /// show stay until the new ones arrive; an empty plan clears them.
+    pub fn set_plan(&mut self, mut plan: Vec<TileSpec>) {
+        plan.truncate(MAP_DETAIL_IDS.len());
+        self.plan = plan;
+        self.handles.clear();
+        self.arrived.clear();
+        let keep = |s: &TileSpec| self.plan.contains(s) || self.detail.iter().any(|d| d.tile.spec == *s);
+        self.detail_meshes.retain(|m| keep(&m.spec));
+        self.detail_mesh_failed.retain(|(s, _)| keep(s));
+        if self.plan.is_empty() {
+            self.detail.clear();
+            self.detail_meshes.clear();
+            self.detail_mesh_jobs.clear();
+        }
+    }
+
+    /// Forgets all detail tiles and plans (the view kind changed).
+    fn clear_detail(&mut self) {
+        self.set_plan(Vec::new());
+        self.wanted = None;
+        self.planned = false;
+    }
+
+    /// Takes the read of detail tile `spec` unless it is no longer in the
+    /// plan (a stale result). True when stored.
+    pub fn accept_detail(&mut self, spec: TileSpec, slice: Arc<Slice>) -> bool {
+        if !self.plan.contains(&spec) || self.arrived.iter().any(|a| a.0 == spec) {
+            return false;
+        }
+        self.arrived.push((spec, slice));
+        true
+    }
+
+    /// Starts tracking the read of detail tile `spec`; a cache hit arrives at
+    /// once.
+    pub fn track_detail(&mut self, spec: TileSpec, handle: RequestHandle) {
+        self.note(|| format!("detail request {spec:?}"));
+        self.handles.push((spec, handle));
+        self.poll_detail();
+    }
+
+    /// Collects finished detail reads. A failed read leaves its tile out of
+    /// the plan (and is not retried until the camera next rests).
+    pub fn poll_detail(&mut self) {
+        let mut i = 0;
+        while i < self.handles.len() {
+            let Some(r) = self.handles[i].1.try_take() else {
+                i += 1;
+                continue;
+            };
+            let (spec, _) = self.handles.remove(i);
+            let ms = self.detail_requested.elapsed().as_secs_f64() * 1e3;
+            match r {
+                Ok(slice) => {
+                    let stored = self.accept_detail(spec, slice);
+                    self.note(|| format!("detail tile {spec:?} arrived {ms:.1} ms after request, kept {stored}"));
+                }
+                Err(e) => {
+                    self.plan.retain(|s| *s != spec);
+                    if self.plan.is_empty() {
+                        self.detail.clear();
+                    }
+                    self.note(|| format!("detail tile {spec:?} failed after {ms:.1} ms: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Marks the time detail requests were issued (for the debug log).
+    pub fn detail_requested_now(&mut self) {
+        self.detail_requested = Instant::now();
+    }
+
+    /// Drops reads and arrivals for a re-request of the same plan (slider
+    /// move); returns the plan. The tiles on show stay.
+    pub fn restart_detail(&mut self) -> Vec<TileSpec> {
+        self.handles.clear();
+        self.arrived.clear();
+        self.plan.clone()
     }
 
     pub fn is_curvilinear(&self) -> bool {
@@ -279,6 +460,7 @@ impl MapState {
         self.overview = None;
         self.tried = None;
         self.mesh_on_gpu = None;
+        self.clear_detail();
     }
 
     /// Starts building the locator from the coordinates just read. `Err`
@@ -388,6 +570,7 @@ impl MapState {
             self.basemap_job = None;
             match r {
                 Ok((coast, borders)) => {
+                    self.activity = "line upload";
                     upload_lines(rs, COAST_ID, &coast);
                     upload_lines(rs, BORDERS_ID, &borders);
                     self.basemap_on_gpu = Some(p);
@@ -425,6 +608,7 @@ impl MapState {
             self.grid_job = None;
             match r {
                 Ok(segments) => {
+                    self.activity = "line upload";
                     upload_lines(rs, GRID_ID, &segments);
                     self.grid_on_gpu = Some(key);
                 }
@@ -501,54 +685,164 @@ impl MapState {
         if self.tried.as_ref().is_some_and(|t| Arc::ptr_eq(t, slice)) {
             return Ok(false);
         }
-        let [ny, nx] = spec.shape();
-        let grid = crate::ui::plot_area::Grid { ny, nx, transposed: axes.y > axes.x };
-        let result = if self.curvilinear {
+        let mesh = if self.curvilinear {
             let proj = self.camera.proj;
             let Some(m) = self.mesh.as_ref().filter(|m| m.spec == spec && m.proj == proj) else {
                 return Ok(false);
             };
-            let data = crate::ui::plot_area::image_data(&slice.data, &grid);
-            upload_curvilinear(rs, MAP_OVERVIEW_ID, &data, ny, nx, &m.verts, &m.indices)
-                .map(|t| (t, data))
+            Some(m)
         } else {
-            let strided = |d: usize, a: usize| -> Option<Vec<f64>> {
-                let c = coords.dims.get(d)?.as_ref()?;
-                (0..spec.shape()[a]).map(|k| c.get(spec.start[a] + k * spec.stride[a]).copied()).collect()
-            };
-            let (Some(lat), Some(lon)) = (strided(axes.y, 0), strided(axes.x, 1)) else {
-                self.tried = Some(slice.clone());
-                return Err(UploadFailure::Coords("its coordinates do not match its shape".into()));
-            };
-            let data = crate::ui::plot_area::image_data(&slice.data, &grid);
-            upload_regular(rs, MAP_OVERVIEW_ID, &data, ny, nx, &lat, &lon).map(|t| (t, data))
+            None
         };
+        let t = Instant::now();
+        let result = build_tile(rs, MAP_OVERVIEW_ID, slice, spec, axes, coords, mesh);
         self.tried = Some(slice.clone());
+        self.activity = "overview upload";
+        let took = t.elapsed().as_secs_f64() * 1e3;
         match result {
-            Ok((gpu, data)) => {
-                let data = match data {
-                    std::borrow::Cow::Borrowed(_) => slice.clone(),
-                    std::borrow::Cow::Owned(v) => Arc::new(Slice {
-                        shape: vec![ny, nx],
-                        valid_count: slice.valid_count,
-                        data: v,
-                    }),
-                };
-                self.overview = Some(Tile { spec, data, gpu });
+            Ok(tile) => {
+                self.overview = Some(tile);
                 if self.curvilinear {
                     self.mesh_on_gpu = Some(self.camera.proj);
                 }
+                self.note(|| format!("overview uploaded in {took:.1} ms"));
                 Ok(true)
             }
-            Err(UploadError::BadCoords(why)) => {
+            Err(f) => {
                 self.overview = None;
-                Err(UploadFailure::Coords(why.into()))
-            }
-            Err(e) => {
-                self.overview = None;
-                Err(UploadFailure::Other(e.to_string()))
+                Err(f)
             }
         }
+    }
+
+    /// Per frame: starts mesh jobs for curvilinear detail tiles, and once
+    /// every planned tile has arrived (and has its mesh) uploads them all
+    /// at once, replacing the tiles on show. A tile that cannot be uploaded
+    /// is skipped with a log line. `Ok`-path result: true when uploaded.
+    pub fn prepare_detail(
+        &mut self,
+        ctx: &eframe::egui::Context,
+        rs: &RenderState,
+        axes: AxisChoice,
+        coords: &Coords,
+        full: [usize; 2],
+    ) -> bool {
+        let proj = self.camera.proj;
+        if self.curvilinear
+            && let Some((lat, lon)) = &coords.curv
+        {
+            // Meshes for tiles that arrived and for those on show (re-projection).
+            let specs: Vec<TileSpec> = self
+                .arrived
+                .iter()
+                .map(|a| a.0)
+                .chain(self.detail.iter().map(|d| d.tile.spec))
+                .collect();
+            for spec in specs {
+                let want = (spec, proj);
+                let have = self.detail_meshes.iter().any(|m| (m.spec, m.proj) == want)
+                    || self.detail_mesh_failed.contains(&want)
+                    || self.detail_mesh_jobs.iter().any(|(k, _)| *k == want);
+                if have {
+                    continue;
+                }
+                let geo = self.detail_meshes.iter().find(|m| m.spec == spec).map(|m| m.geo.clone());
+                let (lat, lon) = (lat.clone(), lon.clone());
+                let job = Job::spawn(ctx, move || {
+                    let geo = geo.unwrap_or_else(|| {
+                        Arc::new(build_mesh(&lat, &lon, full, &spec, MESH_MAX_SIDE))
+                    });
+                    let (verts, indices) = project_mesh(proj, &geo);
+                    MeshSet { spec, geo, proj, verts, indices }
+                });
+                self.detail_mesh_jobs.push((want, job));
+            }
+            let mut i = 0;
+            while i < self.detail_mesh_jobs.len() {
+                let Some(r) = self.detail_mesh_jobs[i].1.poll() else {
+                    i += 1;
+                    continue;
+                };
+                let (key, _) = self.detail_mesh_jobs.remove(i);
+                match r {
+                    Ok(m) => {
+                        self.detail_meshes.retain(|o| o.spec != m.spec);
+                        self.detail_meshes.push(m);
+                    }
+                    Err(()) => {
+                        self.detail_mesh_failed.push(key);
+                        self.note(|| format!("detail mesh {key:?} failed"));
+                    }
+                }
+            }
+            // Tiles on show get their re-projected mesh.
+            for d in &mut self.detail {
+                if d.mesh_proj != Some(proj)
+                    && let Some(m) = self.detail_meshes.iter().find(|m| m.spec == d.tile.spec && m.proj == proj)
+                {
+                    set_curvilinear_mesh(rs, d.tile.gpu.id, &m.verts, &m.indices);
+                    d.mesh_proj = Some(proj);
+                    self.activity = "detail mesh upload";
+                }
+            }
+        }
+
+        if self.plan.is_empty() || self.arrived.len() != self.plan.len() {
+            return false;
+        }
+        let meshes: Vec<Option<&MeshSet>> = self
+            .arrived
+            .iter()
+            .map(|(spec, _)| self.detail_meshes.iter().find(|m| m.spec == *spec && m.proj == proj))
+            .collect();
+        if self.curvilinear && meshes.iter().any(Option::is_none) {
+            // Wait for the mesh jobs; a failed mesh drops its tile.
+            let failed: Vec<TileSpec> = self
+                .arrived
+                .iter()
+                .map(|a| a.0)
+                .filter(|s| self.detail_mesh_failed.contains(&(*s, proj)))
+                .collect();
+            if !failed.is_empty() {
+                self.plan.retain(|s| !failed.contains(s));
+                self.arrived.retain(|a| !failed.contains(&a.0));
+                if self.plan.is_empty() {
+                    self.detail.clear();
+                }
+            }
+            return false;
+        }
+        let t = Instant::now();
+        let mut tiles = Vec::new();
+        let mut notes = Vec::new();
+        for (i, (spec, slice)) in self.arrived.iter().enumerate() {
+            match build_tile(rs, MAP_DETAIL_IDS[i], slice, *spec, axes, coords, meshes[i]) {
+                Ok(tile) => {
+                    tiles.push(DetailTile { tile, mesh_proj: self.curvilinear.then_some(proj) })
+                }
+                Err(UploadFailure::Coords(e) | UploadFailure::Other(e)) => {
+                    notes.push(format!("detail tile {spec:?} not uploaded: {e}"));
+                }
+            }
+        }
+        self.arrived.clear();
+        self.activity = "detail upload";
+        let took = t.elapsed().as_secs_f64() * 1e3;
+        notes.push(format!("detail uploaded: {} tiles in {took:.1} ms", tiles.len()));
+        self.detail = tiles;
+        for n in notes {
+            self.note(|| n);
+        }
+        true
+    }
+
+    /// Detail tiles that can be drawn with the current projection, in order.
+    pub fn drawable_details(&self) -> impl Iterator<Item = &Tile> {
+        let proj = self.camera.proj;
+        self.detail
+            .iter()
+            .filter(move |d| !self.curvilinear || d.mesh_proj == Some(proj))
+            .map(|d| &d.tile)
     }
 
     /// The overview tile, when it can be drawn with the current projection.
@@ -572,7 +866,51 @@ impl MapState {
     /// show; `None` for a missing value.
     pub fn value(&self, iy: usize, ix: usize) -> Option<f32> {
         let t = self.overview.as_ref()?;
-        hover_value(&[(t.spec, &*t.data)], iy, ix)
+        let mut tiles = vec![(t.spec, &*t.data)];
+        tiles.extend(self.detail.iter().map(|d| (d.tile.spec, &*d.tile.data)));
+        hover_value(&tiles, iy, ix)
+    }
+}
+
+/// Uploads one data tile as texture `id`. Curvilinear tiles need their
+/// `mesh`. Transposed (x-before-y) variables are turned to `[y, x]`; the
+/// returned tile's `data` is row-major as `[ty, tx]`.
+fn build_tile(
+    rs: &RenderState,
+    id: u64,
+    slice: &Arc<Slice>,
+    spec: TileSpec,
+    axes: AxisChoice,
+    coords: &Coords,
+    mesh: Option<&MeshSet>,
+) -> Result<Tile, UploadFailure> {
+    let [ny, nx] = spec.shape();
+    let grid = crate::ui::plot_area::Grid { ny, nx, transposed: axes.y > axes.x };
+    let data = crate::ui::plot_area::image_data(&slice.data, &grid);
+    let result = if let Some(m) = mesh {
+        upload_curvilinear(rs, id, &data, ny, nx, &m.verts, &m.indices)
+    } else {
+        let strided = |d: usize, a: usize| -> Option<Vec<f64>> {
+            let c = coords.dims.get(d)?.as_ref()?;
+            (0..spec.shape()[a]).map(|k| c.get(spec.start[a] + k * spec.stride[a]).copied()).collect()
+        };
+        let (Some(lat), Some(lon)) = (strided(axes.y, 0), strided(axes.x, 1)) else {
+            return Err(UploadFailure::Coords("its coordinates do not match its shape".into()));
+        };
+        upload_regular(rs, id, &data, ny, nx, &lat, &lon)
+    };
+    match result {
+        Ok(gpu) => {
+            let data = match data {
+                std::borrow::Cow::Borrowed(_) => slice.clone(),
+                std::borrow::Cow::Owned(v) => {
+                    Arc::new(Slice { shape: vec![ny, nx], valid_count: slice.valid_count, data: v })
+                }
+            };
+            Ok(Tile { spec, data, gpu })
+        }
+        Err(UploadError::BadCoords(why)) => Err(UploadFailure::Coords(why.into())),
+        Err(e) => Err(UploadFailure::Other(e.to_string())),
     }
 }
 
@@ -814,6 +1152,155 @@ mod tests {
         assert_eq!(m.mesh_failed, Some((spec, proj)));
         assert_eq!(m.grid_failed, Some(key));
         assert!(m.drawable_overview().is_none() && !m.basemap_ready() && !m.grid_ready());
+    }
+
+    #[test]
+    fn stale_detail_is_ignored() {
+        let geo = Geo::Regular {
+            lat_dim: 0,
+            lon_dim: 1,
+            lat_var: "/lat".into(),
+            lon_var: "/lon".into(),
+        };
+        let mut m = MapState::new(&geo);
+        let a = TileSpec { start: [0, 0], count: [4, 4], stride: [1, 1] };
+        let b = TileSpec { start: [10, 10], count: [4, 4], stride: [1, 1] };
+        m.set_plan(vec![a]);
+        assert!(!m.accept_detail(b, Arc::new(filled(&b, 1.0))), "not in the plan");
+        assert!(m.arrived.is_empty());
+        assert!(m.accept_detail(a, Arc::new(filled(&a, 2.0))));
+        assert_eq!(m.arrived.len(), 1);
+        // A new plan drops what arrived for the old one.
+        m.set_plan(vec![b]);
+        assert!(m.arrived.is_empty());
+        assert!(!m.accept_detail(a, Arc::new(filled(&a, 2.0))));
+    }
+
+    #[test]
+    fn detail_flow_holds_old_tiles_and_empty_plan_clears() {
+        let (mut v, ctx, service, _dir) = open_view(fixtures::write_classic, "/t");
+        let rs = headless::render_state();
+        let axes = v.axes.unwrap();
+        let ov = TileSpec::overview(4, 8);
+        let a = TileSpec { start: [0, 0], count: [2, 4], stride: [1, 1] };
+        let b = TileSpec { start: [1, 2], count: [2, 3], stride: [1, 1] };
+        {
+            let shown = v.shown.as_ref().unwrap().slice.clone();
+            let map = v.map.as_mut().unwrap();
+            assert!(matches!(map.upload_overview(&rs, &shown, ov, axes, &v.coords), Ok(true)));
+            map.set_plan(vec![a]);
+        }
+        let full = [4, 8];
+        let run = |v: &mut VarView| {
+            v.refresh(&ctx, &service); // re-requests the overview and the plan
+            wait("detail upload", || {
+                v.poll(&ctx);
+                v.map.as_mut().unwrap().prepare_detail(&ctx, &rs, axes, &v.coords, full)
+            });
+        };
+        run(&mut v);
+        let map = v.map.as_mut().unwrap();
+        assert_eq!(map.drawable_details().count(), 1);
+        let truth = map.value(1, 1);
+        assert!(truth.is_some());
+        // A new plan: the old tile stays until the new one arrives.
+        map.set_plan(vec![b]);
+        assert_eq!(map.drawable_details().count(), 1);
+        assert_eq!(map.drawable_details().next().unwrap().spec, a);
+        run(&mut v);
+        let map = v.map.as_mut().unwrap();
+        assert_eq!(map.drawable_details().next().unwrap().spec, b);
+        // An empty plan clears the detail tiles.
+        map.set_plan(Vec::new());
+        assert_eq!(map.drawable_details().count(), 0);
+    }
+
+    /// Measures the detail reads the app would issue on a big regular grid:
+    /// `TORCDF_GEBCO=<file> cargo test -p torcdf-app detail_read_timings -- --ignored --nocapture`.
+    /// Camera fitted to a lon/lat box in a 1600x900 rect at ppp 1, then
+    /// `plan_detail`, then each tile through `SliceService` (first touch) and
+    /// `read_slice` again (warm: the file cache holds it, the service cache is
+    /// bypassed).
+    #[test]
+    #[ignore = "needs TORCDF_GEBCO=<path to GEBCO_2025_sub_ice.nc>"]
+    fn detail_read_timings() {
+        use crate::map::locate::CellLocator;
+        use crate::map::tiles::plan_detail;
+        use crate::view::defaults::{choose_axes, tile_request};
+        let Some(path) = std::env::var_os("TORCDF_GEBCO") else { return };
+        let nc = Arc::new(NcFile::open(Path::new(&path)).unwrap());
+        let var = nc.meta.var("/elevation").unwrap().clone();
+        let axes = choose_axes(&nc.meta, &var).unwrap();
+        let Geo::Regular { lat_dim, lon_dim, .. } = torcdf_core::cf::detect_geo(&nc.meta, &var)
+        else {
+            panic!("not a regular grid")
+        };
+        let coord = |d: usize| nc.read_coord(&format!("/{}", var.dims[d])).unwrap();
+        let t = Instant::now();
+        let loc = CellLocator::regular(coord(lat_dim), coord(lon_dim)).unwrap();
+        println!("locator built in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        let full = [var.shape[axes.y], var.shape[axes.x]];
+        let overview = TileSpec::overview(full[0], full[1]);
+        let service = SliceService::new(256 << 20, 2, Arc::new(|| {}));
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 900.0));
+        let boxes: [(&str, [f64; 4]); 5] = [
+            ("10x10 deg, 0-10E 40-50N", [0.0, 40.0, 10.0, 50.0]),
+            ("2x2 deg, 7-9E 45-47N", [7.0, 45.0, 9.0, 47.0]),
+            ("0.5x0.5 deg Alps, 8-8.5E 46-46.5N", [8.0, 46.0, 8.5, 46.5]),
+            ("0.1x0.1 deg Alps, 8-8.1E 46-46.1N", [8.0, 46.0, 8.1, 46.1]),
+            ("2x2 deg Norway coast, 5-7E 61-63N", [5.0, 61.0, 7.0, 63.0]),
+        ];
+        for (name, [lo0, la0, lo1, la1]) in boxes {
+            let mut cam = MapCamera::new(Projection::Equirectangular);
+            cam.fit(&[(lo0, la0), (lo1, la1)], rect);
+            let t = Instant::now();
+            let plan = plan_detail(&loc, full, &cam, rect, 1.0, &overview);
+            println!("{name}: plan {plan:?} in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            for spec in plan {
+                let req = tile_request(&var, &axes, &vec![0; var.shape.len()], &spec);
+                let t = Instant::now();
+                let mut h = service.request(&nc, req.clone());
+                let first = wait_take(&mut h);
+                let first_ms = t.elapsed().as_secs_f64() * 1e3;
+                let t = Instant::now();
+                let _ = nc.read_slice(&req).unwrap();
+                let warm_ms = t.elapsed().as_secs_f64() * 1e3;
+                println!(
+                    "  tile {spec:?} shape {:?}: first touch {first_ms:.1} ms, warm {warm_ms:.1} ms",
+                    first.shape
+                );
+            }
+        }
+    }
+
+    fn wait_take(h: &mut torcdf_core::RequestHandle) -> Arc<Slice> {
+        loop {
+            if let Some(r) = h.try_take() {
+                return r.unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn camera_must_rest_before_detail_is_due() {
+        let ctx = egui::Context::default();
+        let geo = Geo::Regular {
+            lat_dim: 0,
+            lon_dim: 1,
+            lat_var: "/lat".into(),
+            lon_var: "/lon".into(),
+        };
+        let mut m = MapState::new(&geo);
+        assert!(!m.detail_due(&ctx, rect()), "first frame starts the clock");
+        std::thread::sleep(DETAIL_DELAY + Duration::from_millis(20));
+        assert!(m.detail_due(&ctx, rect()));
+        assert!(!m.detail_due(&ctx, rect()), "due once per rest");
+        m.camera.pan(vec2(5.0, 0.0));
+        std::thread::sleep(DETAIL_DELAY + Duration::from_millis(20));
+        assert!(!m.detail_due(&ctx, rect()), "moving restarts the clock");
+        std::thread::sleep(DETAIL_DELAY + Duration::from_millis(20));
+        assert!(m.detail_due(&ctx, rect()));
     }
 
     #[test]

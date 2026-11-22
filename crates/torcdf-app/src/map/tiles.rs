@@ -65,14 +65,11 @@ impl TileSpec {
 
 /// Detail tiles are planned only when the overview is coarser than the
 /// on-screen need by more than this factor on some axis.
-#[allow(dead_code)] // used from Task 11
 pub const DETAIL_TRIGGER: f64 = 1.5;
 
 /// Largest texture side of a tile.
-#[allow(dead_code)] // used from Task 11
 const MAX_SIDE: usize = 2048;
 /// Sample points per screen axis (edges included).
-#[allow(dead_code)] // used from Task 11
 const SAMPLES: usize = 33;
 
 /// Plans 0, 1 or 2 strided detail tiles covering the visible window.
@@ -86,7 +83,6 @@ const SAMPLES: usize = 33;
 /// `window_px`, the framebuffer extent the window covers on an axis, is
 /// `rect_px * hit_fraction * window_cells / hit_cells`, where `hit_fraction`
 /// is the share of sample rows (columns) that hit the grid.
-#[allow(dead_code)] // used from Task 11
 pub fn plan_detail(
     loc: &CellLocator,
     full: [usize; 2],
