@@ -12,6 +12,7 @@ use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 
 use super::colormap::Colormap;
+use super::gpu_common;
 
 /// Largest texture side this plan uses: the wgpu downlevel default.
 const MAX_TEXTURE_DIM: u32 = 2048;
@@ -179,7 +180,9 @@ impl ImageResources {
     fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("torcdf image"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("image.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(include_str!("colour.wgsl"), include_str!("image.wgsl")).into(),
+            ),
         });
         let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -263,21 +266,9 @@ struct LayerGpu {
 
 impl LayerGpu {
     fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ny: usize, nx: usize) -> Self {
-        let texture = |label, width, height, format| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            })
-        };
-        // check_shape bounds both sides by MAX_TEXTURE_DIM, so the casts are lossless.
-        let data = texture("torcdf image data", nx as u32, ny as u32, wgpu::TextureFormat::R32Float);
-        let lut = texture("torcdf image lut", 256, 1, wgpu::TextureFormat::Rgba8Unorm);
+        // check_shape bounds both sides by MAX_TEXTURE_DIM.
+        let data = gpu_common::create_data_texture(device, ny, nx);
+        let lut = gpu_common::lut_texture(device);
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("torcdf image params"),
             size: UNIFORM_BYTES,
@@ -305,43 +296,17 @@ impl LayerGpu {
     }
 
     fn write_data(&self, queue: &wgpu::Queue, data: &[f32]) {
-        write_texture(queue, &self.data, bytemuck::cast_slice(data), self.nx, self.ny, 4);
+        gpu_common::write_data(queue, &self.data, data, self.ny, self.nx);
     }
 
     /// Updates uniforms, and the LUT when the colour map changed.
     fn write_params(&mut self, queue: &wgpu::Queue, words: &[u32; 12], colormap: Colormap) {
         queue.write_buffer(&self.uniforms, 0, bytemuck::cast_slice(words));
         if self.colormap != Some(colormap) {
-            let lut = colormap.lut();
-            write_texture(queue, &self.lut, lut.as_flattened(), 256, 1, 4);
+            gpu_common::write_lut(queue, &self.lut, &colormap.lut());
             self.colormap = Some(colormap);
         }
     }
-}
-
-fn write_texture(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    bytes: &[u8],
-    width: usize,
-    height: usize,
-    texel_bytes: usize,
-) {
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        bytes,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some((width * texel_bytes) as u32),
-            rows_per_image: None,
-        },
-        wgpu::Extent3d { width: width as u32, height: height as u32, depth_or_array_layers: 1 },
-    );
 }
 
 /// One frame's draw of a layer.
@@ -387,43 +352,9 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor, wgpu};
-    use std::sync::Arc;
+    use crate::render::gpu_common::headless::{self, render_state};
 
-    /// egui prefers a gamma-space (non-sRGB) target; this is what the app gets.
-    const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-
-    /// A render state on the software fallback adapter (WARP on Windows), with
-    /// downlevel limits so the test sees the same constraints as weak machines.
-    fn render_state() -> egui_wgpu::RenderState {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            force_fallback_adapter: true,
-            ..Default::default()
-        }))
-        .expect("no fallback (software) wgpu adapter on this machine");
-        eprintln!("adapter: {:?}", adapter.get_info());
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("torcdf-test"),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            ..Default::default()
-        }))
-        .expect("device on fallback adapter");
-        let renderer = Renderer::new(&device, FORMAT, RendererOptions::PREDICTABLE);
-        egui_wgpu::RenderState {
-            adapter,
-            available_adapters: Vec::new(),
-            instance,
-            device,
-            queue,
-            target_format: FORMAT,
-            renderer: Arc::new(egui::mutex::RwLock::new(renderer)),
-        }
-    }
-
-    /// Runs one egui frame that paints `layer` over a whole `w` x `h` offscreen
-    /// target through egui_wgpu's renderer, and reads the pixels back row-major.
+    /// Paints `layer` over a whole `w` x `h` offscreen target and reads it back.
     fn render(
         rs: &egui_wgpu::RenderState,
         w: u32,
@@ -431,89 +362,7 @@ mod tests {
         layer: &ImageLayer,
         p: &ImageParams,
     ) -> Vec<[u8; 4]> {
-        let (device, queue) = (&rs.device, &rs.queue);
-        let ctx = egui::Context::default();
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32));
-        let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
-        let mut out = ctx.run_ui(input, |ui| paint(ui, screen, layer, p));
-        let textures = std::mem::take(&mut out.textures_delta.set);
-        out.textures_delta.clear(); // nothing to free in a single-frame context
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        let sd = ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: out.pixels_per_point };
-
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("target"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = target.create_view(&Default::default());
-        let mut encoder = device.create_command_encoder(&Default::default());
-        let mut renderer = rs.renderer.write();
-        for (id, deltas) in &textures {
-            for delta in deltas {
-                renderer.update_texture(device, queue, *id, delta);
-            }
-        }
-        let mut cmds = renderer.update_buffers(device, queue, &mut encoder, &prims, &sd);
-        {
-            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("test pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            renderer.render(&mut pass.forget_lifetime(), &prims, &sd);
-        }
-
-        let row_bytes = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT; // >= 4 * w for small tests
-        assert!(4 * w <= row_bytes);
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (row_bytes * h) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row_bytes),
-                    rows_per_image: None,
-                },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        cmds.push(encoder.finish());
-        queue.submit(cmds);
-        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("map readback"));
-        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-        let bytes = readback.get_mapped_range(..).expect("mapped range");
-        (0..h as usize)
-            .flat_map(|y| (0..w as usize).map(move |x| (y, x)))
-            .map(|(y, x)| {
-                let o = y * row_bytes as usize + 4 * x;
-                [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]
-            })
-            .collect()
+        headless::render(rs, w, h, |ui, screen| paint(ui, screen, layer, p))
     }
 
     fn params(flip_y: bool) -> ImageParams {

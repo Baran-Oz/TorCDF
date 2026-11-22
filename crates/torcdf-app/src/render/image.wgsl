@@ -1,6 +1,8 @@
 // Colour-mapped image layer. Data is an unfilterable R32Float texture and the
 // colour map a 256 x 1 Rgba8Unorm LUT; both are read with textureLoad only
 // (no samplers, no float filtering), which keeps this within downlevel limits.
+// Prepended at build time: colour.wgsl (non_finite, colour_of,
+// linear_from_gamma_rgb).
 
 struct Params {
     // t = (w - offset) * scale, where w = v, or log2(v) in log mode.
@@ -30,11 +32,6 @@ fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(x, y, 0.0, 1.0);
 }
 
-// NaN or +-inf, tested on the bits so no compiler can fold `v != v` away.
-fn non_finite(v: f32) -> bool {
-    return (bitcast<u32>(v) & 0x7f800000u) == 0x7f800000u;
-}
-
 // Premultiplied, gamma-space colour of the cell under framebuffer position `pos`.
 fn shade(pos: vec2<f32>) -> vec4<f32> {
     let uv = (pos - params.rect_min_px) / params.rect_size_px;
@@ -49,32 +46,13 @@ fn shade(pos: vec2<f32>) -> vec4<f32> {
         return vec4<f32>(0.0);
     }
     let v = textureLoad(data_tex, vec2<i32>(i32(floor(x)), i32(floor(y))), 0).r;
-    if non_finite(v) {
-        return vec4<f32>(0.0);
-    }
-    var w = v;
-    if params.log_scale != 0u {
-        if v <= 0.0 {
-            return vec4<f32>(0.0);
-        }
-        w = log2(v);
-    }
-    let t = clamp((w - params.offset) * params.scale, 0.0, 1.0);
-    let index = min(i32(t * 256.0), 255);
-    return textureLoad(lut_tex, vec2<i32>(index, 0), 0);
+    return colour_of(v, params.offset, params.scale, params.log_scale, lut_tex);
 }
 
 // egui's preferred target: Rgba8Unorm / Bgra8Unorm holding gamma-space colour.
 @fragment
 fn fs_main_gamma_framebuffer(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return shade(pos.xy);
-}
-
-fn linear_from_gamma_rgb(srgb: vec3<f32>) -> vec3<f32> {
-    let cutoff = srgb < vec3<f32>(0.04045);
-    let lower = srgb / vec3<f32>(12.92);
-    let higher = pow((srgb + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
-    return select(higher, lower, cutoff);
 }
 
 // sRGB targets encode on write, so hand them linear colour.
