@@ -1,5 +1,7 @@
 //! Colour bar: tick computation, label text and an egui-drawn gradient.
 
+use std::sync::Arc;
+
 use eframe::egui;
 use torcdf_core::VarInfo;
 
@@ -71,21 +73,39 @@ pub fn colorbar_label(v: &VarInfo) -> String {
     }
 }
 
+/// Space between the label and the bar top, and below the bar: over half a
+/// 12 pt text row, so tick labels centred on the bar ends stay clear of the
+/// label and inside the strip.
+const END_GAP: f32 = 8.0;
+
+/// The label laid out for `rect`, wrapped to its width so the units are
+/// never clipped, and the bar below it.
+fn layout(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    label: &str,
+    font: egui::FontId,
+    colour: egui::Color32,
+) -> (Arc<egui::Galley>, egui::Rect) {
+    let galley = painter.layout(label.to_owned(), font, colour, rect.width());
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top() + galley.size().y + END_GAP),
+        egui::pos2(rect.left() + BAR_WIDTH, rect.bottom() - END_GAP),
+    );
+    (galley, bar)
+}
+
 /// Draw the bar (low at the bottom) with tick labels and the label above, inside `rect`.
 pub fn show(ui: &mut egui::Ui, rect: egui::Rect, colormap: Colormap, range: (f32, f32), log: bool, label: &str) {
     let painter = ui.painter_at(rect);
     let text_color = ui.visuals().text_color();
     let font = egui::FontId::proportional(12.0);
 
-    let label_h = 16.0;
-    let bar = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), rect.top() + label_h + 6.0),
-        egui::pos2(rect.left() + BAR_WIDTH, rect.bottom() - 6.0),
-    );
+    let (galley, bar) = layout(&painter, rect, label, font.clone(), text_color);
     if bar.height() < 8.0 {
         return;
     }
-    painter.text(rect.left_top(), egui::Align2::LEFT_TOP, label, font.clone(), text_color);
+    painter.galley(rect.left_top(), galley, text_color);
 
     let lut = colormap.lut();
     let mut mesh = egui::Mesh::default();
@@ -169,5 +189,31 @@ mod tests {
         assert_eq!(colorbar_label(&v), "Elevation relative to sea level [m]");
         assert_eq!(colorbar_label(&var(vec![])), "z");
         assert_eq!(colorbar_label(&var(vec![("standard_name", "height")])), "height");
+    }
+
+    #[test]
+    fn long_label_wraps_inside_the_strip_above_the_bar() {
+        // The strip the plot area gives the colour bar (130 pt less margins).
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(122.0, 400.0));
+        let font = egui::FontId::proportional(12.0);
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter_at(rect);
+            let lay = |s: &str| layout(&painter, rect, s, font.clone(), egui::Color32::WHITE);
+            let (short, _) = lay("z");
+            for long in ["Elevation relative to sea level [m]", "Eastward Velocity [m s-1]"] {
+                let (g, bar) = lay(long);
+                assert!(g.size().x <= rect.width(), "{long}: {:?}", g.size());
+                assert!(g.size().y > short.size().y, "{long} wraps to more lines");
+                assert!(g.text().ends_with(']'), "units kept");
+                assert!(bar.top() >= rect.top() + g.size().y, "{long}: bar {bar:?}");
+            }
+            // Tick labels (centred on the bar ends) stay inside the strip.
+            let (_, bar) = lay("z");
+            let half_row = 0.5 * short.size().y;
+            assert!(bar.bottom() + half_row <= rect.bottom(), "{bar:?}");
+            assert!(bar.top() - half_row >= rect.top() + short.size().y, "{bar:?}");
+        });
+        out.textures_delta.clear(); // no renderer in this test
     }
 }
