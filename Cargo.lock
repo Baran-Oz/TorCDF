@@ -529,6 +529,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "netcdf",
+ "netcdf-sys",
  "tempfile",
  "thiserror",
  "torcdf-core",
