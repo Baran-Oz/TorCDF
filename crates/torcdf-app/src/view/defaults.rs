@@ -6,6 +6,7 @@ use torcdf_core::{Dataset, Slice, SliceRequest, VarInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewKind {
+    Map,
     Image,
     Line,
     Table,
@@ -20,13 +21,16 @@ pub struct AxisChoice {
 
 pub const OVERVIEW_TARGET: usize = 2048;
 
-pub fn choose_view(_ds: &Dataset, v: &VarInfo) -> ViewKind {
+/// Table for text and single values, Line for one long dimension, Map for
+/// geographic fields of two or more long dimensions, Image otherwise.
+pub fn choose_view(ds: &Dataset, v: &VarInfo) -> ViewKind {
     if !v.dtype.is_numeric() {
         return ViewKind::Table;
     }
     match v.shape.iter().filter(|&&n| n > 1).count() {
         0 => ViewKind::Table,
         1 => ViewKind::Line,
+        _ if detect_geo(ds, v) != Geo::None => ViewKind::Map,
         _ => ViewKind::Image,
     }
 }
@@ -134,11 +138,14 @@ mod tests {
     }
 
     #[test]
-    fn geo_var_is_image_on_lat_lon() {
+    fn geo_var_is_map() {
         let classic = open(fixtures::write_classic);
         let t = classic.var("/t").unwrap();
-        assert_eq!(choose_view(&classic, t), ViewKind::Image);
+        assert_eq!(choose_view(&classic, t), ViewKind::Map);
         assert_eq!(choose_axes(&classic, t), Some(AxisChoice { y: 1, x: 2 }));
+        // No geographic coordinates: stays an image.
+        let bare = open(fixtures::write_bare);
+        assert_eq!(choose_view(&bare, bare.var("/data").unwrap()), ViewKind::Image);
     }
 
     #[test]

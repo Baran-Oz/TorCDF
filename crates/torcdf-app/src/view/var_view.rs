@@ -11,12 +11,14 @@ use torcdf_core::{
 };
 
 use crate::app::Job;
+use crate::map::tiles::TileSpec;
 use crate::render::colormap::Colormap;
 use crate::render::image::ImageLayer;
 use crate::ui::{inspector, plot_area};
 use crate::view::defaults::{
-    AxisChoice, ViewKind, auto_range, build_request, choose_axes, choose_view,
+    AxisChoice, ViewKind, auto_range, build_request, choose_axes, choose_view, tile_request,
 };
+use crate::view::map_state::MapState;
 
 /// Slices up to this many values get their statistics on the UI thread
 /// (well under a millisecond); larger ones on a helper thread.
@@ -27,8 +29,9 @@ pub const TABLE_MAX_CELLS: usize = 10_000;
 const TABLE_MAX_COLS: usize = 100;
 /// Points in a line plot; longer lines are thinned by the core.
 const LINE_MAX_POINTS: usize = 100_000;
-/// Largest curvilinear grid (cells) whose 2-D lat/lon are read for hover.
-const CURV_MAX_CELLS: usize = 25_000_000;
+/// Largest curvilinear grid (cells) whose 2-D lat/lon are read (for the map
+/// and hover); larger grids are shown as an image.
+const CURV_MAX_CELLS: usize = 10_000_000;
 
 /// Colour settings shared by every variable.
 pub struct Display {
@@ -85,8 +88,9 @@ pub struct Shown {
 pub struct Coords {
     /// Per dimension of the variable: its 1-D coordinate values.
     pub dims: Vec<Option<Vec<f64>>>,
-    /// Curvilinear 2-D latitude and longitude, row-major over (y, x).
-    pub curv: Option<(Vec<f64>, Vec<f64>)>,
+    /// Curvilinear 2-D latitude and longitude, row-major over (y, x),
+    /// unpacked (missing values are NaN). Shared with the map's jobs.
+    pub curv: Option<(Arc<Vec<f64>>, Arc<Vec<f64>>)>,
 }
 
 /// Image layer and navigation state of the image view.
@@ -140,6 +144,10 @@ pub struct VarView {
     text_job: Option<Job<Result<TextTable, CoreError>>>,
     pub error: Option<String>,
     pub image: ImageState,
+    /// Map view state; `None` when the variable cannot be mapped.
+    pub map: Option<MapState>,
+    /// One-line notice in the plot area (e.g. why the map fell back to the image).
+    pub notice: Option<String>,
     pub hover: Option<Hover>,
 }
 
@@ -168,6 +176,16 @@ impl VarView {
             }
             _ => None,
         };
+        let mut kind = kind;
+        let mut notice = None;
+        if kind == ViewKind::Map && matches!(geo, Geo::Curvilinear { .. }) && curv.is_none() {
+            kind = ViewKind::Image;
+            notice = Some(map_notice(&format!(
+                "its 2-D latitude/longitude has more than {} million cells",
+                CURV_MAX_CELLS / 1_000_000
+            )));
+        }
+        let map = (kind == ViewKind::Map).then(|| MapState::new(&geo));
         let job_nc = nc.clone();
         let coords_job = Some(Job::spawn(ctx, move || load_coords(&job_nc, &coord_paths, curv)));
         VarView {
@@ -191,8 +209,20 @@ impl VarView {
             text_job: None,
             error: None,
             image: ImageState::default(),
+            map,
+            notice,
             hover: None,
         }
+    }
+
+    /// The map cannot be drawn: show the image view instead, with a notice.
+    pub fn fall_back_to_image(&mut self, why: &str) {
+        self.kind = ViewKind::Image;
+        self.default_kind = ViewKind::Image;
+        self.map = None;
+        self.notice = Some(map_notice(why));
+        self.hover = None;
+        self.image = ImageState { upload_needed: self.shown.is_some(), ..ImageState::default() };
     }
 
     pub fn is_text(&self) -> bool {
@@ -207,6 +237,7 @@ impl VarView {
     /// View kinds that make sense for this variable.
     pub fn kinds(&self) -> Vec<ViewKind> {
         match self.default_kind {
+            ViewKind::Map => vec![ViewKind::Map, ViewKind::Image, ViewKind::Table],
             ViewKind::Image => vec![ViewKind::Image, ViewKind::Table],
             ViewKind::Line => vec![ViewKind::Line, ViewKind::Table],
             ViewKind::Table => vec![ViewKind::Table],
@@ -228,7 +259,7 @@ impl VarView {
         }
         let line_dim = self.var.shape.iter().position(|&len| len > 1);
         match (self.kind, self.axes, line_dim) {
-            (ViewKind::Image | ViewKind::Table, Some(a), _) => vec![a.y, a.x],
+            (ViewKind::Map | ViewKind::Image | ViewKind::Table, Some(a), _) => vec![a.y, a.x],
             (_, _, Some(d)) => vec![d],
             _ => vec![],
         }
@@ -244,8 +275,13 @@ impl VarView {
     /// The hyperslab the current view needs.
     fn request(&self) -> SliceRequest {
         let v = &self.var;
-        if let (ViewKind::Image, Some(a), false) = (self.kind, &self.axes, self.is_text()) {
-            return build_request(v, a, &self.slider_pos);
+        match (self.kind, &self.axes, self.is_text()) {
+            (ViewKind::Image, Some(a), false) => return build_request(v, a, &self.slider_pos),
+            (ViewKind::Map, Some(a), false) => {
+                let spec = TileSpec::overview(v.shape[a.y], v.shape[a.x]);
+                return tile_request(v, a, &self.slider_pos, &spec);
+            }
+            _ => {}
         }
         let n = v.shape.len();
         let mut r = SliceRequest {
@@ -375,10 +411,19 @@ impl VarView {
             if !self.image.user_moved {
                 self.image.view = None;
             }
+            // The map's cell index is built off the UI thread.
+            if let Some(m) = &mut self.map
+                && let Err(why) = m.start_locator(ctx, &self.geo, &self.coords, &self.var.shape)
+            {
+                self.fall_back_to_image(&why);
+            }
             true
         } else {
             false
         };
+        if let Some(why) = self.map.as_mut().and_then(MapState::poll_locator) {
+            self.fall_back_to_image(&why);
+        }
         if let Some(r) = self.text_job.as_ref().and_then(Job::poll) {
             self.text_job = None;
             match r {
@@ -482,6 +527,11 @@ fn dim_coord_paths(nc: &NcFile, v: &VarInfo, geo: &Geo) -> Vec<Option<String>> {
         .collect()
 }
 
+/// "Map unavailable" notice for `why` (a clause about the variable).
+fn map_notice(why: &str) -> String {
+    format!("Shown as an image: this variable cannot be drawn as a map because {why}.")
+}
+
 /// Runs on a helper thread. Coordinates that cannot be read are left out.
 fn load_coords(nc: &NcFile, paths: &[Option<String>], curv: Option<(String, String)>) -> Coords {
     // A coordinate this long would risk an allocation abort; labels then fall
@@ -491,7 +541,22 @@ fn load_coords(nc: &NcFile, paths: &[Option<String>], curv: Option<(String, Stri
         let len: usize = nc.meta.var(p)?.shape.iter().product();
         if len > MAX_COORD_LEN { None } else { nc.read_coord(p).ok() }
     };
+    // 2-D lat/lon are unpacked, so fill values become NaN.
+    let read_2d = |p: &str| -> Option<Arc<Vec<f64>>> {
+        let shape = &nc.meta.var(p)?.shape;
+        if shape.iter().product::<usize>() > CURV_MAX_CELLS {
+            return None;
+        }
+        let r = SliceRequest {
+            var: p.to_string(),
+            start: vec![0; shape.len()],
+            count: shape.clone(),
+            stride: vec![1; shape.len()],
+        };
+        let s = nc.read_slice(&r).ok()?;
+        Some(Arc::new(s.data.iter().map(|&v| f64::from(v)).collect()))
+    };
     let dims = paths.iter().map(|p| p.as_deref().and_then(read)).collect();
-    let curv = curv.and_then(|(lat, lon)| Some((read(&lat)?, read(&lon)?)));
+    let curv = curv.and_then(|(lat, lon)| Some((read_2d(&lat)?, read_2d(&lon)?)));
     Coords { dims, curv }
 }

@@ -1,4 +1,4 @@
-//! Centre panel: image, line or table view of the selected variable.
+//! Centre panel: map, image, line or table view of the selected variable.
 
 use std::borrow::Cow;
 
@@ -6,15 +6,17 @@ use eframe::egui::{self, Pos2, Rect, Vec2};
 use eframe::egui_wgpu::RenderState;
 use egui_extras::{Column, TableBuilder};
 
-use super::{fmt_value, inspector::log_range, slider_label};
-use crate::view::var_view::{Display, Hover, VarView};
+use super::{colorbar, fmt_value, inspector::log_range, map_view, slider_label};
 use crate::render::image::{self as gpu, ImageParams};
 use crate::view::defaults::{AxisChoice, ViewKind};
+use crate::view::var_view::{Display, Hover, Stats, VarView};
 
 /// The image panel's one GPU layer (layers are never freed, so the id is fixed).
 const IMAGE_LAYER_ID: u64 = 1;
 /// Wheel zoom speed: view scale factor per scrolled point.
-const WHEEL_ZOOM: f32 = 0.0025;
+pub const WHEEL_ZOOM: f32 = 0.0025;
+/// Width of the colour bar strip right of a map or image (points).
+const COLORBAR_WIDTH: f32 = 130.0;
 
 /// Draws the selected variable. Returns true when a new image was uploaded.
 pub fn show(
@@ -30,10 +32,14 @@ pub fn show(
         return false;
     };
     header(ui, v);
+    if let Some(n) = &v.notice {
+        ui.colored_label(ui.visuals().warn_fg_color, n);
+    }
     if let Some(e) = &v.error {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
     match v.kind {
+        ViewKind::Map => map_view::show(ui, v, display, rs),
         ViewKind::Image => image(ui, v, display, rs),
         ViewKind::Line => {
             line(ui, v);
@@ -96,7 +102,7 @@ fn image(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&Rend
         v.image.grid = Some(grid);
     }
 
-    let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+    let (rect, bar, resp) = plot_rects(ui, "image");
     v.hover = None;
     let (Some(layer), Some(grid), Some(shown)) = (v.image.layer, v.image.grid, &v.shown) else {
         if v.loading() {
@@ -150,18 +156,41 @@ fn image(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&Rend
     }
     v.image.view = Some(view);
 
-    let Some(range) = display.effective(Some(&stats)) else {
-        let font = egui::FontId::proportional(18.0);
-        let color = ui.visuals().warn_fg_color;
-        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "All values missing", font, color);
+    let Some(range) = draw_range(display, &stats) else {
+        all_missing(ui, rect);
         return uploaded;
     };
-    let range = if display.log { log_range(range, stats.min_positive).unwrap_or(range) } else { range };
     let params = ImageParams { range, colormap: display.colormap, log: display.log, view, flip_y };
     gpu::paint(ui, rect, &layer, &params);
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+    colorbar::show(ui, bar, display.colormap, range, display.log, &colorbar::colorbar_label(&v.var));
     uploaded
+}
+
+/// Allocates the rest of the panel: the plot rect (click and drag) and the
+/// colour bar strip to its right.
+pub fn plot_rects(ui: &mut egui::Ui, id: &str) -> (Rect, Rect, egui::Response) {
+    let (full, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+    let w = COLORBAR_WIDTH.min(full.width() * 0.3);
+    let plot = Rect::from_min_max(full.min, egui::pos2(full.max.x - w, full.max.y));
+    let bar = Rect::from_min_max(egui::pos2(full.max.x - w + 8.0, full.min.y), full.max);
+    let resp = ui.interact(plot, ui.make_persistent_id(id), egui::Sense::click_and_drag());
+    (plot, bar, resp)
+}
+
+/// The value range to colour with (log-adjusted in log mode); `None` when
+/// every value is missing.
+pub fn draw_range(display: &Display, stats: &Stats) -> Option<(f32, f32)> {
+    let range = display.effective(Some(stats))?;
+    Some(if display.log { log_range(range, stats.min_positive).unwrap_or(range) } else { range })
+}
+
+/// "All values missing" across `rect`.
+pub fn all_missing(ui: &egui::Ui, rect: Rect) {
+    let font = egui::FontId::proportional(18.0);
+    let color = ui.visuals().warn_fg_color;
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "All values missing", font, color);
 }
 
 /// Label for index `i` of dimension `d`: its coordinate (decoded if time).

@@ -28,7 +28,6 @@ pub struct CameraUniform {
 const _: () = assert!(std::mem::size_of::<CameraUniform>() == 32);
 
 /// The camera uniform for drawing `cam` into `rect` (points).
-#[allow(dead_code)] // used from Task 10
 pub fn camera_uniform(cam: &MapCamera, rect: egui::Rect, pixels_per_point: f32) -> CameraUniform {
     let r = rect * pixels_per_point;
     CameraUniform {

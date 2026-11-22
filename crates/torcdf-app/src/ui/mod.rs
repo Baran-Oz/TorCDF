@@ -1,8 +1,8 @@
 //! Drawing of the main window's panels, plus small formatting helpers.
 
-#[allow(dead_code)] // used from Task 10
 pub mod colorbar;
 pub mod inspector;
+pub mod map_view;
 pub mod plot_area;
 pub mod tree;
 
@@ -11,8 +11,8 @@ use torcdf_core::cf::TimeUnits;
 use torcdf_core::{AttrValue, DType};
 
 use crate::app::Action;
-use crate::view::var_view::VarView;
 use crate::view::defaults::ViewKind;
+use crate::view::var_view::VarView;
 
 /// Menu bar: File and View (Process and Edit come in later stages).
 pub fn menu_bar(ui: &mut egui::Ui, view: Option<&VarView>, actions: &mut Vec<Action>) {
@@ -35,6 +35,7 @@ pub fn menu_bar(ui: &mut egui::Ui, view: Option<&VarView>, actions: &mut Vec<Act
             };
             for kind in v.kinds() {
                 let name = match kind {
+                    ViewKind::Map => "Map",
                     ViewKind::Image => "Image",
                     ViewKind::Line => "Line plot",
                     ViewKind::Table => "Table",
@@ -45,7 +46,9 @@ pub fn menu_bar(ui: &mut egui::Ui, view: Option<&VarView>, actions: &mut Vec<Act
                 }
             }
             ui.separator();
-            let fit = ui.add_enabled(v.kind == ViewKind::Image, egui::Button::new("Fit image to window"));
+            let label = if v.kind == ViewKind::Map { "Fit map to window" } else { "Fit image to window" };
+            let fittable = matches!(v.kind, ViewKind::Image | ViewKind::Map);
+            let fit = ui.add_enabled(fittable, egui::Button::new(label));
             if fit.clicked() {
                 actions.push(Action::FitView);
                 ui.close();

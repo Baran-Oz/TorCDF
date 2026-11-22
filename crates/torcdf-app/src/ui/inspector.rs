@@ -5,22 +5,32 @@ use torcdf_core::cf::Geo;
 use torcdf_core::{Attr, Storage};
 
 use super::{attr_text, dtype_name, fmt_value, slider_label};
-use crate::view::var_view::{Display, VarView};
+use crate::map::projection::Projection;
 use crate::render::colormap::Colormap;
+use crate::view::defaults::ViewKind;
+use crate::view::var_view::{Display, VarView};
 
 pub fn show(
     ui: &mut egui::Ui,
     display: &mut Display,
-    view: Option<&VarView>,
+    mut view: Option<&mut VarView>,
     var_selected: bool,
     attrs: Option<(String, &[Attr])>,
 ) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.heading("Plot");
-        settings(ui, display, view);
+        settings(ui, display, view.as_deref());
+        if let Some(v) = view.as_deref_mut() {
+            map_settings(ui, v);
+        }
+        let view = view.as_deref();
         ui.separator();
         ui.heading("Cursor");
-        cursor(ui, view);
+        if view.is_some_and(|v| v.kind == ViewKind::Map) {
+            map_cursor(ui, view);
+        } else {
+            cursor(ui, view);
+        }
         ui.separator();
         ui.heading("Attributes");
         attributes(ui, view, var_selected, attrs);
@@ -86,6 +96,65 @@ fn range_field(v: &mut f32, speed: f64) -> egui::DragValue<'_> {
 
 fn units(v: &VarView) -> &str {
     v.var.attrs.iter().find(|a| a.name == "units").and_then(|a| a.value.as_str()).unwrap_or("")
+}
+
+/// Projection and overlay switches of the map view. They only change
+/// state; re-projection happens in background jobs.
+fn map_settings(ui: &mut egui::Ui, v: &mut VarView) {
+    let (ViewKind::Map, Some(map)) = (v.kind, v.map.as_mut()) else { return };
+    ui.add_space(4.0);
+    let mut proj = map.camera.proj;
+    egui::ComboBox::from_id_salt("projection").selected_text(proj.name()).show_ui(ui, |ui| {
+        for p in Projection::all() {
+            ui.selectable_value(&mut proj, *p, p.name());
+        }
+    });
+    map.set_projection(proj);
+    ui.checkbox(&mut map.coast, "Coastlines");
+    ui.checkbox(&mut map.borders, "Borders");
+    ui.checkbox(&mut map.grid, "Grid lines");
+}
+
+/// Value, lon/lat and slider positions under the pointer on the map; "—"
+/// where there is no data (or no globe).
+fn map_cursor(ui: &mut egui::Ui, view: Option<&VarView>) {
+    let Some((v, map)) = view.and_then(|v| Some((v, v.map.as_ref()?))) else { return };
+    if !map.hovering {
+        ui.weak("Hover over the map to see values.");
+        return;
+    }
+    const NONE: &str = "—";
+    egui::Grid::new("map cursor").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("value");
+        match v.hover {
+            Some(h) => ui.label(format!("{} {}", fmt_value(h.value as f64), units(v))),
+            None => ui.label(NONE),
+        };
+        ui.end_row();
+        let (lon, lat) = match map.pointer {
+            Some((lo, la)) => (format!("{lo:.4}°"), format!("{la:.4}°")),
+            None => (NONE.into(), NONE.into()),
+        };
+        ui.label("lon");
+        ui.label(lon);
+        ui.end_row();
+        ui.label("lat");
+        ui.label(lat);
+        ui.end_row();
+        if let (Some(h), Some(a)) = (v.hover, v.axes) {
+            ui.label("index");
+            ui.label(format!("{} {}, {} {}", v.var.dims[a.y], h.iy, v.var.dims[a.x], h.ix));
+            ui.end_row();
+        }
+        let coord = |d: usize, i: usize| v.coords.dims.get(d)?.as_ref()?.get(i).copied();
+        for d in v.slider_dims() {
+            let pos = v.slider_pos[d];
+            let time = if v.time_dim == Some(d) { v.time_units.as_ref() } else { None };
+            ui.label(&v.var.dims[d]);
+            ui.label(slider_label(pos, coord(d, pos), time));
+            ui.end_row();
+        }
+    });
 }
 
 fn cursor(ui: &mut egui::Ui, view: Option<&VarView>) {

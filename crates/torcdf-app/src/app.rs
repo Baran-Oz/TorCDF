@@ -324,6 +324,10 @@ impl TorApp {
                     v.kind = kind;
                     v.shown = None;
                     v.image = ImageState::default();
+                    // The map keeps its camera and cell index, not its tile.
+                    if let Some(m) = &mut v.map {
+                        m.reset_tiles();
+                    }
                     v.refresh(&self.ctx, &self.service);
                 }
             }
@@ -331,6 +335,9 @@ impl TorApp {
                 if let Some(v) = &mut self.view {
                     v.image.view = None;
                     v.image.user_moved = false;
+                    if let Some(m) = &mut v.map {
+                        m.request_fit();
+                    }
                 }
             }
             Action::Exit => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -387,7 +394,7 @@ impl eframe::App for TorApp {
         let attrs = selected_attrs(&self.files, self.selection.as_ref());
         let var_selected = matches!(self.selection, Some(Selection::Var(..)));
         egui::Panel::right("inspector").default_size(300.0).show(ui, |ui| {
-            inspector::show(ui, &mut self.display, self.view.as_ref(), var_selected, attrs)
+            inspector::show(ui, &mut self.display, self.view.as_mut(), var_selected, attrs)
         });
         if let Some(v) = &mut self.view
             && !v.slider_dims().is_empty()
@@ -405,12 +412,21 @@ impl eframe::App for TorApp {
             self.first_image_logged = true;
             if let Some(v) = &self.view {
                 let range = self.display.effective(v.shown.as_ref().map(|s| &s.stats));
-                self.log.log(format_args!(
-                    "first image uploaded {:.1} ms after request; grid {:?}, flip_y (north up) {}, range {range:?}",
-                    ms(v.requested_at),
-                    v.image.grid,
-                    v.flip_y(),
-                ));
+                if let (ViewKind::Map, Some(m)) = (v.kind, &v.map) {
+                    self.log.log(format_args!(
+                        "first map tile uploaded {:.1} ms after request; tile {:?}, camera {:?}, range {range:?}",
+                        ms(v.requested_at),
+                        m.overview.as_ref().map(|t| t.spec),
+                        m.camera,
+                    ));
+                } else {
+                    self.log.log(format_args!(
+                        "first image uploaded {:.1} ms after request; grid {:?}, flip_y (north up) {}, range {range:?}",
+                        ms(v.requested_at),
+                        v.image.grid,
+                        v.flip_y(),
+                    ));
+                }
             }
         }
         for a in actions {
