@@ -83,6 +83,9 @@ pub struct Shown {
     pub line: Vec<egui_plot::PlotPoint>,
 }
 
+/// Curvilinear 2-D latitude and longitude, shared with the map's jobs.
+pub type CurvLatLon = (Arc<Vec<f64>>, Arc<Vec<f64>>);
+
 /// Coordinate values of a variable, read off the UI thread.
 #[derive(Default)]
 pub struct Coords {
@@ -90,7 +93,7 @@ pub struct Coords {
     pub dims: Vec<Option<Vec<f64>>>,
     /// Curvilinear 2-D latitude and longitude, row-major over (y, x),
     /// unpacked (missing values are NaN). Shared with the map's jobs.
-    pub curv: Option<(Arc<Vec<f64>>, Arc<Vec<f64>>)>,
+    pub curv: Option<CurvLatLon>,
 }
 
 /// Image layer and navigation state of the image view.

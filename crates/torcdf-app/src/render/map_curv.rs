@@ -17,7 +17,7 @@ use crate::map::mesh::MeshVertex;
 
 /// Checks that `indices` forms whole triangles over `verts`.
 fn check_mesh(verts: &[MeshVertex], indices: &[u32]) -> Result<(), UploadError> {
-    if indices.len() % 3 != 0 {
+    if !indices.len().is_multiple_of(3) {
         return Err(UploadError::BadCoords("mesh indices are not whole triangles"));
     }
     if indices.iter().any(|&i| i as usize >= verts.len()) {

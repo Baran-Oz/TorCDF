@@ -392,7 +392,7 @@ mod tests {
         let cam = world_cam(Projection::Equirectangular);
         let px = draw(&rs, &tile, &cam, 8);
         let got = at(&px, &cam, 45.0, 45.0);
-        assert!(near(got, lut_of(1 * 4 + 2, 8)), "{got:?} vs {:?}", lut_of(6, 8));
+        assert!(near(got, lut_of(6, 8)), "{got:?} vs {:?}", lut_of(6, 8)); // row 1, column 2 of 4
         let got = at(&px, &cam, -135.0, -45.0);
         assert!(near(got, lut_of(0, 8)), "{got:?}");
     }

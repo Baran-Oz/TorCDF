@@ -340,7 +340,9 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
         device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         let mapped = readback.get_mapped_range(..).expect("mapped range");
         mapped
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|c| std::array::from_fn(|i| bytemuck::pod_read_unaligned(&c[4 * i..4 * i + 4])))
             .collect()
     }

@@ -159,6 +159,9 @@ struct GridKey {
     window: GeoWindow,
 }
 
+/// Projected coastlines and borders, as line segment vertex lists.
+type BasemapLines = (Vec<[f32; 2]>, Vec<[f32; 2]>);
+
 /// A curvilinear tile's mesh (geographic) and its projection for `proj`.
 struct MeshSet {
     spec: TileSpec,
@@ -212,7 +215,7 @@ pub struct MapState {
     mesh_on_gpu: Option<Projection>,
     /// Projection of the coastline and border sets on the GPU.
     basemap_on_gpu: Option<Projection>,
-    basemap_job: Option<(Projection, Job<(Vec<[f32; 2]>, Vec<[f32; 2]>)>)>,
+    basemap_job: Option<(Projection, Job<BasemapLines>)>,
     grid_on_gpu: Option<GridKey>,
     grid_job: Option<(GridKey, Job<Vec<[f32; 2]>>)>,
     /// Keys whose job died: never started again for the same key.
@@ -1178,7 +1181,7 @@ mod tests {
         m.mesh_job = Some(((spec, proj), Job::spawn(&ctx, move || -> MeshSet {
             panic!("injected job failure")
         })));
-        m.basemap_job = Some((proj, Job::spawn(&ctx, move || -> (Vec<[f32; 2]>, Vec<[f32; 2]>) {
+        m.basemap_job = Some((proj, Job::spawn(&ctx, move || -> BasemapLines {
             panic!("injected job failure")
         })));
         let step = graticule_step((100.0 / m.camera.scale).to_degrees());

@@ -29,7 +29,7 @@ fn lattice(n: usize, max_side: usize) -> Vec<usize> {
         return Vec::new();
     }
     let max_side = max_side.max(2);
-    let k = (1..).find(|&k| (n - 1).div_ceil(k) + 1 <= max_side).unwrap_or(1);
+    let k = (1..).find(|&k| (n - 1).div_ceil(k) < max_side).unwrap_or(1);
     let mut v: Vec<usize> = (0..n - 1).step_by(k).collect();
     v.push(n - 1);
     v
