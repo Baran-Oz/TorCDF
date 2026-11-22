@@ -158,7 +158,8 @@ impl Display {
         }
         let auto = stats?.auto?;
         Some(match self.colormap {
-            Colormap::Diverging | Colormap::Topo => inspector::centre_on_zero(auto),
+            Colormap::Diverging => inspector::centre_on_zero(auto),
+            Colormap::Topo => inspector::sea_level_range(auto),
             Colormap::Viridis => auto,
         })
     }
@@ -475,10 +476,10 @@ impl VarView {
             self.coords = r.unwrap_or_default();
             self.coords_job = None;
             // Line x values come from the coordinates.
-            if self.kind == ViewKind::Line {
-                if let Some(s) = self.shown.take() {
-                    self.show(s.slice, s.req, s.stats);
-                }
+            if self.kind == ViewKind::Line
+                && let Some(s) = self.shown.take()
+            {
+                self.show(s.slice, s.req, s.stats);
             }
             // Orientation and aspect may have changed.
             if !self.image.user_moved {
@@ -497,23 +498,23 @@ impl VarView {
             }
             arrived = true;
         }
-        if let Some(h) = &mut self.pending {
-            if let Some(r) = h.try_take() {
-                let req = h.req().clone();
-                self.pending = None;
-                arrived |= self.on_slice(ctx, req, r);
-            }
+        if let Some(h) = &mut self.pending
+            && let Some(r) = h.try_take()
+        {
+            let req = h.req().clone();
+            self.pending = None;
+            arrived |= self.on_slice(ctx, req, r);
         }
-        if let Some((_, _, job)) = &self.stats_job {
-            if let Some(r) = job.poll() {
-                let (slice, req, _) = self.stats_job.take().expect("checked above");
-                match r {
-                    Ok(stats) => {
-                        self.show(slice, req, stats);
-                        arrived = true;
-                    }
-                    Err(()) => self.error = Some("Range statistics failed unexpectedly.".into()),
+        if let Some((_, _, job)) = &self.stats_job
+            && let Some(r) = job.poll()
+        {
+            let (slice, req, _) = self.stats_job.take().expect("checked above");
+            match r {
+                Ok(stats) => {
+                    self.show(slice, req, stats);
+                    arrived = true;
                 }
+                Err(()) => self.error = Some("Range statistics failed unexpectedly.".into()),
             }
         }
         (arrived, coords_arrived)
@@ -527,11 +528,15 @@ impl VarView {
             let (ny, nx) = (self.var.shape[a.y], self.var.shape[a.x]);
             let mid = nx / 2;
             return match (lat.get(mid), lat.get((ny - 1) * nx + mid)) {
+                // Deliberate: NaN endpoints count as "not decreasing" (north up).
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
                 (Some(first), Some(last)) => !(last < first),
                 _ => true,
             };
         }
         match self.coords.dims.get(a.y).and_then(|c| c.as_ref()) {
+            // Deliberate: NaN endpoints count as "not decreasing" (north up).
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
             Some(c) if c.len() >= 2 => !(c[c.len() - 1] < c[0]),
             _ => true,
         }
@@ -589,8 +594,15 @@ fn dim_coord_paths(nc: &NcFile, v: &VarInfo, geo: &Geo) -> Vec<Option<String>> {
 
 /// Runs on a helper thread. Coordinates that cannot be read are left out.
 fn load_coords(nc: &NcFile, paths: &[Option<String>], curv: Option<(String, String)>) -> Coords {
-    let dims = paths.iter().map(|p| p.as_deref().and_then(|p| nc.read_coord(p).ok())).collect();
-    let curv = curv.and_then(|(lat, lon)| Some((nc.read_coord(&lat).ok()?, nc.read_coord(&lon).ok()?)));
+    // A coordinate this long would risk an allocation abort; labels then fall
+    // back to indices.
+    const MAX_COORD_LEN: usize = 10_000_000;
+    let read = |p: &str| {
+        let len: usize = nc.meta.var(p)?.shape.iter().product();
+        if len > MAX_COORD_LEN { None } else { nc.read_coord(p).ok() }
+    };
+    let dims = paths.iter().map(|p| p.as_deref().and_then(read)).collect();
+    let curv = curv.and_then(|(lat, lon)| Some((read(&lat)?, read(&lon)?)));
     Coords { dims, curv }
 }
 
@@ -712,10 +724,10 @@ impl TorApp {
                 let (first, last) = (label(0), label(n.saturating_sub(1)));
                 self.log.log(format_args!("time axis {}: {first} .. {last} ({n} steps)", v.var.dims[d]));
             }
-            if !error_before {
-                if let Some(e) = &v.error {
-                    self.log.log(format_args!("view error: {e}"));
-                }
+            if !error_before
+                && let Some(e) = &v.error
+            {
+                self.log.log(format_args!("view error: {e}"));
             }
         }
     }
@@ -787,13 +799,13 @@ impl TorApp {
                 }
             }
             Action::SetKind(kind) => {
-                if let Some(v) = &mut self.view {
-                    if v.kind != kind {
-                        v.kind = kind;
-                        v.shown = None;
-                        v.image = ImageState::default();
-                        v.refresh(&self.ctx, &self.service);
-                    }
+                if let Some(v) = &mut self.view
+                    && v.kind != kind
+                {
+                    v.kind = kind;
+                    v.shown = None;
+                    v.image = ImageState::default();
+                    v.refresh(&self.ctx, &self.service);
                 }
             }
             Action::FitView => {
@@ -854,13 +866,14 @@ impl eframe::App for TorApp {
             tree::show(ui, &self.files, &self.opening, self.selection.as_ref(), &mut actions)
         });
         let attrs = selected_attrs(&self.files, self.selection.as_ref());
+        let var_selected = matches!(self.selection, Some(Selection::Var(..)));
         egui::Panel::right("inspector").default_size(300.0).show(ui, |ui| {
-            inspector::show(ui, &mut self.display, self.view.as_ref(), attrs)
+            inspector::show(ui, &mut self.display, self.view.as_ref(), var_selected, attrs)
         });
-        if let Some(v) = &mut self.view {
-            if !v.slider_dims().is_empty() {
-                egui::Panel::bottom("sliders").show(ui, |ui| ui::slider_strip(ui, v, &mut actions));
-            }
+        if let Some(v) = &mut self.view
+            && !v.slider_dims().is_empty()
+        {
+            egui::Panel::bottom("sliders").show(ui, |ui| ui::slider_strip(ui, v, &mut actions));
         }
         let uploaded = egui::CentralPanel::default()
             .show(ui, |ui| {

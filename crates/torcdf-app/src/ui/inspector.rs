@@ -12,6 +12,7 @@ pub fn show(
     ui: &mut egui::Ui,
     display: &mut Display,
     view: Option<&VarView>,
+    var_selected: bool,
     attrs: Option<(String, &[Attr])>,
 ) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -22,7 +23,7 @@ pub fn show(
         cursor(ui, view);
         ui.separator();
         ui.heading("Attributes");
-        attributes(ui, view, attrs);
+        attributes(ui, view, var_selected, attrs);
     });
 }
 
@@ -112,15 +113,15 @@ fn cursor(ui: &mut egui::Ui, view: Option<&VarView>) {
             }
             Geo::Curvilinear { .. } => {
                 let i = h.iy * v.var.shape[a.x] + h.ix;
-                if let Some((lat, lon)) = &v.coords.curv {
-                    if let (Some(la), Some(lo)) = (lat.get(i), lon.get(i)) {
-                        ui.label("lat");
-                        ui.label(format!("{la:.4}"));
-                        ui.end_row();
-                        ui.label("lon");
-                        ui.label(format!("{lo:.4}"));
-                        ui.end_row();
-                    }
+                if let Some((lat, lon)) = &v.coords.curv
+                    && let (Some(la), Some(lo)) = (lat.get(i), lon.get(i))
+                {
+                    ui.label("lat");
+                    ui.label(format!("{la:.4}"));
+                    ui.end_row();
+                    ui.label("lon");
+                    ui.label(format!("{lo:.4}"));
+                    ui.end_row();
                 }
             }
             Geo::None => {
@@ -146,13 +147,18 @@ fn cursor(ui: &mut egui::Ui, view: Option<&VarView>) {
     });
 }
 
-fn attributes(ui: &mut egui::Ui, view: Option<&VarView>, attrs: Option<(String, &[Attr])>) {
+fn attributes(
+    ui: &mut egui::Ui,
+    view: Option<&VarView>,
+    var_selected: bool,
+    attrs: Option<(String, &[Attr])>,
+) {
     let Some((title, attrs)) = attrs else {
         ui.weak("Select a file, group or variable.");
         return;
     };
     ui.strong(title);
-    if let Some(v) = view.filter(|v| v.var.attrs.as_slice() == attrs) {
+    if let Some(v) = view.filter(|_| var_selected) {
         let dims: Vec<String> =
             v.var.dims.iter().zip(&v.var.shape).map(|(d, n)| format!("{d}={n}")).collect();
         ui.label(format!("{}  ({})", dtype_name(&v.var.dtype), dims.join(", ")));
@@ -193,11 +199,20 @@ pub fn centre_on_zero(range: (f32, f32)) -> (f32, f32) {
     }
 }
 
+/// Topography range: always symmetric about zero so the colour map splits at
+/// sea level, even when the data are all above or all below it.
+pub fn sea_level_range(range: (f32, f32)) -> (f32, f32) {
+    let m = range.0.abs().max(range.1.abs());
+    (-m, m)
+}
+
 /// The range to draw in log mode: a non-positive low end is raised to the
 /// smallest positive value of the slice. `Err` explains why log scale cannot
 /// be drawn.
 pub fn log_range(range: (f32, f32), min_positive: Option<f32>) -> Result<(f32, f32), &'static str> {
     let (lo, hi) = range;
+    // Deliberate: a NaN maximum must also take the error path.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(hi > 0.0) {
         return Err("log scale needs a positive range maximum");
     }
@@ -219,6 +234,14 @@ mod tests {
         assert_eq!(centre_on_zero((2.0, 4.0)), (2.0, 4.0));
         assert_eq!(centre_on_zero((-4.0, -2.0)), (-4.0, -2.0));
         assert_eq!(centre_on_zero((0.0, 4.0)), (0.0, 4.0));
+    }
+
+    #[test]
+    fn topo_always_splits_at_sea_level() {
+        assert_eq!(sea_level_range((-5000.0, 3000.0)), (-5000.0, 5000.0));
+        assert_eq!(sea_level_range((2.0, 4.0)), (-4.0, 4.0));
+        assert_eq!(sea_level_range((-4.0, -2.0)), (-4.0, 4.0));
+        assert_eq!(sea_level_range((0.0, 4.0)), (-4.0, 4.0));
     }
 
     #[test]
