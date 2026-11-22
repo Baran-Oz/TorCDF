@@ -248,6 +248,53 @@ fn bad_units_is_none() {
 }
 
 #[test]
+fn zone_offsets() {
+    let e = |z: &str| dt(&format!("hours since 2000-01-01 12:00:00 {z}"), None, 0.0);
+    assert_eq!(e("+01:00"), "2000-01-01 11:00");
+    assert_eq!(e("+0100"), "2000-01-01 11:00");
+    assert_eq!(e("-0600"), "2000-01-01 18:00");
+    assert_eq!(e("+01"), "2000-01-01 11:00");
+    assert_eq!(e("-0530"), "2000-01-01 17:30");
+    for bad in ["+100", "+01000", "+1:0", "+0160", "+25:00", "+ab"] {
+        assert!(
+            TimeUnits::parse(&format!("hours since 2000-01-01 12:00:00 {bad}"), None).is_none(),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn projected_grid_is_curvilinear() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("proj.nc");
+    {
+        let mut f = netcdf::create(&path).unwrap();
+        f.add_dimension("y", 3).unwrap();
+        f.add_dimension("x", 4).unwrap();
+        for (n, axis, std) in [("y", "Y", "projection_y_coordinate"), ("x", "X", "projection_x_coordinate")] {
+            let mut v = f.add_variable::<f64>(n, &[n]).unwrap();
+            v.put_attribute("units", "m").unwrap();
+            v.put_attribute("axis", axis).unwrap();
+            v.put_attribute("standard_name", std).unwrap();
+        }
+        for (n, units) in [("lat", "degrees_north"), ("lon", "degrees_east")] {
+            let mut v = f.add_variable::<f64>(n, &["y", "x"]).unwrap();
+            v.put_attribute("units", units).unwrap();
+        }
+        let mut t = f.add_variable::<f32>("t", &["y", "x"]).unwrap();
+        t.put_attribute("coordinates", "lat lon").unwrap();
+    }
+    let file = NcFile::open(&path).unwrap();
+    let t = file.meta.var("/t").unwrap();
+    match detect_geo(&file.meta, t) {
+        Geo::Curvilinear { y_dim: 0, x_dim: 1, lat_var, lon_var } => {
+            assert_eq!((lat_var.as_str(), lon_var.as_str()), ("/lat", "/lon"));
+        }
+        g => panic!("{g:?}"),
+    }
+}
+
+#[test]
 fn calendar_round_trip() {
     // decode -> format -> parse as epoch -> decode(0) must be the identity,
     // and successive samples must differ, for every calendar across eras.

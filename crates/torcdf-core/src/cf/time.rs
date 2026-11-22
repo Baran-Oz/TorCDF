@@ -120,7 +120,6 @@ fn jdn_to_julian(j: i64) -> (i64, i64, i64) {
     richards_tail(j + 1401)
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CfDateTime {
     pub year: i32,
@@ -241,9 +240,18 @@ fn parse_epoch(s: &str) -> Option<(i64, i64, i64, f64)> {
     } else if let Some(i) = time.rfind(['+', '-']) {
         let (t, z) = time.split_at(i);
         let sign = if z.starts_with('-') { -1.0 } else { 1.0 };
-        let mut zp = z[1..].trim().split(':');
-        let zh: f64 = zp.next()?.parse().ok()?;
-        let zm: f64 = zp.next().map_or(Some(0.0), |x| x.parse().ok())?;
+        // Accepted: hh, hhmm, hh:mm.
+        let digits = z[1..].trim();
+        let (zh, zm): (f64, f64) = match digits.split_once(':') {
+            Some((h, m)) if h.len() <= 2 && m.len() == 2 => (h.parse().ok()?, m.parse().ok()?),
+            Some(_) => return None,
+            None if digits.len() == 4 => (digits[..2].parse().ok()?, digits[2..].parse().ok()?),
+            None if (1..=2).contains(&digits.len()) => (digits.parse().ok()?, 0.0),
+            None => return None,
+        };
+        if !digits.bytes().all(|b| b.is_ascii_digit() || b == b':') || zh > 23.0 || zm > 59.0 {
+            return None;
+        }
         offset_secs = sign * (zh * 3600.0 + zm * 60.0);
         time = t.trim_end();
     }

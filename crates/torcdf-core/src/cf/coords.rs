@@ -80,11 +80,18 @@ fn classify(c: &VarInfo) -> Option<Kind> {
             _ => {}
         }
     }
-    if let Some(axis) = attr_str(c, "axis") {
-        match axis.to_ascii_uppercase().as_str() {
-            "Y" => return Some(Kind::Lat),
-            "X" => return Some(Kind::Lon),
-            _ => {}
+    // The axis fallback needs no conflicting evidence: a projected x/y (metres,
+    // projection_x_coordinate) is not lat/lon even though it has axis X/Y.
+    let conflicting_std = attr_str(c, "standard_name").is_some();
+    let conflicting_units = attr_str(c, "units")
+        .is_some_and(|u| !u.to_ascii_lowercase().starts_with("degree"));
+    if !conflicting_std && !conflicting_units {
+        if let Some(axis) = attr_str(c, "axis") {
+            match axis.to_ascii_uppercase().as_str() {
+                "Y" => return Some(Kind::Lat),
+                "X" => return Some(Kind::Lon),
+                _ => {}
+            }
         }
     }
     match c.name.to_ascii_lowercase().as_str() {
