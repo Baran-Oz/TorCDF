@@ -1,5 +1,6 @@
 //! Default view, axes, request and value range for a variable (spec 6.3).
 
+use crate::map::tiles::TileSpec;
 use torcdf_core::cf::{Geo, detect_geo};
 use torcdf_core::{Dataset, Slice, SliceRequest, VarInfo};
 
@@ -56,15 +57,32 @@ pub fn overview_stride(len: usize, target: usize) -> usize {
 /// Full extent (thinned to the overview size) on the plotted axes; one index
 /// from `slider_pos` on every other dimension.
 pub fn build_request(v: &VarInfo, axes: &AxisChoice, slider_pos: &[usize]) -> SliceRequest {
+    let len = |d: usize| v.shape.get(d).copied().unwrap_or(0);
+    tile_request(v, axes, slider_pos, &TileSpec::overview(len(axes.y), len(axes.x)))
+}
+
+/// Request for one tile of the plotted dimensions; one index from
+/// `slider_pos` on every other dimension.
+pub fn tile_request(
+    v: &VarInfo,
+    axes: &AxisChoice,
+    slider_pos: &[usize],
+    tile: &TileSpec,
+) -> SliceRequest {
     let n = v.shape.len();
     let (mut start, mut count, mut stride) = (vec![0; n], vec![1; n], vec![1; n]);
     for d in 0..n {
-        if d == axes.y || d == axes.x {
-            count[d] = v.shape[d];
-            stride[d] = overview_stride(v.shape[d], OVERVIEW_TARGET);
+        let a = if d == axes.y {
+            0
+        } else if d == axes.x {
+            1
         } else {
             start[d] = slider_pos.get(d).copied().unwrap_or(0);
-        }
+            continue;
+        };
+        start[d] = tile.start[a];
+        count[d] = tile.count[a];
+        stride[d] = tile.stride[a].max(1);
     }
     SliceRequest { var: v.path.clone(), start, count, stride }
 }
@@ -173,6 +191,17 @@ mod tests {
                 stride: vec![1, 1, 1]
             }
         );
+    }
+
+    #[test]
+    fn tile_request_maps_spec() {
+        let mut v = open(fixtures::write_bare).var("/data").unwrap().clone();
+        v.shape = vec![12, 400, 500];
+        let tile = TileSpec { start: [10, 20], count: [100, 200], stride: [2, 4] };
+        let r = tile_request(&v, &AxisChoice { y: 1, x: 2 }, &[5, 0, 0], &tile);
+        assert_eq!(r.start, vec![5, 10, 20]);
+        assert_eq!(r.count, vec![1, 100, 200]);
+        assert_eq!(r.stride, vec![1, 2, 4]);
     }
 
     #[test]
