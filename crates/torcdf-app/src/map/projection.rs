@@ -18,7 +18,13 @@ pub enum Projection {
 
 /// Wrap a longitude in radians to [-pi, pi).
 fn wrap_lon(lon: f64) -> f64 {
-    (lon + PI).rem_euclid(TAU) - PI
+    let w = (lon + PI).rem_euclid(TAU) - PI;
+    // rem_euclid can round up to exactly TAU for tiny negative inputs.
+    if w >= PI {
+        w - TAU
+    } else {
+        w
+    }
 }
 
 impl Projection {
@@ -56,6 +62,9 @@ impl Projection {
     }
 
     pub fn forward(&self, lon_deg: f64, lat_deg: f64) -> Option<[f64; 2]> {
+        if !lon_deg.is_finite() || !lat_deg.is_finite() || lat_deg.abs() > 90.0 {
+            return None;
+        }
         let lam = wrap_lon(lon_deg.to_radians());
         let phi = lat_deg.to_radians();
         match self {
@@ -85,6 +94,9 @@ impl Projection {
 
     /// Returns (lon, lat) in degrees with lon in [-180, 180).
     pub fn inverse(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
         match self {
             Projection::Equirectangular => {
                 if y.abs() > FRAC_PI_2 {
@@ -194,6 +206,35 @@ mod tests {
                 lon += 7;
             }
         }
+    }
+
+    #[test]
+    fn non_finite_and_out_of_range_rejected() {
+        for &p in Projection::all() {
+            assert!(p.forward(f64::NAN, 10.0).is_none(), "{p:?}");
+            assert!(p.forward(10.0, f64::NAN).is_none(), "{p:?}");
+            assert!(p.forward(f64::INFINITY, 10.0).is_none(), "{p:?}");
+            assert!(p.forward(10.0, 100.0).is_none(), "{p:?}");
+            assert!(p.forward(10.0, -100.0).is_none(), "{p:?}");
+            assert!(p.inverse(f64::NAN, 0.5).is_none(), "{p:?}");
+            assert!(p.inverse(0.5, f64::NAN).is_none(), "{p:?}");
+            assert!(p.inverse(f64::INFINITY, 0.5).is_none(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn longitude_wraps_into_half_open_range() {
+        for lon in [180.0, -180.0, 540.0, -540.0] {
+            let xy = Projection::Equirectangular.forward(lon, 0.0).unwrap();
+            assert_eq!(xy[0], -PI, "forward lon {lon}");
+            let (back, _) = Projection::Equirectangular.inverse(xy[0], 0.0).unwrap();
+            assert_eq!(back, -180.0, "inverse lon {lon}");
+        }
+        // Just below -pi must not round up to +pi.
+        let (lon, _) = Projection::Mercator.inverse(-PI - 1e-16, 0.0).unwrap();
+        assert!((-180.0..180.0).contains(&lon), "{lon}");
+        let (lon, _) = Projection::Mercator.inverse(-1e-17 - PI, 0.0).unwrap();
+        assert!((-180.0..180.0).contains(&lon), "{lon}");
     }
 
     #[test]
