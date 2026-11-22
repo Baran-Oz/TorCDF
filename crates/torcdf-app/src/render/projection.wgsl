@@ -12,6 +12,8 @@ const PROJ_TAU: f32 = 6.28318530717959;
 const PROJ_FRAC_PI_2: f32 = 1.57079632679490;
 const PROJ_FRAC_PI_4: f32 = 0.78539816339745;
 const MERCATOR_LIMIT_DEG: f32 = 85.051129;
+// Mercator inverse accepts |y| up to pi plus a tolerance (CPU: 1e-6).
+const MERCATOR_Y_MAX: f32 = 3.1415937;
 // Polar inverse accepts rho <= 2 plus a tolerance so the equator (rho = 2)
 // round-trips: 1e-9 on the CPU (f64), one f32 ulp at 2 here.
 const POLAR_RHO_MAX: f32 = 2.0000002;
@@ -149,8 +151,10 @@ fn inverse(proj: u32, xy: vec2<f32>) -> vec3<f32> {
             }
         }
         case 1u: {
-            let phi = 2.0 * proj_atan(exp(y)) - PROJ_FRAC_PI_2;
-            out = vec3<f32>(degrees(wrap_lon(x)), degrees(phi), 1.0);
+            if abs(y) <= MERCATOR_Y_MAX {
+                let phi = 2.0 * proj_atan(exp(y)) - PROJ_FRAC_PI_2;
+                out = vec3<f32>(degrees(wrap_lon(x)), degrees(phi), 1.0);
+            }
         }
         case 2u, 3u: {
             let rho = length(xy);

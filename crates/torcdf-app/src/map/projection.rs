@@ -6,6 +6,9 @@ use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
 /// Mercator is cut off at the latitude where y = pi (a square world).
 pub const MERCATOR_LIMIT_DEG: f64 = 85.051_129;
+/// Mercator inverse accepts |y| up to pi plus a tolerance, so the limit
+/// latitude (rounded up, y a hair above pi) round-trips.
+const MERCATOR_Y_MAX: f64 = PI + 1e-6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Projection {
@@ -105,6 +108,9 @@ impl Projection {
                 Some((wrap_lon(x).to_degrees(), y.to_degrees()))
             }
             Projection::Mercator => {
+                if y.abs() > MERCATOR_Y_MAX {
+                    return None;
+                }
                 let phi = 2.0 * y.exp().atan() - FRAC_PI_2;
                 Some((wrap_lon(x).to_degrees(), phi.to_degrees()))
             }
@@ -153,6 +159,16 @@ mod tests {
     fn mercator_rejects_beyond_limit() {
         assert!(Projection::Mercator.forward(0.0, 86.0).is_none());
         assert!(Projection::Mercator.forward(0.0, 90.0).is_none());
+    }
+
+    #[test]
+    fn mercator_inverse_rejects_beyond_square_world() {
+        let m = Projection::Mercator;
+        let top = m.forward(0.0, MERCATOR_LIMIT_DEG).unwrap()[1];
+        assert!(m.inverse(0.0, top).is_some(), "the limit round-trips");
+        assert!(m.inverse(0.0, 3.0).is_some());
+        assert!(m.inverse(0.0, PI + 0.01).is_none());
+        assert!(m.inverse(1.0, -PI - 0.01).is_none());
     }
 
     #[test]

@@ -365,7 +365,8 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
             cases.push([id, 0.0, 10.0, f32::INFINITY]);
             // Inverse: points inside and outside each world.
             for x in [-4.0, -2.5, -1.0, -0.3, 0.0, 0.7, 1.5, 3.0, 3.5] {
-                for y in [-3.0, -1.7, -1.0, -0.2, 0.0, 0.4, 1.2, 1.6, 2.5] {
+                // +-3.3: beyond Mercator's square world (|y| > pi).
+                for y in [-3.3, -3.0, -1.7, -1.0, -0.2, 0.0, 0.4, 1.2, 1.6, 2.5, 3.3] {
                     cases.push([id, 1.0, x, y]);
                 }
             }
@@ -379,6 +380,9 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
             let p = Projection::all()[c[0] as usize];
             let (a, b) = (c[2] as f64, c[3] as f64);
             let inverse = c[1] != 0.0;
+            if inverse && p == Projection::Mercator && b.abs() > std::f64::consts::PI && r[2] != 0.0 {
+                bad.push(format!("Mercator case {c:?}: GPU {r:?} accepts |y| > pi"));
+            }
             let want = if inverse {
                 p.inverse(a, b).map(|(lon, lat)| [lon, lat])
             } else {
