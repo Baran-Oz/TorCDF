@@ -28,6 +28,8 @@ pub struct ImageLayer {
 }
 
 impl ImageLayer {
+    // The app has one image layer so far; several layers come with later plans.
+    #[allow(dead_code)]
     pub fn id(&self) -> u64 {
         self.id
     }

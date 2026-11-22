@@ -71,14 +71,25 @@ pub fn build_request(v: &VarInfo, axes: &AxisChoice, slider_pos: &[usize]) -> Sl
 
 /// 2nd to 98th percentile of the finite values; `None` if there are none.
 /// A constant field is widened to a total width of 1.0.
+///
+/// Linear time (two selections, no full sort), but it copies and scans the
+/// whole slice: call it once per slice arrival, off the UI thread for big
+/// slices, never per frame.
 pub fn auto_range(s: &Slice) -> Option<(f32, f32)> {
     let mut vals: Vec<f32> = s.data.iter().copied().filter(|x| x.is_finite()).collect();
     if vals.is_empty() {
         return None;
     }
-    vals.sort_unstable_by(f32::total_cmp);
-    let at = |p: f64| vals[((vals.len() - 1) as f64 * p).round() as usize];
-    let (lo, hi) = (at(0.02), at(0.98));
+    let rank = |p: f64| ((vals.len() - 1) as f64 * p).round() as usize;
+    let (i_lo, i_hi) = (rank(0.02), rank(0.98));
+    let (_, &mut lo, above) = vals.select_nth_unstable_by(i_lo, f32::total_cmp);
+    // Everything in `above` ranks after `lo`, so the high percentile is the
+    // (i_hi - i_lo - 1)-th of it.
+    let hi = if i_hi > i_lo {
+        *above.select_nth_unstable_by(i_hi - i_lo - 1, f32::total_cmp).1
+    } else {
+        lo
+    };
     if lo == hi {
         Some((lo - 0.5, hi + 0.5))
     } else {
@@ -193,5 +204,25 @@ mod tests {
         let (lo, hi) = auto_range(&slice_of(&v)).unwrap();
         assert_eq!(lo, 2.0);
         assert!(hi < 100.0 && hi > 90.0, "hi = {hi}");
+    }
+
+    /// The selection-based percentiles equal those of a full sort.
+    #[test]
+    fn auto_range_matches_sorted_percentiles() {
+        let mut x: u32 = 12345;
+        for n in [1usize, 2, 3, 49, 50, 51, 1000, 4097] {
+            let v: Vec<f32> = (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (x >> 8) as f32 / 1000.0 - 5000.0
+                })
+                .collect();
+            let mut sorted = v.clone();
+            sorted.sort_unstable_by(f32::total_cmp);
+            let at = |p: f64| sorted[((n - 1) as f64 * p).round() as usize];
+            let (lo, hi) = (at(0.02), at(0.98));
+            let want = if lo == hi { (lo - 0.5, hi + 0.5) } else { (lo, hi) };
+            assert_eq!(auto_range(&slice_of(&v)), Some(want), "n = {n}");
+        }
     }
 }

@@ -3,9 +3,17 @@ name = "torcdf-app"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "torcdf"
+path = "src/main.rs"
+
 [dependencies]
 bytemuck = "1"
 eframe = "0.37"
+# egui_plot 0.38 and egui_extras 0.37 both build on egui 0.37 (eframe 0.37's).
+egui_extras = { version = "0.37", default-features = false }
+egui_plot = "0.38"
+rfd = { version = "0.18", default-features = false }
 torcdf-core = { path = "../torcdf-core" }
 
 [dev-dependencies]
