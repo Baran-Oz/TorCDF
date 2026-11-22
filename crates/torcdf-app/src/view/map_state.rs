@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{Rect, pos2};
 use eframe::egui_wgpu::RenderState;
 use torcdf_core::cf::Geo;
-use torcdf_core::{RequestHandle, Slice};
+use torcdf_core::{CoreError, RequestHandle, Slice};
 
 use crate::app::Job;
 use crate::map::basemap::{borders, coastlines};
@@ -30,6 +30,7 @@ use crate::view::var_view::Coords;
 
 /// The camera must rest this long before detail tiles are planned.
 pub const DETAIL_DELAY: Duration = Duration::from_millis(300);
+const DETAIL_PROBLEM: &str = "Detail could not be loaded; showing the overview.";
 pub const MAP_OVERVIEW_ID: u64 = 10;
 pub const MAP_DETAIL_IDS: [u64; 2] = [11, 12];
 pub const COAST_ID: u64 = 20;
@@ -220,6 +221,8 @@ pub struct MapState {
     pub tile_problem: Option<String>,
     /// One-line message when an overlay cannot be prepared (it is skipped).
     pub overlay_problem: Option<String>,
+    /// One-line message when detail tiles could not be loaded (the overview stays).
+    pub detail_problem: Option<String>,
     /// The pointer is over the map this frame.
     pub hovering: bool,
     /// Lon/lat under the pointer, when it is on the globe.
@@ -281,6 +284,7 @@ impl MapState {
             mesh_failed: None,
             tile_problem: None,
             overlay_problem: None,
+            detail_problem: None,
             hovering: false,
             pointer: None,
             plan: Vec::new(),
@@ -358,6 +362,7 @@ impl MapState {
     /// show stay until the new ones arrive; an empty plan clears them.
     pub fn set_plan(&mut self, mut plan: Vec<TileSpec>) {
         plan.truncate(MAP_DETAIL_IDS.len());
+        self.detail_problem = None;
         self.plan = plan;
         self.handles.clear();
         self.arrived.clear();
@@ -407,19 +412,35 @@ impl MapState {
             };
             let (spec, _) = self.handles.remove(i);
             let ms = self.detail_requested.elapsed().as_secs_f64() * 1e3;
-            match r {
-                Ok(slice) => {
-                    let stored = self.accept_detail(spec, slice);
-                    self.note(|| format!("detail tile {spec:?} arrived {ms:.1} ms after request, kept {stored}"));
-                }
-                Err(e) => {
-                    self.plan.retain(|s| *s != spec);
-                    if self.plan.is_empty() {
-                        self.detail.clear();
-                    }
-                    self.note(|| format!("detail tile {spec:?} failed after {ms:.1} ms: {e}"));
-                }
+            self.on_detail_result(spec, r, ms);
+        }
+    }
+
+    /// A finished read of detail tile `spec`. A failed read leaves the tile
+    /// out of the plan and reports a message.
+    fn on_detail_result(&mut self, spec: TileSpec, r: Result<Arc<Slice>, CoreError>, ms: f64) {
+        match r {
+            Ok(slice) => {
+                let stored = self.accept_detail(spec, slice);
+                self.note(|| format!("detail tile {spec:?} arrived {ms:.1} ms after request, kept {stored}"));
             }
+            Err(e) => {
+                self.plan.retain(|s| *s != spec);
+                self.detail_failed();
+                self.note(|| format!("detail tile {spec:?} failed after {ms:.1} ms: {e}"));
+            }
+        }
+    }
+
+    /// Detail could not be loaded: say so, and drop the held tiles when no
+    /// tile of the plan is left.
+    fn detail_failed(&mut self) {
+        self.detail_problem = Some(DETAIL_PROBLEM.into());
+        if self.plan.is_empty() {
+            self.detail.clear();
+            self.detail_meshes.clear();
+            self.detail_mesh_jobs.clear();
+            self.detail_mesh_failed.clear();
         }
     }
 
@@ -771,6 +792,7 @@ impl MapState {
                     }
                     Err(()) => {
                         self.detail_mesh_failed.push(key);
+                        self.detail_problem = Some(DETAIL_PROBLEM.into());
                         self.note(|| format!("detail mesh {key:?} failed"));
                     }
                 }
@@ -806,9 +828,7 @@ impl MapState {
             if !failed.is_empty() {
                 self.plan.retain(|s| !failed.contains(s));
                 self.arrived.retain(|a| !failed.contains(&a.0));
-                if self.plan.is_empty() {
-                    self.detail.clear();
-                }
+                self.detail_failed();
             }
             return false;
         }
@@ -829,6 +849,11 @@ impl MapState {
         self.activity = "detail upload";
         let took = t.elapsed().as_secs_f64() * 1e3;
         notes.push(format!("detail uploaded: {} tiles in {took:.1} ms", tiles.len()));
+        if notes.iter().any(|n| n.contains("not uploaded")) {
+            self.detail_problem = Some(DETAIL_PROBLEM.into());
+        } else {
+            self.detail_problem = None;
+        }
         self.detail = tiles;
         for n in notes {
             self.note(|| n);
@@ -1243,13 +1268,21 @@ mod tests {
         let overview = TileSpec::overview(full[0], full[1]);
         let service = SliceService::new(256 << 20, 2, Arc::new(|| {}));
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 900.0));
-        let boxes: [(&str, [f64; 4]); 5] = [
+        let mut boxes: Vec<(String, [f64; 4])> = [360.0f64, 240.0, 180.0, 120.0, 90.0, 60.0, 30.0, 20.0]
+            .into_iter()
+            .map(|w| {
+                let h = (w * 9.0 / 16.0).min(170.0);
+                (format!("{w} deg wide, centred 8E 46N"), [8.0 - w / 2.0, 46.0 - h / 2.0, 8.0 + w / 2.0, 46.0 + h / 2.0])
+            })
+            .collect();
+        let named: [(&str, [f64; 4]); 5] = [
             ("10x10 deg, 0-10E 40-50N", [0.0, 40.0, 10.0, 50.0]),
             ("2x2 deg, 7-9E 45-47N", [7.0, 45.0, 9.0, 47.0]),
             ("0.5x0.5 deg Alps, 8-8.5E 46-46.5N", [8.0, 46.0, 8.5, 46.5]),
             ("0.1x0.1 deg Alps, 8-8.1E 46-46.1N", [8.0, 46.0, 8.1, 46.1]),
             ("2x2 deg Norway coast, 5-7E 61-63N", [5.0, 61.0, 7.0, 63.0]),
         ];
+        boxes.extend(named.map(|(n, b)| (n.to_string(), b)));
         for (name, [lo0, la0, lo1, la1]) in boxes {
             let mut cam = MapCamera::new(Projection::Equirectangular);
             cam.fit(&[(lo0, la0), (lo1, la1)], rect);
@@ -1280,6 +1313,28 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn failed_detail_shows_a_message_until_a_new_plan() {
+        let geo = Geo::Regular { lat_dim: 0, lon_dim: 1, lat_var: "/lat".into(), lon_var: "/lon".into() };
+        let mut m = MapState::new(&geo);
+        let a = TileSpec { start: [0, 0], count: [4, 4], stride: [1, 1] };
+        let b = TileSpec { start: [10, 10], count: [4, 4], stride: [1, 1] };
+        m.set_plan(vec![a]);
+        m.on_detail_result(a, Err(torcdf_core::CoreError::Unsupported("boom".into())), 1.0);
+        assert!(m.detail_problem.as_deref().is_some_and(|p| p.starts_with("Detail could not")));
+        assert!(m.plan.is_empty() && m.arrived.is_empty());
+        // A later plan starts clean; its tile arriving keeps no message.
+        m.set_plan(vec![b]);
+        assert!(m.detail_problem.is_none());
+        m.on_detail_result(b, Ok(Arc::new(filled(&b, 1.0))), 1.0);
+        assert!(m.detail_problem.is_none() && m.arrived.len() == 1);
+        // An empty plan after a failure clears the message too.
+        m.on_detail_result(b, Err(torcdf_core::CoreError::Unsupported("x".into())), 1.0);
+        assert!(m.detail_problem.is_some());
+        m.set_plan(Vec::new());
+        assert!(m.detail_problem.is_none());
     }
 
     #[test]

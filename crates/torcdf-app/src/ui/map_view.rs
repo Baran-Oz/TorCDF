@@ -49,6 +49,9 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
         if let Some(p) = &m.overlay_problem {
             ui.colored_label(ui.visuals().warn_fg_color, p);
         }
+        if let Some(p) = &m.detail_problem {
+            ui.colored_label(ui.visuals().warn_fg_color, p);
+        }
     }
     let (rect, bar, resp) = plot_rects(ui, "map");
     let Some(rs) = rs else {
