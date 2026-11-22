@@ -31,7 +31,7 @@ pub struct MapParams {
 
 /// Longitudes made monotonic: each step is reduced to (-180, 180] degrees, so
 /// 0-360 and -180-180 axes both come out continuous. Not yet validated.
-fn unwrap_lon(lon: &[f64]) -> Vec<f64> {
+pub(crate) fn unwrap_lon(lon: &[f64]) -> Vec<f64> {
     let mut out = Vec::with_capacity(lon.len());
     let mut prev = None;
     for &l in lon {
@@ -49,7 +49,7 @@ fn unwrap_lon(lon: &[f64]) -> Vec<f64> {
 }
 
 /// True when `c` is finite and strictly monotonic in one direction.
-fn strictly_monotonic(c: &[f64]) -> bool {
+pub(crate) fn strictly_monotonic(c: &[f64]) -> bool {
     c.iter().all(|v| v.is_finite())
         && (c.windows(2).all(|w| w[1] > w[0]) || c.windows(2).all(|w| w[1] < w[0]))
 }
@@ -57,7 +57,7 @@ fn strictly_monotonic(c: &[f64]) -> bool {
 /// Start of the 360 degree longitude window for unwrapped, validated `lon`:
 /// the smaller end minus half that end cell's spacing (1 degree cells for a
 /// single column).
-fn lon_window_start(lon: &[f64]) -> f64 {
+pub(crate) fn lon_window_start(lon: &[f64]) -> f64 {
     let n = lon.len();
     if n < 2 {
         return lon[0] - 0.5;
