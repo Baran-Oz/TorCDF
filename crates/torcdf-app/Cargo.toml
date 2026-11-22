@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+bytemuck = "1"
+eframe = "0.37"
 torcdf-core = { path = "../torcdf-core" }
 
 [dev-dependencies]
 torcdf-core = { path = "../torcdf-core", features = ["fixtures"] }
 tempfile = "3"
+pollster = "1"
