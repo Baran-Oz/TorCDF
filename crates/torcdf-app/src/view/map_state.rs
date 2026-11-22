@@ -44,27 +44,29 @@ const WINDOW_SAMPLES: usize = 17;
 
 /// The value at full-resolution cell `(iy, ix)`. `tiles[0]` is the overview;
 /// every slice holds its tile's values row-major as `[ty, tx]`. The finest
-/// tile (smallest stride) with an exact texel hit wins; otherwise the
-/// overview's nearest texel; `None` outside the overview.
-pub fn value_at(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<f32> {
+/// tile (smallest stride) whose extent holds the cell gives its nearest
+/// texel, as drawn (the overview is simply the coarsest tile); `None`
+/// outside every tile. Returns the value and the full-resolution cell
+/// that texel holds (`start + t * stride`), so a hover index names the
+/// cell whose value it shows.
+pub fn value_at(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
     let get = |spec: &TileSpec, s: &Slice, t: [usize; 2]| {
-        s.data.get(t[0] * spec.shape()[1] + t[1]).copied()
+        let v = s.data.get(t[0] * spec.shape()[1] + t[1]).copied()?;
+        Some((v, (spec.start[0] + t[0] * spec.stride[0], spec.start[1] + t[1] * spec.stride[1])))
     };
-    let mut finest: Vec<&(TileSpec, &Slice)> = tiles.iter().collect();
-    finest.sort_by_key(|(spec, _)| spec.stride[0].saturating_mul(spec.stride[1]));
-    for (spec, s) in finest {
-        if let Some(t) = spec.texel_of(iy, ix) {
-            return get(spec, s, t);
-        }
-    }
-    let (spec, s) = tiles.first()?;
-    get(spec, s, spec.nearest_texel(iy, ix)?)
+    // Finest first; on a tie a detail tile beats the overview (`tiles[0]`).
+    let mut finest: Vec<(usize, &(TileSpec, &Slice))> = tiles.iter().enumerate().collect();
+    finest.sort_by_key(|(i, (spec, _))| (spec.stride[0].saturating_mul(spec.stride[1]), *i == 0));
+    finest
+        .into_iter()
+        .find_map(|(_, (spec, s))| spec.nearest_texel(iy, ix).map(|t| (spec, s, t)))
+        .and_then(|(spec, s, t)| get(spec, s, t))
 }
 
 /// [`value_at`] for the hover readout: a missing value (NaN or ±inf) counts
 /// as no value, so it reads "—" like a point outside the data.
-pub fn hover_value(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<f32> {
-    value_at(tiles, iy, ix).filter(|v| v.is_finite())
+pub fn hover_value(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
+    value_at(tiles, iy, ix).filter(|(v, _)| v.is_finite())
 }
 
 /// A lon/lat window in degrees. `lon` may run past ±180 (it follows the
@@ -888,8 +890,8 @@ impl MapState {
     }
 
     /// Hover value of full-resolution cell `(iy, ix)` from the tiles on
-    /// show; `None` for a missing value.
-    pub fn value(&self, iy: usize, ix: usize) -> Option<f32> {
+    /// show, with the cell actually sampled; `None` for a missing value.
+    pub fn value(&self, iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
         let t = self.overview.as_ref()?;
         let mut tiles = vec![(t.spec, &*t.data)];
         tiles.extend(self.detail.iter().map(|d| (d.tile.spec, &*d.tile.data)));
@@ -955,17 +957,36 @@ mod tests {
         let detail = TileSpec { start: [8, 8], count: [8, 8], stride: [1, 1] };
         let (o, d) = (filled(&overview, 1.0), filled(&detail, 2.0));
         let tiles = [(overview, &o), (detail, &d)];
-        assert_eq!(value_at(&tiles, 10, 10), Some(2.0));
-        assert_eq!(value_at(&tiles, 1, 1), Some(1.0));
+        assert_eq!(value_at(&tiles, 10, 10), Some((2.0, (10, 10))));
+        // Outside the detail tile: the overview's nearest texel, and its cell.
+        assert_eq!(value_at(&tiles, 1, 1), Some((1.0, (0, 0))));
+        assert_eq!(value_at(&tiles, 3, 30), Some((1.0, (4, 28))));
         assert_eq!(value_at(&tiles, 10_000, 0), None);
+    }
+
+    #[test]
+    fn value_at_uses_detail_off_its_lattice() {
+        // A stride-2 detail tile is drawn over its whole extent, so a cell
+        // between its texels reads the detail's nearest texel, not the overview.
+        let overview = TileSpec { start: [0, 0], count: [64, 64], stride: [8, 8] };
+        let detail = TileSpec { start: [8, 8], count: [9, 9], stride: [2, 2] };
+        let (o, d) = (filled(&overview, 1.0), filled(&detail, 2.0));
+        let tiles = [(overview, &o), (detail, &d)];
+        assert_eq!(value_at(&tiles, 9, 11), Some((2.0, (10, 12))));
+        assert_eq!(value_at(&tiles, 16, 16), Some((2.0, (16, 16))));
+        // Just past the detail extent: the overview again.
+        assert_eq!(value_at(&tiles, 17, 9), Some((1.0, (16, 8))));
+        // The order of the tiles does not matter.
+        let tiles = [(detail, &d), (overview, &o)];
+        assert_eq!(value_at(&tiles, 9, 11), Some((2.0, (10, 12))));
     }
 
     #[test]
     fn value_at_reads_row_major_texels() {
         let spec = TileSpec { start: [0, 0], count: [2, 3], stride: [1, 1] };
         let s = Slice { shape: vec![2, 3], data: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], valid_count: 6 };
-        assert_eq!(value_at(&[(spec, &s)], 1, 2), Some(5.0));
-        assert_eq!(value_at(&[(spec, &s)], 0, 1), Some(1.0));
+        assert_eq!(value_at(&[(spec, &s)], 1, 2), Some((5.0, (1, 2))));
+        assert_eq!(value_at(&[(spec, &s)], 0, 1), Some((1.0, (0, 1))));
         assert_eq!(value_at(&[], 0, 0), None);
     }
 
@@ -1056,7 +1077,7 @@ mod tests {
         assert!(matches!(map.upload_overview(&rs, &shown.slice, spec, axes, &v.coords), Ok(true)));
         // Same slice again: nothing to do.
         assert!(matches!(map.upload_overview(&rs, &shown.slice, spec, axes, &v.coords), Ok(false)));
-        assert_eq!(map.value(1, 2), Some(shown.slice.data[8 + 2]));
+        assert_eq!(map.value(1, 2), Some((shown.slice.data[8 + 2], (1, 2))));
         // Cell (0, 0) holds the fill value: hover reads it as no value.
         assert!(shown.slice.data[0].is_nan());
         assert_eq!(map.value(0, 0), None);
@@ -1104,7 +1125,7 @@ mod tests {
             matches!(map.upload_overview(&rs, &shown.slice, spec, axes, &v.coords), Ok(true))
         });
         assert!(map.drawable_overview().is_some());
-        assert_eq!(map.value(2, 3), Some(shown.slice.data[2 * 6 + 3]));
+        assert_eq!(map.value(2, 3), Some((shown.slice.data[2 * 6 + 3], (2, 3))));
 
         // A projection change hides the tile until its mesh is re-projected.
         map.set_projection(Projection::Mercator);
@@ -1124,11 +1145,11 @@ mod tests {
             valid_count: 3,
         };
         let tiles = [(spec, &s)];
-        assert!(value_at(&tiles, 0, 0).is_some_and(f32::is_nan));
+        assert!(value_at(&tiles, 0, 0).is_some_and(|(v, _)| v.is_nan()));
         assert_eq!(hover_value(&tiles, 0, 0), None);
         assert_eq!(hover_value(&tiles, 0, 1), None);
         assert_eq!(hover_value(&tiles, 0, 2), None);
-        assert_eq!(hover_value(&tiles, 0, 3), Some(7.0));
+        assert_eq!(hover_value(&tiles, 0, 3), Some((7.0, (0, 3))));
         assert_eq!(hover_value(&tiles, 5, 0), None);
     }
 

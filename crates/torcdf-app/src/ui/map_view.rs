@@ -110,13 +110,14 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
     }
     map.prepare_detail(ui.ctx(), rs, axes, &v.coords, full);
 
-    // Hover: pointer -> lon/lat -> cell -> value.
+    // Hover: pointer -> lon/lat -> cell -> value. The index shown is the
+    // cell the drawn tile actually sampled, so index and value agree.
     if let Some(pos) = resp.hover_pos() {
         map.hovering = true;
         map.pointer = map.camera.screen_to_lonlat(pos, rect);
         if let (Some((lon, lat)), Some(loc)) = (map.pointer, &map.locator)
             && let Some((iy, ix)) = loc.nearest(lon, lat)
-            && let Some(value) = map.value(iy, ix)
+            && let Some((value, (iy, ix))) = map.value(iy, ix)
         {
             v.hover = Some(Hover { value, iy, ix });
         }

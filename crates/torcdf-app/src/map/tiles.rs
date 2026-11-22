@@ -30,22 +30,6 @@ impl TileSpec {
         [0, 1].map(|a| self.count[a].div_ceil(self.stride[a].max(1)))
     }
 
-    /// Tile texel of full-resolution cell `(iy, ix)`, only for an exact hit
-    /// (on the stride lattice and inside the tile).
-    pub fn texel_of(&self, iy: usize, ix: usize) -> Option<[usize; 2]> {
-        let shape = self.shape();
-        let mut out = [0; 2];
-        for (a, i) in [iy, ix].into_iter().enumerate() {
-            let d = i.checked_sub(self.start[a])?;
-            let s = self.stride[a].max(1);
-            if d % s != 0 || d / s >= shape[a] {
-                return None;
-            }
-            out[a] = d / s;
-        }
-        Some(out)
-    }
-
     /// Tile texel nearest to full-resolution cell `(iy, ix)`, if the cell is
     /// inside the tile's extent.
     pub fn nearest_texel(&self, iy: usize, ix: usize) -> Option<[usize; 2]> {
@@ -268,8 +252,7 @@ mod tests {
     fn tile_spec_overview_and_texels() {
         let t = TileSpec::overview(43200, 86400);
         assert_eq!(t.stride, [22, 43]);
-        assert_eq!(t.texel_of(22, 43), Some([1, 1]));
-        assert_eq!(t.texel_of(23, 43), None);
+        assert_eq!(t.nearest_texel(22, 43), Some([1, 1]));
         assert_eq!(t.nearest_texel(23, 44), Some([1, 1]));
         assert_eq!(t.nearest_texel(43200, 0), None);
         assert!(t.shape().iter().all(|&n| n <= OVERVIEW_TARGET));
