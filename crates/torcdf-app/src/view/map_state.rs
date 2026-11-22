@@ -58,6 +58,12 @@ pub fn value_at(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<f3
     get(spec, s, spec.nearest_texel(iy, ix)?)
 }
 
+/// [`value_at`] for the hover readout: a missing value (NaN or ±inf) counts
+/// as no value, so it reads "—" like a point outside the data.
+pub fn hover_value(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<f32> {
+    value_at(tiles, iy, ix).filter(|v| v.is_finite())
+}
+
 /// A lon/lat window in degrees. `lon` may run past ±180 (it follows the
 /// camera across the seam); a span of 360 or more means "all longitudes".
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -204,6 +210,14 @@ pub struct MapState {
     basemap_job: Option<(Projection, Job<(Vec<[f32; 2]>, Vec<[f32; 2]>)>)>,
     grid_on_gpu: Option<GridKey>,
     grid_job: Option<(GridKey, Job<Vec<[f32; 2]>>)>,
+    /// Keys whose job died: never started again for the same key.
+    basemap_failed: Option<Projection>,
+    grid_failed: Option<GridKey>,
+    mesh_failed: Option<(TileSpec, Projection)>,
+    /// One-line message when the data tile cannot be prepared.
+    pub tile_problem: Option<String>,
+    /// One-line message when an overlay cannot be prepared (it is skipped).
+    pub overlay_problem: Option<String>,
     /// The pointer is over the map this frame.
     pub hovering: bool,
     /// Lon/lat under the pointer, when it is on the globe.
@@ -231,6 +245,11 @@ impl MapState {
             basemap_job: None,
             grid_on_gpu: None,
             grid_job: None,
+            basemap_failed: None,
+            grid_failed: None,
+            mesh_failed: None,
+            tile_problem: None,
+            overlay_problem: None,
             hovering: false,
             pointer: None,
         }
@@ -246,6 +265,7 @@ impl MapState {
         if proj != self.camera.proj {
             self.camera = MapCamera::new(proj);
             self.needs_fit = true;
+            self.overlay_problem = None;
         }
     }
 
@@ -352,7 +372,10 @@ impl MapState {
         let proj = self.camera.proj;
 
         // Coastlines and borders: once per projection.
-        if self.basemap_on_gpu != Some(proj) && self.basemap_job.as_ref().map(|j| j.0) != Some(proj) {
+        if self.basemap_on_gpu != Some(proj)
+            && self.basemap_failed != Some(proj)
+            && self.basemap_job.as_ref().map(|j| j.0) != Some(proj)
+        {
             let job = Job::spawn(ctx, move || {
                 (project_polylines(proj, coastlines()), project_polylines(proj, borders()))
             });
@@ -363,10 +386,17 @@ impl MapState {
         {
             let p = *p;
             self.basemap_job = None;
-            if let Ok((coast, borders)) = r {
-                upload_lines(rs, COAST_ID, &coast);
-                upload_lines(rs, BORDERS_ID, &borders);
-                self.basemap_on_gpu = Some(p);
+            match r {
+                Ok((coast, borders)) => {
+                    upload_lines(rs, COAST_ID, &coast);
+                    upload_lines(rs, BORDERS_ID, &borders);
+                    self.basemap_on_gpu = Some(p);
+                }
+                Err(()) => {
+                    self.basemap_failed = Some(p);
+                    self.overlay_problem =
+                        Some("Coastlines and borders could not be prepared, so they are hidden.".into());
+                }
             }
         }
 
@@ -378,6 +408,7 @@ impl MapState {
             let covers =
                 |k: &GridKey| k.proj == proj && k.step == step && k.window.contains(&vis);
             let have = self.grid_on_gpu.as_ref().is_some_and(covers)
+                || self.grid_failed.as_ref().is_some_and(covers)
                 || self.grid_job.as_ref().is_some_and(|(k, _)| covers(k));
             if !have {
                 let key = GridKey { proj, step, window: vis.widened() };
@@ -392,9 +423,16 @@ impl MapState {
         {
             let key = *key;
             self.grid_job = None;
-            if let Ok(segments) = r {
-                upload_lines(rs, GRID_ID, &segments);
-                self.grid_on_gpu = Some(key);
+            match r {
+                Ok(segments) => {
+                    upload_lines(rs, GRID_ID, &segments);
+                    self.grid_on_gpu = Some(key);
+                }
+                Err(()) => {
+                    self.grid_failed = Some(key);
+                    self.overlay_problem =
+                        Some("Grid lines could not be prepared, so they are hidden.".into());
+                }
             }
         }
 
@@ -402,6 +440,7 @@ impl MapState {
         if let (true, Some(spec), Some((lat, lon))) = (self.curvilinear, spec, &coords.curv) {
             let want = (spec, proj);
             let have = self.mesh.as_ref().is_some_and(|m| (m.spec, m.proj) == want)
+                || self.mesh_failed == Some(want)
                 || self.mesh_job.as_ref().is_some_and(|(k, _)| *k == want);
             if !have {
                 let geo = self.mesh.as_ref().filter(|m| m.spec == spec).map(|m| m.geo.clone());
@@ -416,12 +455,23 @@ impl MapState {
                 self.mesh_job = Some((want, job));
             }
         }
-        if let Some((_, job)) = &self.mesh_job
+        if let Some((key, job)) = &self.mesh_job
             && let Some(r) = job.poll()
         {
+            let key = *key;
             self.mesh_job = None;
-            if let Ok(m) = r {
-                self.mesh = Some(m);
+            match r {
+                Ok(m) => {
+                    self.mesh = Some(m);
+                    self.tile_problem = None;
+                }
+                Err(()) => {
+                    self.mesh_failed = Some(key);
+                    self.tile_problem = Some(
+                        "Cannot draw this map: preparing its curvilinear grid failed unexpectedly."
+                            .into(),
+                    );
+                }
             }
         }
         // A re-projected mesh for the tile already on the GPU.
@@ -518,10 +568,11 @@ impl MapState {
         self.grid_on_gpu.is_some_and(|k| k.proj == self.camera.proj)
     }
 
-    /// Value under full-resolution cell `(iy, ix)` from the tiles on show.
+    /// Hover value of full-resolution cell `(iy, ix)` from the tiles on
+    /// show; `None` for a missing value.
     pub fn value(&self, iy: usize, ix: usize) -> Option<f32> {
         let t = self.overview.as_ref()?;
-        value_at(&[(t.spec, &*t.data)], iy, ix)
+        hover_value(&[(t.spec, &*t.data)], iy, ix)
     }
 }
 
@@ -643,6 +694,9 @@ mod tests {
         // Same slice again: nothing to do.
         assert!(matches!(map.upload_overview(&rs, &shown.slice, spec, axes, &v.coords), Ok(false)));
         assert_eq!(map.value(1, 2), Some(shown.slice.data[8 + 2]));
+        // Cell (0, 0) holds the fill value: hover reads it as no value.
+        assert!(shown.slice.data[0].is_nan());
+        assert_eq!(map.value(0, 0), None);
         assert!(map.drawable_overview().is_some());
 
         // Coastlines, borders and grid lines arrive through jobs.
@@ -696,6 +750,70 @@ mod tests {
             map.prepare(&ctx, &rs, rect(), &v.coords, [5, 6], Some(spec));
             map.drawable_overview().is_some()
         });
+    }
+
+    #[test]
+    fn hover_treats_missing_values_as_none() {
+        let spec = TileSpec { start: [0, 0], count: [1, 4], stride: [1, 1] };
+        let s = Slice {
+            shape: vec![1, 4],
+            data: vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 7.0],
+            valid_count: 3,
+        };
+        let tiles = [(spec, &s)];
+        assert!(value_at(&tiles, 0, 0).is_some_and(f32::is_nan));
+        assert_eq!(hover_value(&tiles, 0, 0), None);
+        assert_eq!(hover_value(&tiles, 0, 1), None);
+        assert_eq!(hover_value(&tiles, 0, 2), None);
+        assert_eq!(hover_value(&tiles, 0, 3), Some(7.0));
+        assert_eq!(hover_value(&tiles, 5, 0), None);
+    }
+
+    #[test]
+    fn failed_jobs_are_reported_once_and_not_respawned() {
+        let ctx = egui::Context::default();
+        let rs = headless::render_state();
+        let geo = Geo::Curvilinear {
+            y_dim: 0,
+            x_dim: 1,
+            lat_var: "/lat".into(),
+            lon_var: "/lon".into(),
+        };
+        let mut m = MapState::new(&geo);
+        let coords = Coords {
+            dims: Vec::new(),
+            curv: Some((Arc::new(vec![0.0; 30]), Arc::new(vec![0.0; 30]))),
+        };
+        let spec = TileSpec::overview(5, 6);
+        let proj = m.camera.proj;
+        // Jobs that die, under the keys `prepare` would use.
+        m.mesh_job = Some(((spec, proj), Job::spawn(&ctx, move || -> MeshSet {
+            panic!("injected job failure")
+        })));
+        m.basemap_job = Some((proj, Job::spawn(&ctx, move || -> (Vec<[f32; 2]>, Vec<[f32; 2]>) {
+            panic!("injected job failure")
+        })));
+        let step = graticule_step((100.0 / m.camera.scale).to_degrees());
+        let window = visible_window(&m.camera, rect()).unwrap().widened();
+        let key = GridKey { proj, step, window };
+        m.grid_job = Some((key, Job::spawn(&ctx, move || -> Vec<[f32; 2]> {
+            panic!("injected job failure")
+        })));
+
+        wait("the injected failures", || {
+            m.prepare(&ctx, &rs, rect(), &coords, [5, 6], Some(spec));
+            m.mesh_failed.is_some() && m.basemap_failed.is_some() && m.grid_failed.is_some()
+        });
+        assert!(m.tile_problem.as_deref().is_some_and(|p| p.starts_with("Cannot draw this map")));
+        assert!(m.overlay_problem.is_some());
+        // Later frames do not start the same jobs again.
+        for _ in 0..5 {
+            m.prepare(&ctx, &rs, rect(), &coords, [5, 6], Some(spec));
+            assert!(m.mesh_job.is_none() && m.basemap_job.is_none() && m.grid_job.is_none());
+        }
+        assert_eq!(m.mesh_failed, Some((spec, proj)));
+        assert_eq!(m.grid_failed, Some(key));
+        assert!(m.drawable_overview().is_none() && !m.basemap_ready() && !m.grid_ready());
     }
 
     #[test]

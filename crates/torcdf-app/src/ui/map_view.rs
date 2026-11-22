@@ -41,6 +41,15 @@ fn centred_text(ui: &egui::Ui, rect: Rect, text: &str, colour: Color32) {
 
 /// Draws the map of `v`. Returns true when a new data tile was uploaded.
 pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&RenderState>) -> bool {
+    // A failed background job shows once here; it is not retried.
+    if let Some(m) = &v.map {
+        if let Some(p) = &m.tile_problem {
+            ui.colored_label(ui.visuals().error_fg_color, p);
+        }
+        if let Some(p) = &m.overlay_problem {
+            ui.colored_label(ui.visuals().warn_fg_color, p);
+        }
+    }
     let (rect, bar, resp) = plot_rects(ui, "map");
     let Some(rs) = rs else {
         centred_text(ui, rect, "GPU rendering is unavailable, so maps cannot be drawn.", ui.visuals().error_fg_color);
