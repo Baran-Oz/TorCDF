@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+#[allow(dead_code)] // used from Task 10
+mod map;
 mod render;
 mod ui;
 mod view;
