@@ -6,7 +6,7 @@
 //! ([`upload_lines`]). Panning and zooming only rewrite a 64-byte uniform.
 
 use std::collections::HashMap;
-use std::f64::consts::PI;
+use std::f64::consts::{PI, TAU};
 use std::num::NonZeroU64;
 
 use eframe::egui;
@@ -17,19 +17,26 @@ use crate::map::projection::Projection;
 use torcdf_core::basemap::Polyline;
 
 /// LineList endpoints in world units: one segment per consecutive valid pair
-/// of points. A segment is dropped when either end does not project, or (for
-/// the cylindrical projections) when it jumps across the seam, |dx| > pi.
+/// of points. A segment is dropped when either end does not project. For the
+/// cylindrical projections a segment crossing the seam (|dx| > pi) is kept:
+/// its second endpoint is shifted by 2*pi so it stays short and continuous,
+/// and the part beyond +-pi is covered by the renderer's wrap copies.
 pub fn project_polylines(proj: Projection, lines: &[Polyline]) -> Vec<[f32; 2]> {
     let mut out = Vec::new();
     for line in lines {
         let mut prev: Option<[f64; 2]> = None;
         for p in line {
             let cur = proj.forward(p[0] as f64, p[1] as f64);
-            if let (Some(a), Some(b)) = (prev, cur) {
-                if !(proj.wraps_x() && (b[0] - a[0]).abs() > PI) {
-                    out.push([a[0] as f32, a[1] as f32]);
-                    out.push([b[0] as f32, b[1] as f32]);
+            if let (Some(a), Some(mut b)) = (prev, cur) {
+                if proj.wraps_x() {
+                    if b[0] - a[0] > PI {
+                        b[0] -= TAU;
+                    } else if b[0] - a[0] < -PI {
+                        b[0] += TAU;
+                    }
                 }
+                out.push([a[0] as f32, a[1] as f32]);
+                out.push([b[0] as f32, b[1] as f32]);
             }
             prev = cur;
         }
@@ -270,9 +277,17 @@ mod tests {
     use std::f64::consts::{PI, TAU};
 
     #[test]
-    fn project_polylines_drops_bad_segments() {
+    fn project_polylines_handles_seam_and_bad_points() {
         let eq = Projection::Equirectangular;
-        assert_eq!(project_polylines(eq, &[vec![[179.0, 0.0], [-179.0, 0.0]]]).len(), 0, "seam");
+        // Seam crossings are unwrapped so the segment stays short and continuous.
+        let east = project_polylines(eq, &[vec![[179.0, 0.0], [-179.0, 0.0]]]);
+        assert_eq!(east.len(), 2, "seam segment kept");
+        assert!((east[0][0] - 179f32.to_radians()).abs() < 1e-5, "{east:?}");
+        assert!((east[1][0] - 181f32.to_radians()).abs() < 1e-5, "{east:?}");
+        let west = project_polylines(eq, &[vec![[-179.0, 0.0], [179.0, 0.0]]]);
+        assert_eq!(west.len(), 2, "mirror seam segment kept");
+        assert!((west[0][0] - (-179f32).to_radians()).abs() < 1e-5, "{west:?}");
+        assert!((west[1][0] - (-181f32).to_radians()).abs() < 1e-5, "{west:?}");
         let one = project_polylines(eq, &[vec![[0.0, 0.0], [10.0, 0.0]]]);
         assert_eq!(one.len(), 2, "one segment = two endpoints");
         assert!((one[1][0] - 10f32.to_radians()).abs() < 1e-6);
@@ -315,8 +330,17 @@ mod tests {
         upload_lines(&rs, 2, &project_polylines(eq, &[vec![[170.0, 0.0], [179.0, 0.0]]]));
         let row = |px: &[[u8; 4]]| (0..W).filter(|&x| lit(at(px, x, 16))).collect::<Vec<_>>();
         let wrapped = draw(2, -PI + 0.01, true);
-        assert!(row(&wrapped).iter().any(|&x| x < 32), "wrap draws the copy: {:?}", row(&wrapped));
+        // Copy spans x = -3.316..-3.159 rad, i.e. about columns 30..=31 (centre -pi+0.01).
+        let cols = row(&wrapped);
+        assert!(cols.contains(&30), "wrap draws the copy: {cols:?}");
+        assert!(cols.iter().all(|&x| (29..=32).contains(&x)), "copy stays near x=31: {cols:?}");
         let unwrapped = draw(2, -PI + 0.01, false);
         assert!(row(&unwrapped).is_empty(), "no wrap, nothing in view: {:?}", row(&unwrapped));
+
+        // A line crossing the dateline (170 -> -170) has no gap at the target centre.
+        upload_lines(&rs, 3, &project_polylines(eq, &[vec![[170.0, 0.0], [-170.0, 0.0]]]));
+        let seam = draw(3, PI, true);
+        let cols = row(&seam);
+        assert!((31..=32).all(|x| cols.contains(&x)), "no gap at the dateline: {cols:?}");
     }
 }
