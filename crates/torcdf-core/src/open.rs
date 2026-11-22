@@ -26,7 +26,10 @@ impl NcFile {
         let format = raw.format().map_err(open_err)?;
         let file_size = std::fs::metadata(path).map_err(|e| open_err(e.to_string()))?.len();
 
-        let mut root = read_root(&file);
+        // The netcdf crate panics on some metadata errors; a failed open must
+        // not take the app down. `raw` is dropped (handle closed) on return.
+        let mut root = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_root(&file)))
+            .map_err(|_| open_err("file metadata could not be read (corrupt or unsupported)".into()))?;
         if matches!(format, FileFormat::Netcdf4 | FileFormat::Netcdf4Classic) {
             raw.fill_storage(&mut root);
         }
@@ -156,8 +159,8 @@ fn attr_of(a: &netcdf::Attribute) -> Option<Attr> {
         V::Uints(x) => ints(x.into_iter().map(i64::from).collect()),
         V::Int(x) => ints(vec![x.into()]),
         V::Ints(x) => ints(x.into_iter().map(i64::from).collect()),
-        V::Ulonglong(x) => ints(vec![x as i64]),
-        V::Ulonglongs(x) => ints(x.into_iter().map(|i| i as i64).collect()),
+        V::Ulonglong(x) => u64s_to_attr(vec![x]),
+        V::Ulonglongs(x) => u64s_to_attr(x),
         V::Longlong(x) => ints(vec![x]),
         V::Longlongs(x) => ints(x),
         V::Float(x) => AttrValue::Floats(vec![x.into()]),
@@ -168,6 +171,28 @@ fn attr_of(a: &netcdf::Attribute) -> Option<Attr> {
         V::Strs(s) => AttrValue::Texts(s),
     };
     Some(Attr { name: a.name().to_string(), value })
+}
+
+/// Unsigned 64-bit values stay exact `Ints` when they all fit in `i64`;
+/// otherwise the whole attribute becomes `Floats` rather than wrapping.
+fn u64s_to_attr(v: Vec<u64>) -> AttrValue {
+    match v.iter().map(|&x| i64::try_from(x)).collect::<Result<Vec<_>, _>>() {
+        Ok(ints) => AttrValue::Ints(ints),
+        Err(_) => AttrValue::Floats(v.into_iter().map(|x| x as f64).collect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u64_attrs_do_not_wrap() {
+        assert_eq!(u64s_to_attr(vec![5, 7]), AttrValue::Ints(vec![5, 7]));
+        assert_eq!(u64s_to_attr(vec![i64::MAX as u64]), AttrValue::Ints(vec![i64::MAX]));
+        let big = u64::MAX - 1;
+        assert_eq!(u64s_to_attr(vec![1, big]), AttrValue::Floats(vec![1.0, big as f64]));
+    }
 }
 
 // ---- format and storage via the raw C API ---------------------------------
