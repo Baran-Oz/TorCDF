@@ -7,7 +7,7 @@ use eframe::egui_wgpu::RenderState;
 use egui_extras::{Column, TableBuilder};
 
 use super::{fmt_value, inspector::log_range, slider_label};
-use crate::app::{Display, Hover, VarView};
+use crate::view::var_view::{Display, Hover, VarView};
 use crate::render::image::{self as gpu, ImageParams};
 use crate::view::defaults::{AxisChoice, ViewKind};
 

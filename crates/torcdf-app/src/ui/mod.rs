@@ -10,7 +10,8 @@ use eframe::egui;
 use torcdf_core::cf::TimeUnits;
 use torcdf_core::{AttrValue, DType};
 
-use crate::app::{Action, VarView};
+use crate::app::Action;
+use crate::view::var_view::VarView;
 use crate::view::defaults::ViewKind;
 
 /// Menu bar: File and View (Process and Edit come in later stages).

@@ -5,7 +5,7 @@ use torcdf_core::cf::Geo;
 use torcdf_core::{Attr, Storage};
 
 use super::{attr_text, dtype_name, fmt_value, slider_label};
-use crate::app::{Display, VarView};
+use crate::view::var_view::{Display, VarView};
 use crate::render::colormap::Colormap;
 
 pub fn show(
