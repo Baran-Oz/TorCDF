@@ -3,3 +3,4 @@
 *.nc
 *.h5
 *.hdf5
+.claude/worktrees/
