@@ -524,6 +524,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "torcdf-bench"
+version = "0.1.0"
+dependencies = [
+ "netcdf",
+ "netcdf-sys",
+]
+
+[[package]]
 name = "torcdf-core"
 version = "0.1.0"
 dependencies = [
