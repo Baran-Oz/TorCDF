@@ -665,6 +665,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "torcdf-app"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "torcdf-core",
+]
+
+[[package]]
 name = "torcdf-bench"
 version = "0.1.0"
 dependencies = [

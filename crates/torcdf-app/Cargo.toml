@@ -1,0 +1,11 @@
+[package]
+name = "torcdf-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+torcdf-core = { path = "../torcdf-core" }
+
+[dev-dependencies]
+torcdf-core = { path = "../torcdf-core", features = ["fixtures"] }
+tempfile = "3"
