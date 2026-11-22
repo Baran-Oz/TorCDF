@@ -1,0 +1,17 @@
+[package]
+name = "torcdf-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Exposes netCDF fixture writers for tests (this crate's and dependents').
+fixtures = []
+
+[dependencies]
+netcdf = { version = "0.12", features = ["static"] }
+thiserror = "2"
+
+[dev-dependencies]
+torcdf-core = { path = ".", features = ["fixtures"] }
+tempfile = "3"
+approx = "0.5"

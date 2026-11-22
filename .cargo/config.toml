@@ -1,0 +1,9 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# The cmake-built C libraries (HDF5, netCDF-C) would otherwise use the dynamic
+# CRT (/MD), which mismatches Rust's static CRT (/MT) at link time. Rust always
+# links the release CRT, even in debug builds, hence "MultiThreaded".
+CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
+CMAKE_TOOLCHAIN_FILE = { value = ".cargo/msvc-static-crt.cmake", relative = true }
