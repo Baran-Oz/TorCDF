@@ -9,7 +9,6 @@ use crate::{CoreError, NcFile, Slice, SliceRequest};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
 use lru::LruCache;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -31,7 +30,9 @@ pub fn default_cache_budget_bytes() -> usize {
     usize::try_from(total / 4).unwrap_or(usize::MAX)
 }
 
-type Key = (PathBuf, SliceRequest);
+/// (NcFile::open_id, request): the id, not the path, so a file rewritten and
+/// reopened at the same path never hits stale entries.
+type Key = (u64, SliceRequest);
 type Outcome = Result<Arc<Slice>, CoreError>;
 
 /// LRU map plus a running byte total.
@@ -127,7 +128,7 @@ impl SliceService {
     pub fn request(&self, file: &Arc<NcFile>, req: SliceRequest) -> RequestHandle {
         let (reply, rx) = bounded::<Outcome>(1);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let key = (file.meta.path.clone(), req.clone());
+        let key = (file.open_id(), req.clone());
         if let Some(hit) = self.shared.lock().get(&key) {
             let _ = reply.send(Ok(hit));
         } else if let Some(jobs) = &self.jobs {
@@ -139,7 +140,7 @@ impl SliceService {
 
     /// The cached slice for `req`, if present (marks it recently used).
     pub fn cached(&self, file: &NcFile, req: &SliceRequest) -> Option<Arc<Slice>> {
-        self.shared.lock().get(&(file.meta.path.clone(), req.clone()))
+        self.shared.lock().get(&(file.open_id(), req.clone()))
     }
 
     /// Number of reads actually performed against files (cache hits and
@@ -165,7 +166,7 @@ fn worker(shared: &Shared, rx: &Receiver<Job>) {
         if job.cancelled.load(Ordering::SeqCst) {
             continue;
         }
-        let key = (job.file.meta.path.clone(), job.req.clone());
+        let key = (job.file.open_id(), job.req.clone());
         // Another job for the same slice may have finished while this waited.
         let hit = shared.lock().get(&key);
         let outcome = match hit {

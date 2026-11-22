@@ -216,3 +216,29 @@ fn default_budget_is_a_quarter_of_ram() {
     sys.refresh_memory();
     assert_eq!(b as u64, sys.total_memory() / 4);
 }
+
+fn write_values(path: &std::path::Path, base: f32) {
+    let mut f = netcdf::create(path).unwrap();
+    f.add_dimension("x", 4).unwrap();
+    let mut v = f.add_variable::<f32>("v", &["x"]).unwrap();
+    v.put_values(&[base, base + 1.0, base + 2.0, base + 3.0], ..).unwrap();
+}
+
+#[test]
+fn reopening_a_rewritten_file_does_not_serve_stale_cache() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("same.nc");
+    let req = SliceRequest { var: "/v".into(), start: vec![0], count: vec![4], stride: vec![1] };
+    let svc = SliceService::new(1 << 20, 1, noop());
+
+    write_values(&path, 1.0);
+    let f = Arc::new(NcFile::open(&path).unwrap());
+    let old = wait(&mut svc.request(&f, req.clone())).unwrap();
+    assert_eq!(old.data, vec![1.0, 2.0, 3.0, 4.0]);
+    drop(f);
+
+    write_values(&path, 100.0);
+    let f = Arc::new(NcFile::open(&path).unwrap());
+    let new = wait(&mut svc.request(&f, req.clone())).unwrap();
+    assert_eq!(new.data, vec![100.0, 101.0, 102.0, 103.0]);
+}

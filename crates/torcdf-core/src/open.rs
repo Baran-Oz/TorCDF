@@ -11,9 +11,20 @@ use std::path::{Path, PathBuf};
 pub struct NcFile {
     pub meta: Dataset,
     pub(crate) file: netcdf::File,
+    open_id: u64,
 }
 
+/// Source of [`NcFile::open_id`] values.
+static NEXT_OPEN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl NcFile {
+    /// Unique per successful `open` call within this process. Unlike the
+    /// path, it changes when a file is closed, rewritten and reopened, so it
+    /// is safe to key caches by.
+    pub fn open_id(&self) -> u64 {
+        self.open_id
+    }
+
     /// Opens `path` and reads its structure (dimensions, variables,
     /// attributes, groups). Variable data is not touched.
     pub fn open(path: &Path) -> Result<NcFile, CoreError> {
@@ -32,7 +43,8 @@ impl NcFile {
             raw.fill_storage(&mut root);
         }
         let meta = Dataset { path: path.to_path_buf(), file_size, format, root };
-        Ok(NcFile { meta, file })
+        let open_id = NEXT_OPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(NcFile { meta, file, open_id })
     }
 }
 
