@@ -464,8 +464,57 @@ fn main() -> Res<()> {
             args.get(1).ok_or("usage: bench <file> --var V")?,
             &arg(&args, "--var").ok_or("--var required")?,
         ),
-        _ => Err("usage: torcdf-bench inspect|gen|bench ...".into()),
+        Some("ne-convert") => cmd_ne_convert(
+            args.get(1).ok_or("usage: ne-convert <in.geojson> <out.bin>")?,
+            args.get(2).ok_or("usage: ne-convert <in.geojson> <out.bin>")?,
+        ),
+        _ => Err("usage: torcdf-bench inspect|gen|bench|ne-convert ...".into()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Natural Earth GeoJSON -> embedded polyline format
+// ---------------------------------------------------------------------------
+
+fn coord_pair(v: &serde_json::Value) -> Option<[f32; 2]> {
+    let a = v.as_array()?;
+    // Clamp: Natural Earth coordinates occasionally exceed the range by float noise.
+    let lon = (a.first()?.as_f64()? as f32).clamp(-180.0, 180.0);
+    let lat = (a.get(1)?.as_f64()? as f32).clamp(-90.0, 90.0);
+    Some([lon, lat])
+}
+
+fn line_from(v: &serde_json::Value) -> Option<Vec<[f32; 2]>> {
+    v.as_array()?.iter().map(coord_pair).collect()
+}
+
+/// Every LineString and MultiLineString geometry of a FeatureCollection.
+fn geojson_lines(root: &serde_json::Value) -> Res<Vec<Vec<[f32; 2]>>> {
+    let features = root["features"].as_array().ok_or("not a FeatureCollection")?;
+    let mut out = Vec::new();
+    for f in features {
+        let g = &f["geometry"];
+        match g["type"].as_str() {
+            Some("LineString") => out.extend(line_from(&g["coordinates"])),
+            Some("MultiLineString") => {
+                for l in g["coordinates"].as_array().into_iter().flatten() {
+                    out.extend(line_from(l));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn cmd_ne_convert(input: &str, output: &str) -> Res<()> {
+    let root: serde_json::Value = serde_json::from_slice(&std::fs::read(input)?)?;
+    let lines = geojson_lines(&root)?;
+    let bytes = torcdf_core::basemap::encode(&lines);
+    std::fs::write(output, &bytes)?;
+    let pts: usize = lines.iter().map(Vec::len).sum();
+    println!("{output}: {} polylines, {pts} points, {} bytes", lines.len(), bytes.len());
+    Ok(())
 }
 
 #[cfg(test)]

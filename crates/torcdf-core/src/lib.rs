@@ -1,5 +1,6 @@
 #[cfg(feature = "fixtures")]
 pub mod fixtures;
+pub mod basemap;
 pub mod cf;
 mod model;
 mod open;
