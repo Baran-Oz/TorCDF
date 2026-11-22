@@ -19,11 +19,20 @@ pub struct MapCamera {
 /// smaller rect side.
 pub fn min_scale(proj: Projection, rect: Rect) -> f64 {
     let (w, h) = (rect.width() as f64, rect.height() as f64);
-    if proj.wraps_x() {
-        w / TAU
+    // The floor is a backstop so the scale can never be zero or negative.
+    let s = if proj.wraps_x() { w / TAU } else { w.min(h) / 4.0 };
+    if s.is_finite() {
+        s.max(1e-9)
     } else {
-        w.min(h) / 4.0
+        1e-9
     }
+}
+
+fn valid_rect(rect: Rect) -> bool {
+    rect.width() > 0.0
+        && rect.height() > 0.0
+        && rect.width().is_finite()
+        && rect.height().is_finite()
 }
 
 fn wrap_pi(x: f64) -> f64 {
@@ -71,12 +80,22 @@ impl MapCamera {
     /// Content follows the pointer. Only the centre wrap applies here (the
     /// scale is unchanged), so no rect is needed.
     pub fn pan(&mut self, delta: Vec2) {
+        if !delta.x.is_finite() || !delta.y.is_finite() {
+            return;
+        }
         self.centre[0] -= delta.x as f64 / self.scale;
         self.centre[1] += delta.y as f64 / self.scale;
         self.wrap_centre();
     }
 
     pub fn zoom_at(&mut self, p: Pos2, factor: f64, rect: Rect) {
+        if !valid_rect(rect)
+            || !p.x.is_finite()
+            || !p.y.is_finite()
+            || !(factor.is_finite() && factor > 0.0)
+        {
+            return;
+        }
         let w = self.screen_to_world(p, rect);
         self.clamp_scale(self.scale * factor, rect);
         let c = rect.center();
@@ -91,7 +110,7 @@ impl MapCamera {
     pub fn fit(&mut self, lonlat: &[(f64, f64)], rect: Rect) {
         let pts: Vec<[f64; 2]> =
             lonlat.iter().filter_map(|&(lo, la)| self.proj.forward(lo, la)).collect();
-        if pts.is_empty() {
+        if pts.is_empty() || !valid_rect(rect) {
             return;
         }
         let mut xs: Vec<f64> = pts.iter().map(|p| p[0]).collect();
@@ -125,6 +144,9 @@ impl MapCamera {
     }
 
     pub fn clamp(&mut self, rect: Rect) {
+        if !valid_rect(rect) {
+            return;
+        }
         self.clamp_scale(self.scale, rect);
         self.wrap_centre();
     }
@@ -238,9 +260,49 @@ mod tests {
     fn scale_is_clamped() {
         let r = rect();
         let mut cam = MapCamera::new(Projection::Equirectangular);
-        cam.zoom_at(r.center(), 1e12, r);
+        let p = Pos2::new(300.0, 250.0);
+        let w = cam.screen_to_world(p, r);
+        cam.zoom_at(p, 1e12, r);
         assert_eq!(cam.scale, MAX_SCALE);
-        cam.zoom_at(r.center(), 1e-12, r);
+        let w2 = cam.screen_to_world(p, r);
+        assert!((w[0] - w2[0]).abs() < 1e-9 && (w[1] - w2[1]).abs() < 1e-9);
+        cam.zoom_at(p, 1e-12, r);
         assert_eq!(cam.scale, min_scale(Projection::Equirectangular, r));
+        let w3 = cam.screen_to_world(p, r);
+        assert!((w[0] - w3[0]).abs() < 1e-9 && (w[1] - w3[1]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_rect_is_harmless() {
+        let neg = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(-5.0, -5.0));
+        for bad in [Rect::ZERO, neg] {
+            let mut cam = MapCamera::new(Projection::Equirectangular);
+            let before = cam;
+            cam.fit(&[(0.0, 0.0), (10.0, 10.0)], bad);
+            cam.zoom_at(Pos2::new(1.0, 1.0), 2.0, bad);
+            cam.clamp(bad);
+            assert_eq!(cam, before);
+        }
+        let mut cam = MapCamera::new(Projection::Equirectangular);
+        cam.fit(&[(0.0, 0.0), (10.0, 10.0)], Rect::ZERO);
+        let r = rect();
+        cam.fit(&[(0.0, 0.0), (10.0, 10.0)], r);
+        assert!(cam.scale > 0.0 && cam.scale.is_finite() && cam.centre.iter().all(|c| c.is_finite()));
+        cam.pan(Vec2::new(5.0, 5.0));
+        assert!(cam.centre.iter().all(|c| c.is_finite()));
+    }
+
+    #[test]
+    fn non_finite_inputs_ignored() {
+        let r = rect();
+        let mut cam = MapCamera::new(Projection::Mercator);
+        let before = cam;
+        cam.pan(Vec2::new(f32::NAN, 1.0));
+        cam.pan(Vec2::new(1.0, f32::INFINITY));
+        cam.zoom_at(Pos2::new(f32::NAN, 5.0), 2.0, r);
+        for f in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            cam.zoom_at(r.center(), f, r);
+        }
+        assert_eq!(cam, before);
     }
 }
