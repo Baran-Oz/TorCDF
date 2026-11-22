@@ -5,3 +5,5 @@ pub mod image;
 pub mod lines;
 #[allow(dead_code)] // used from Task 10
 pub mod map_regular;
+#[allow(dead_code)] // used from Task 10
+pub mod map_curv;

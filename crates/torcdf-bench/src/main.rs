@@ -305,6 +305,68 @@ fn cmd_gen(out: &str, like: &str, var: &str, target_gb: u64) -> Res<()> {
 }
 
 // ---------------------------------------------------------------------------
+// gen-curv
+// ---------------------------------------------------------------------------
+
+/// Small curvilinear test file for the map checklist: a 600 x 800 regular
+/// 0.05 degree grid rotated 30 degrees about (10E, 50N), 2-D `nav_lat`/`nav_lon`
+/// and `sst(time=12, y, x)`; a 40-cell-radius disc at the centre is land
+/// (fill 1e20 in the coordinates, fill in the data).
+fn cmd_gen_curv(out: &str) -> Res<()> {
+    const FILL: f32 = 1.0e20;
+    let (ny, nx, nt) = (600usize, 800usize, 12usize);
+    let (s, c) = 30f64.to_radians().sin_cos();
+    let mut file = netcdf::create(out)?;
+    file.add_dimension("time", nt)?;
+    file.add_dimension("y", ny)?;
+    file.add_dimension("x", nx)?;
+
+    let (cy, cx) = ((ny as f64 - 1.0) / 2.0, (nx as f64 - 1.0) / 2.0);
+    let land: Vec<bool> = (0..ny * nx)
+        .map(|k| {
+            let (i, j) = ((k / nx) as f64 - cy, (k % nx) as f64 - cx);
+            i * i + j * j <= 40.0 * 40.0
+        })
+        .collect();
+    let mut lat = vec![0f32; ny * nx];
+    let mut lon = vec![0f32; ny * nx];
+    for k in 0..ny * nx {
+        let (x, y) = (((k % nx) as f64 - cx) * 0.05, ((k / nx) as f64 - cy) * 0.05);
+        lon[k] = (10.0 + x * c - y * s) as f32;
+        lat[k] = (50.0 + x * s + y * c) as f32;
+    }
+    let mut sst = vec![0f32; nt * ny * nx];
+    for t in 0..nt {
+        for k in 0..ny * nx {
+            sst[t * ny * nx + k] = if land[k] { FILL } else { 12.0 + (lat[k] - 50.0) * 2.0 + t as f32 * 0.5 };
+        }
+    }
+    for k in 0..ny * nx {
+        if land[k] {
+            lat[k] = FILL;
+            lon[k] = FILL;
+        }
+    }
+    for (name, vals, units, std_name) in
+        [("nav_lat", &lat, "degrees_north", "latitude"), ("nav_lon", &lon, "degrees_east", "longitude")]
+    {
+        let mut v = file.add_variable::<f32>(name, &["y", "x"])?;
+        v.set_fill_value(FILL)?;
+        v.put_attribute("units", units)?;
+        v.put_attribute("standard_name", std_name)?;
+        v.put_values(vals, ..)?;
+    }
+    let mut v = file.add_variable::<f32>("sst", &["time", "y", "x"])?;
+    v.set_fill_value(FILL)?;
+    v.put_attribute("units", "degC")?;
+    v.put_attribute("coordinates", "nav_lat nav_lon")?;
+    v.put_values(&sst, ..)?;
+    drop(file);
+    println!("wrote {out}: sst(time={nt}, y={ny}, x={nx}), land disc of 40 cells at the centre");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // bench
 // ---------------------------------------------------------------------------
 
@@ -460,6 +522,7 @@ fn main() -> Res<()> {
             &arg(&args, "--var").unwrap_or_else(|| "uo".into()),
             arg(&args, "--target-gb").ok_or("--target-gb required")?.parse()?,
         ),
+        Some("gen-curv") => cmd_gen_curv(args.get(1).ok_or("usage: gen-curv <out.nc>")?),
         Some("bench") => cmd_bench(
             args.get(1).ok_or("usage: bench <file> --var V")?,
             &arg(&args, "--var").ok_or("--var required")?,
@@ -468,7 +531,7 @@ fn main() -> Res<()> {
             args.get(1).ok_or("usage: ne-convert <in.geojson> <out.bin>")?,
             args.get(2).ok_or("usage: ne-convert <in.geojson> <out.bin>")?,
         ),
-        _ => Err("usage: torcdf-bench inspect|gen|bench|ne-convert ...".into()),
+        _ => Err("usage: torcdf-bench inspect|gen|gen-curv|bench|ne-convert ...".into()),
     }
 }
 
