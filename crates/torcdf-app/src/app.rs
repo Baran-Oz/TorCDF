@@ -277,6 +277,13 @@ impl TorApp {
             ctx,
         };
         app.log.log("window created");
+        if let Some(rs) = &cc.wgpu_render_state {
+            let info = rs.adapter.get_info();
+            app.log.log(format_args!(
+                "adapter: {} backend={:?} type={:?}",
+                info.name, info.backend, info.device_type
+            ));
+        }
         if cc.wgpu_render_state.is_none() {
             app.errors.push("GPU rendering is unavailable, so images cannot be drawn.".into());
         }
