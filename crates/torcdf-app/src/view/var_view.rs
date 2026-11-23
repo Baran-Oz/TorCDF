@@ -156,8 +156,9 @@ pub struct VarView {
     pub map: Option<MapState>,
     /// One-line notice in the plot area (e.g. why the map fell back to the image).
     pub notice: Option<String>,
-    /// When the notice goes away by itself (pop-up messages); `None` = stays.
-    pub notice_until: Option<Instant>,
+    /// A passing message (a pop-up click that opened nothing) and when it
+    /// goes; shown under `notice`, which it never replaces.
+    pub flash: Option<(String, Instant)>,
     pub hover: Option<Hover>,
     /// The vector pair shown, when this view is of one.
     pub vector: Option<Arc<VectorPair>>,
@@ -222,7 +223,7 @@ impl VarView {
             image: ImageState::default(),
             map,
             notice,
-            notice_until: None,
+            flash: None,
             hover: None,
             vector: None,
             resolved: None,
@@ -284,7 +285,7 @@ impl VarView {
             image: ImageState::default(),
             map,
             notice,
-            notice_until: None,
+            flash: None,
             hover: None,
             vector: Some(pair),
             resolved: None,
@@ -340,6 +341,23 @@ impl VarView {
             (_, _, Some(d)) => vec![d],
             _ => vec![],
         }
+    }
+
+    /// Shows `text` as a passing message for `for_how_long` from now.
+    pub fn set_flash(&mut self, text: String, for_how_long: std::time::Duration) {
+        self.flash = Some((text, Instant::now() + for_how_long));
+    }
+
+    /// Drops the passing message once its time is up at `now`; else the
+    /// time it has left (`None` when there is none).
+    pub fn expire_flash(&mut self, now: Instant) -> Option<std::time::Duration> {
+        let (_, until) = self.flash.as_ref()?;
+        let left = until.saturating_duration_since(now);
+        if left.is_zero() {
+            self.flash = None;
+            return None;
+        }
+        Some(left)
     }
 
     pub fn slider_dims(&self) -> Vec<usize> {

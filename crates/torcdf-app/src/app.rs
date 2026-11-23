@@ -26,7 +26,7 @@ use crate::view::var_view::{Display, ImageState, VarView};
 /// A CSV save: `None` when the dialog was cancelled, else the write result.
 type SaveOutcome = Option<Result<(), String>>;
 
-/// How long a pop-up notice stays in the plot area.
+/// How long a pop-up click message (`VarView::flash`) stays in the plot area.
 const NOTICE_TIME: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Frames slower than this are logged (UI-thread stalls).
@@ -578,10 +578,7 @@ impl TorApp {
                 let id = self.popups.next_id();
                 match Popup::open(v, iy, ix, lonlat, id, &self.service) {
                     Ok(p) => self.popups.place(p),
-                    Err(e) => {
-                        v.notice = Some(e);
-                        v.notice_until = Some(Instant::now() + NOTICE_TIME);
-                    }
+                    Err(e) => v.set_flash(e, NOTICE_TIME),
                 }
             }
             Action::ClosePopup(id) => self.popups.close(id),
@@ -843,6 +840,7 @@ impl TorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use torcdf_core::fixtures::vectors::write_nemo_like;
 
     #[test]
@@ -969,12 +967,32 @@ mod tests {
         app.popups.list[0].pinned = true;
         app.apply(Action::OpenPopup { iy: 1, ix: 1, lonlat: None });
         assert_eq!(app.popups.list.len(), 2);
-        // Off the grid: nothing opens, a notice appears.
+        // Off the grid: nothing opens, a passing message appears.
         app.apply(Action::OpenPopup { iy: 99, ix: 99, lonlat: None });
         assert_eq!(app.popups.list.len(), 2);
-        assert!(app.view.as_ref().unwrap().notice.is_some());
+        assert!(app.view.as_ref().unwrap().flash.is_some());
         let id = app.popups.list[1].id;
         app.apply(Action::ClosePopup(id));
         assert_eq!(app.popups.list.len(), 1);
+    }
+
+    #[test]
+    fn failed_popup_click_keeps_the_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        let why = "Shown as an image: this variable cannot be drawn as a map because of a test.";
+        app.view.as_mut().unwrap().notice = Some(why.into());
+        let clicked = Instant::now();
+        app.apply(Action::OpenPopup { iy: 99, ix: 99, lonlat: None });
+        let v = app.view.as_mut().unwrap();
+        assert_eq!(v.notice.as_deref(), Some(why));
+        let (text, _) = v.flash.clone().expect("click error shown");
+        assert_eq!(text, "That point is outside the grid.");
+        // Still there within 4 s; gone after, and the notice stays.
+        assert!(v.expire_flash(clicked + Duration::from_millis(3900)).is_some());
+        assert!(v.flash.is_some());
+        assert!(v.expire_flash(Instant::now() + NOTICE_TIME).is_none());
+        assert!(v.flash.is_none());
+        assert_eq!(v.notice.as_deref(), Some(why));
     }
 }

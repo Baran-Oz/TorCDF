@@ -41,17 +41,14 @@ pub fn show(
         return false;
     };
     header(ui, v);
-    if let Some(t) = v.notice_until {
-        let left = t.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            v.notice = None;
-            v.notice_until = None;
-        } else {
-            ui.ctx().request_repaint_after(left);
-        }
-    }
     if let Some(n) = &v.notice {
         ui.colored_label(ui.visuals().warn_fg_color, n);
+    }
+    if let Some(left) = v.expire_flash(std::time::Instant::now()) {
+        ui.ctx().request_repaint_after(left);
+        if let Some((text, _)) = &v.flash {
+            ui.colored_label(ui.visuals().warn_fg_color, text);
+        }
     }
     if let Some(e) = &v.error {
         ui.colored_label(ui.visuals().error_fg_color, e);
