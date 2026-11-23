@@ -7,7 +7,7 @@
 //! axes, averages the bracketing points at full resolution, subsamples,
 //! rotates to east/north and takes the magnitude.
 
-use super::{AngleSource, Frame, RotateChoice, VectorPair, VectorParts};
+use super::{AngleSource, Frame, PairForm, RotateChoice, VectorPair, VectorParts, magdir_to_en};
 use crate::cf::{Geo, detect_geo, wrap_lon};
 use crate::read::check_shape;
 use crate::{CoreError, NcFile, Slice, SliceRequest, VarInfo};
@@ -356,7 +356,12 @@ impl NcFile {
                 None => Side::Same,
             }
         };
-        let sides = [[side(0, 0), side(0, 1)], [side(1, 0), side(1, 1)]];
+        // Magnitude and direction share one grid: never staggered.
+        let sides = if matches!(pair.form, PairForm::MagDir(_)) {
+            [[Side::Same; 2]; 2]
+        } else {
+            [[side(0, 0), side(0, 1)], [side(1, 0), side(1, 1)]]
+        };
 
         let centre = centre.or_else(|| {
             let avg = |c: usize| planes[c].as_ref().map(|p| p.onto_centre(sides[c], cy, cx));
@@ -478,7 +483,11 @@ impl NcFile {
         let cx = pair.centre_shape[hx];
         let mut data = vec![f32::NAN; total];
         odometer(&shape, |k, idx| {
-            let (u, v) = (f64::from(east[k]), f64::from(north[k]));
+            let mag = east[k];
+            let (u, v) = match pair.form {
+                PairForm::EastNorth => (f64::from(east[k]), f64::from(north[k])),
+                PairForm::MagDir(c) => magdir_to_en(f64::from(east[k]), f64::from(north[k]), &c),
+            };
             let (mut e, mut n) = (u, v);
             if let Some(angle) = &res.angle {
                 let j = r.start[hy] + idx[hy] * r.stride[hy];
@@ -491,7 +500,11 @@ impl NcFile {
             }
             east[k] = e as f32;
             north[k] = n as f32;
-            data[k] = e.hypot(n) as f32;
+            data[k] = match pair.form {
+                PairForm::EastNorth => e.hypot(n) as f32,
+                PairForm::MagDir(_) if e.is_nan() => f32::NAN,
+                PairForm::MagDir(_) => mag,
+            };
         });
         let valid_count = data.iter().filter(|v| !v.is_nan()).count();
         Ok(Slice { shape, data, valid_count, vector: Some(VectorParts { east, north }) })

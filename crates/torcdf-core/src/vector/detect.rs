@@ -4,7 +4,7 @@
 //! component names, units, dimensions, grid mappings, angle variables),
 //! never a list of models. Each variable is in at most one detected pair.
 
-use super::{AngleSource, Frame, RotateChoice, VectorPair};
+use super::{AngleSource, Frame, PairForm, RotateChoice, VectorPair};
 use crate::cf::{Geo, detect_geo};
 use crate::{Dataset, Group, VarInfo};
 use std::collections::HashSet;
@@ -100,11 +100,11 @@ fn detect_in_group(ds: &Dataset, g: &Group, coords: &Coords, out: &mut Vec<Vecto
 
 /// Coordinate variables, which are never components or centre scalars
 /// (ROMS `lat_u`/`lat_v` would otherwise pair by name).
-struct Coords(HashSet<String>);
+pub(super) struct Coords(HashSet<String>);
 
 impl Coords {
     /// Names listed in any variable's `coordinates` attribute.
-    fn of(ds: &Dataset) -> Coords {
+    pub(super) fn of(ds: &Dataset) -> Coords {
         let names = ds
             .all_vars()
             .into_iter()
@@ -145,7 +145,7 @@ enum Rule {
     CommonName,
 }
 
-fn attr_str<'a>(v: &'a VarInfo, name: &str) -> Option<&'a str> {
+pub(super) fn attr_str<'a>(v: &'a VarInfo, name: &str) -> Option<&'a str> {
     v.attrs
         .iter()
         .find(|a| a.name == name)
@@ -154,7 +154,7 @@ fn attr_str<'a>(v: &'a VarInfo, name: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-fn units(v: &VarInfo) -> Option<&str> {
+pub(super) fn units(v: &VarInfo) -> Option<&str> {
     attr_str(v, "units")
 }
 
@@ -240,7 +240,7 @@ fn stem_or_vector(s: &str) -> String {
 }
 
 /// Grid-relative when either component's `grid_mapping` is a rotated pole.
-fn mapping_frame(ds: &Dataset, g: &Group, e: &VarInfo, n: &VarInfo) -> Frame {
+pub(super) fn mapping_frame(ds: &Dataset, g: &Group, e: &VarInfo, n: &VarInfo) -> Frame {
     let rotated = [e, n].iter().any(|v| {
         attr_str(v, "grid_mapping")
             .and_then(|m| m.split_whitespace().next())
@@ -284,7 +284,7 @@ fn shapes_fit(e: &VarInfo, n: &VarInfo) -> bool {
 /// The pair's centre grid, coordinates and angle source. `e` and `n` must
 /// satisfy [`shapes_fit`].
 #[allow(clippy::too_many_arguments)]
-fn build(
+pub(super) fn build(
     ds: &Dataset,
     g: &Group,
     coords: &Coords,
@@ -341,6 +341,7 @@ fn build(
         angle,
         rotate: RotateChoice::Auto,
         by_hand: false,
+        form: PairForm::EastNorth,
     }
 }
 
@@ -416,14 +417,14 @@ fn angle_source(ds: &Dataset, g: &Group, centre_dims: &[String], horiz: [usize; 
 }
 
 /// The group path of a variable path.
-fn parent(path: &str) -> &str {
+pub(super) fn parent(path: &str) -> &str {
     match path.rfind('/') {
         Some(0) | None => "/",
         Some(i) => &path[..i],
     }
 }
 
-fn join(group: &str, name: &str) -> String {
+pub(super) fn join(group: &str, name: &str) -> String {
     if group == "/" { format!("/{name}") } else { format!("{group}/{name}") }
 }
 

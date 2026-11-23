@@ -249,6 +249,88 @@ fn write_noclue_as(dir: &Path, file: &str, theta: f64, names: [&str; 2]) -> Path
     path
 }
 
+/// AROME-like `arome.nc`: `time` = 2, `height` = 1, `y` = 4, `x` = 5, 2-D
+/// `latitude`/`longitude` (about 58-60 N, 4-7 E). `wind_speed` and
+/// `wind_direction` are packed i16 on `(time, height, y, x)`: speed 10.0
+/// everywhere (scale 0.01, fill -32767; `[0,0,0,0]` is fill), direction 270.0
+/// at t = 0 and 0.0 at t = 1 (scale 0.1, `wind_from_direction`, meteorological
+/// units text), except `[0,0,3,4]` fill, `[1,0,1,1]` = -90.0 and
+/// `[1,0,1,2]` = 450.0.
+pub fn write_arome_like(dir: &Path) -> PathBuf {
+    let (nt, ny, nx) = (2, 4, 5);
+    let path = dir.join("arome.nc");
+    let mut f = netcdf::create(&path).unwrap();
+    f.add_dimension("time", nt).unwrap();
+    f.add_dimension("height", 1).unwrap();
+    f.add_dimension("y", ny).unwrap();
+    f.add_dimension("x", nx).unwrap();
+    let yx = ["y", "x"];
+    let lat = grid(1, ny, nx, 0.0, 0.0, |_, q| 58.0 + 2.0 * q / 3.0);
+    let lon = grid(1, ny, nx, 0.0, 0.0, |p, _| 4.0 + 3.0 * p / 4.0);
+    put(&mut f, "latitude", &yx, DEG_LAT, None, &lat);
+    put(&mut f, "longitude", &yx, DEG_LON, None, &lon);
+    let dims = ["time", "height", "y", "x"];
+    const FILL: i16 = -32767;
+    let mut speed = vec![1000i16; nt * ny * nx];
+    speed[0] = FILL;
+    let mut dir = vec![2700i16; nt * ny * nx];
+    for v in &mut dir[ny * nx..] {
+        *v = 0;
+    }
+    dir[3 * nx + 4] = FILL;
+    dir[ny * nx + nx + 1] = -900;
+    dir[ny * nx + nx + 2] = 4500;
+    let speed_attrs = [("standard_name", "wind_speed"), ("units", "m/s")];
+    let dir_attrs = [
+        ("standard_name", "wind_from_direction"),
+        ("units", "degrees clockwise from north (meteorological)"),
+    ];
+    for (name, data, scale, attrs) in
+        [("wind_speed", &speed, 0.01f64, speed_attrs), ("wind_direction", &dir, 0.1, dir_attrs)]
+    {
+        let mut v = f.add_variable::<i16>(name, &dims).unwrap();
+        v.set_fill_value(FILL).unwrap();
+        v.put_attribute("scale_factor", scale).unwrap();
+        v.put_attribute("add_offset", 0f64).unwrap();
+        for (k, val) in attrs {
+            v.put_attribute(k, val).unwrap();
+        }
+        v.put_attribute("coordinates", "longitude latitude").unwrap();
+        v.put_values(data, ..).unwrap();
+    }
+    path
+}
+
+/// `current_to.nc`: `y` = 3, `x` = 3, 1-D `lat`/`lon`; `sea_water_speed`
+/// (0.5 m s-1) and `sea_water_velocity_to_direction` (90.0, units "degree"),
+/// both f32.
+pub fn write_current_to(dir: &Path) -> PathBuf {
+    let path = dir.join("current_to.nc");
+    let mut f = netcdf::create(&path).unwrap();
+    f.add_dimension("y", 3).unwrap();
+    f.add_dimension("x", 3).unwrap();
+    put(&mut f, "lat", &["y"], DEG_LAT, None, &[59.0f64, 59.1, 59.2]);
+    put(&mut f, "lon", &["x"], DEG_LON, None, &[5.0f64, 5.1, 5.2]);
+    let yx = ["y", "x"];
+    let speed = [("standard_name", "sea_water_speed"), ("units", "m s-1")];
+    put(&mut f, "sea_water_speed", &yx, &speed, None, &[0.5f32; 9]);
+    let dir = [("standard_name", "sea_water_velocity_to_direction"), ("units", "degree")];
+    put(&mut f, "sea_water_velocity_to_direction", &yx, &dir, None, &[90.0f32; 9]);
+    path
+}
+
+/// `silent_magdir.nc`: `y` = 3, `x` = 3, `ws` = 4.0 and `wd` = 180.0 (f32)
+/// with no attributes at all.
+pub fn write_silent_magdir(dir: &Path) -> PathBuf {
+    let path = dir.join("silent_magdir.nc");
+    let mut f = netcdf::create(&path).unwrap();
+    f.add_dimension("y", 3).unwrap();
+    f.add_dimension("x", 3).unwrap();
+    put(&mut f, "ws", &["y", "x"], &[], None, &[4.0f32; 9]);
+    put(&mut f, "wd", &["y", "x"], &[], None, &[180.0f32; 9]);
+    path
+}
+
 #[cfg(test)]
 mod tests {
     /// Writes the vector fixtures to `C:/t/fixtures` for checking by hand:
@@ -264,6 +346,9 @@ mod tests {
             super::write_wrf_like(dir),
             super::write_noclue(dir, false),
             super::write_noclue(dir, true),
+            super::write_arome_like(dir),
+            super::write_current_to(dir),
+            super::write_silent_magdir(dir),
         ] {
             assert!(path.is_file(), "{} not written", path.display());
             println!("wrote {}", path.display());

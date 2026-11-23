@@ -5,9 +5,14 @@
 //! ([`pair_by_hand`]). Pairings last for the session; nothing is written.
 
 mod detect;
+mod magdir;
 mod resolve;
 
 pub use detect::{can_pair, detect_pairs, pair_by_hand};
+pub use magdir::{
+    AngleRef, AngleUnit, DirConvention, Guessed, Towards, can_pair_magdir, convention_of, en_to_magdir,
+    magdir_to_en, pair_magdir_by_hand,
+};
 pub use resolve::{Basis, Resolved, Side, angle_from_latlon, stagger_side};
 pub(crate) use resolve::ResolvedCache;
 
@@ -54,6 +59,16 @@ pub enum RotateChoice {
     Off,
 }
 
+/// How a pair's two variables are to be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairForm {
+    /// East and north components.
+    EastNorth,
+    /// Magnitude (stored in `east`) and direction (stored in `north`),
+    /// converted to east/north when read.
+    MagDir(DirConvention),
+}
+
 /// A vector variable made of two component variables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorPair {
@@ -80,6 +95,7 @@ pub struct VectorPair {
     pub angle: AngleSource,
     pub rotate: RotateChoice,
     pub by_hand: bool,
+    pub form: PairForm,
 }
 
 impl VectorPair {
@@ -103,6 +119,32 @@ impl VectorPair {
             attrs,
             storage: Storage::Unknown,
         }
+    }
+
+    /// The magnitude variable of a magnitude/direction pair (the `east` field).
+    pub fn magnitude(&self) -> &str {
+        &self.east
+    }
+
+    /// The direction variable of a magnitude/direction pair (the `north` field).
+    pub fn direction(&self) -> &str {
+        &self.north
+    }
+
+    /// This magnitude/direction pair read with convention `c`; the path tag
+    /// changes with it, the rotation tag stays last. Other pairs are returned
+    /// unchanged.
+    pub fn with_convention(&self, c: DirConvention) -> VectorPair {
+        if !matches!(self.form, PairForm::MagDir(_)) {
+            return self.clone();
+        }
+        let (base, rot) = match self.rotate {
+            RotateChoice::Auto => (self.path.as_str(), ""),
+            RotateChoice::On => (self.path.strip_suffix("#on").unwrap_or(&self.path), "#on"),
+            RotateChoice::Off => (self.path.strip_suffix("#off").unwrap_or(&self.path), "#off"),
+        };
+        let base = base.rsplit_once('~').map_or(base, |(b, _)| b);
+        VectorPair { path: format!("{base}~{}{rot}", c.tag()), form: PairForm::MagDir(c), ..self.clone() }
     }
 
     /// This pair with rotation choice `r`; the path tag changes with it.
