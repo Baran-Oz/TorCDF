@@ -53,6 +53,9 @@ pub struct ArrowLayer {
     /// Picks per form (x & y, magnitude & direction), loaded when that
     /// form is chosen.
     prefill: [Option<[String; 2]>; 2],
+    /// The pair a drop-down edit is replacing, kept through failed picks
+    /// until a pairing succeeds (then it is unregistered).
+    pub(crate) editing: Option<Arc<VectorPair>>,
 }
 
 impl ArrowLayer {
@@ -70,8 +73,15 @@ impl ArrowLayer {
             prefill[i] = Some([p.east.clone(), p.north.clone()]);
             first.get_or_insert(i);
         }
-        let mut layer =
-            ArrowLayer { file, mode: ArrowMode::Off, picks: [None, None], pair: None, problem: None, prefill };
+        let mut layer = ArrowLayer {
+            file,
+            mode: ArrowMode::Off,
+            picks: [None, None],
+            pair: None,
+            problem: None,
+            prefill,
+            editing: None,
+        };
         if let Some(i) = first {
             layer.picks = picks_of(&layer.prefill[i]);
         }
@@ -87,7 +97,15 @@ impl ArrowLayer {
         if let Some(i) = mode.index() {
             prefill[i] = Some(picks.clone());
         }
-        ArrowLayer { file, mode, picks: picks_of(&Some(picks)), pair: Some(pair), problem: None, prefill }
+        ArrowLayer {
+            file,
+            mode,
+            picks: picks_of(&Some(picks)),
+            pair: Some(pair),
+            problem: None,
+            prefill,
+            editing: None,
+        }
     }
 
     /// Takes `mode`'s pre-filled picks (none when it has none).

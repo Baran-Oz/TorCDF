@@ -441,14 +441,21 @@ impl TorApp {
     }
 
     /// Pairs the slot's picks in its mode and shows the result. With
-    /// `replace`, the slot's previous pair is unregistered (with its
-    /// rotation variants) once the new one is made. Any failure leaves the
-    /// slot without a pair and says why.
+    /// `replace` (a drop-down edit), the pair being edited is unregistered
+    /// (with its rotation variants) once a new one is made; it is kept
+    /// through failed picks until then. Any failure leaves the slot without
+    /// a pair and says why.
     fn pair_from_picks(&mut self, replace: bool) {
         let x = self.current_x();
         let Some(l) = self.arrow_layer.as_mut() else { return };
         let Some(nc) = self.files.iter().find(|f| f.id == l.file).map(|f| f.nc.clone()) else { return };
         let old = l.pair.take();
+        if !replace {
+            // A form switch keeps the old pair registered: no edit pending.
+            l.editing = None;
+        } else if old.is_some() {
+            l.editing = old;
+        }
         let [Some(a), Some(b)] = l.picks.clone() else {
             l.problem = Some(PICK_TWO.into());
             self.show_slot();
@@ -489,7 +496,7 @@ impl TorApp {
             self.show_slot();
             return;
         }
-        if let Some(o) = old.filter(|o| replace && family(&o.path) != family(&pair.path)) {
+        if let Some(o) = l.editing.take().filter(|o| family(&o.path) != family(&pair.path)) {
             remove_family(&nc, &o.path);
         }
         let pair = if registered { pair } else { register(&nc, Arc::unwrap_or_clone(pair)) };
@@ -697,6 +704,11 @@ impl TorApp {
                 // The live arrow layer of it turns Off; a layered view of
                 // it becomes the plain view of its variable.
                 if let Some(l) = self.arrow_layer.as_mut().filter(|l| l.file == file)
+                    && l.editing.as_ref().is_some_and(|p| of_it(&p.path))
+                {
+                    l.editing = None;
+                }
+                if let Some(l) = self.arrow_layer.as_mut().filter(|l| l.file == file)
                     && l.pair.as_ref().is_some_and(|p| of_it(&p.path))
                 {
                     l.mode = ArrowMode::Off;
@@ -739,6 +751,7 @@ impl TorApp {
                 l.mode = mode;
                 // The old pair stays registered; the slot no longer draws it.
                 l.pair = None;
+                l.editing = None;
                 if mode == ArrowMode::Off {
                     l.problem = l.missing_picks().then(|| PICK_TWO.to_string());
                     self.show_slot();
@@ -1251,6 +1264,28 @@ mod tests {
         assert_eq!(app.view.as_ref().unwrap().var.path, "/uo");
     }
 
+    /// Swapping the two drop-downs passes through a failed pick (a
+    /// variable with itself); the pair being edited still goes once the
+    /// next pick pairs, so the tree holds no stale entry.
+    #[test]
+    fn failed_pick_still_replaces_edited_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = arome_layer(dir.path());
+        let nc = app.files[0].nc.clone();
+        assert_eq!(nc.pairs().len(), 1);
+        app.apply(Action::PickArrowVar { slot: 0, path: "/wind_direction".into() });
+        let slot = app.arrow_layer.as_ref().unwrap();
+        assert!(slot.problem.is_some() && slot.pair.is_none());
+        assert!(nc.pair(AROME_PAIR).is_some(), "kept while the edit is unfinished");
+        app.apply(Action::PickArrowVar { slot: 1, path: "/wind_speed".into() });
+        let slot = app.arrow_layer.as_ref().unwrap();
+        assert_eq!(slot.problem, None);
+        let new = slot.pair.clone().expect("paired");
+        assert_eq!((new.east.as_str(), new.north.as_str()), ("/wind_direction", "/wind_speed"));
+        assert!(nc.pair(AROME_PAIR).is_none(), "the edited pair is gone");
+        assert_eq!(nc.pairs().len(), 1);
+    }
+
     #[test]
     fn convention_change_replaces_pair() {
         let dir = tempfile::tempdir().unwrap();
@@ -1417,7 +1452,6 @@ mod tests {
         assert_ne!(app.popups.list[0].id, first);
         app.popups.list[0].pinned = true;
         app.apply(Action::OpenPopup { iy: 1, ix: 1, lonlat: None });
-        eprintln!("FLASH {:?}", app.view.as_ref().unwrap().flash);
         assert_eq!(app.popups.list.len(), 2);
         // Off the grid: nothing opens, a passing message appears.
         app.apply(Action::OpenPopup { iy: 99, ix: 99, lonlat: None });
