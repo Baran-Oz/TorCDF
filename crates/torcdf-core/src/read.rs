@@ -326,7 +326,7 @@ impl NcFile {
         let is_str = info.dtype == DType::Str;
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let var = self
-                .file
+                .netcdf()?
                 .variable(var_path.trim_start_matches('/'))
                 .ok_or_else(|| "variable not found".to_string())?;
             let elem = if is_str { std::mem::size_of::<*mut c_char>() } else { 1 };
@@ -396,7 +396,7 @@ impl NcFile {
         // The netcdf crate panics on some lookup failures.
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let var = self
-                .file
+                .netcdf()?
                 .variable(path.trim_start_matches('/'))
                 .ok_or_else(|| "variable not found".to_string())?;
             if extents.is_empty() {

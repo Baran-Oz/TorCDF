@@ -352,6 +352,8 @@ mod tests {
             super::write_arome_like(dir),
             super::write_current_to(dir),
             super::write_silent_magdir(dir),
+            crate::fixtures::hdf5::write_plain_h5(dir),
+            crate::fixtures::hdf5::write_hidden_h5(dir),
         ] {
             assert!(path.is_file(), "{} not written", path.display());
             println!("wrote {}", path.display());

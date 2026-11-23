@@ -1,5 +1,6 @@
 //! Metadata-only open of a netCDF/HDF5 file. No variable data is read.
 
+use crate::fast::h5::H5File;
 use crate::model::*;
 use netcdf::AttributeValue;
 use netcdf::types::{FloatType, IntType, NcVariableType};
@@ -7,14 +8,22 @@ use std::ffi::CString;
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 
-/// An open file: its structure plus the netCDF handle used for later reads.
+/// Where an open file's variable data is read from.
+pub(crate) enum Backend {
+    Netcdf(netcdf::File),
+    /// Plain HDF5 that netCDF-C refused, or hid some datasets of.
+    #[expect(dead_code, reason = "read by the HDF5 data path, the next step")]
+    Hdf5(H5File),
+}
+
+/// An open file: its structure plus the handle used for later reads.
 pub struct NcFile {
     pub meta: Dataset,
     /// The fast chunk reader's handles and caches; dropped (closed) before
-    /// the netCDF handle.
+    /// the backend's handle.
     pub(crate) fast: crate::fast::FastState,
-    pub(crate) file: netcdf::File,
-    /// The exact path netCDF-C opened (the real path, or its 8.3 form on
+    pub(crate) backend: Backend,
+    /// The exact path the backend opened (the real path, or its 8.3 form on
     /// Windows if the real one was refused), so a second HDF5 open names the same file.
     pub(crate) c_path: PathBuf,
     open_id: u64,
@@ -37,9 +46,31 @@ impl NcFile {
         self.open_id
     }
 
+    /// Whether the file is read through the HDF5 library rather than
+    /// netCDF-C (`meta.format` is then [`FileFormat::Hdf5`]).
+    pub fn backend_is_hdf5(&self) -> bool {
+        matches!(self.backend, Backend::Hdf5(_))
+    }
+
+    /// The netCDF-C handle; an error for files read through HDF5.
+    pub(crate) fn netcdf(&self) -> Result<&netcdf::File, String> {
+        match &self.backend {
+            Backend::Netcdf(f) => Ok(f),
+            Backend::Hdf5(_) => Err("not yet supported".into()),
+        }
+    }
+
     /// Opens `path` and reads its structure (dimensions, variables,
     /// attributes, groups). Variable data is not touched.
+    ///
+    /// netCDF-C is tried first. When it refuses the file, or when the HDF5
+    /// library finds more plottable datasets than netCDF-C shows numeric
+    /// variables (it hides some), the file is read through HDF5.
     pub fn open(path: &Path) -> Result<NcFile, CoreError> {
+        Self::open_netcdf(path).or_else(|nc_err| Self::open_hdf5(path).map_err(|_| nc_err))
+    }
+
+    fn open_netcdf(path: &Path) -> Result<NcFile, CoreError> {
         let open_err = |msg: String| CoreError::Open { path: path.to_path_buf(), msg };
         // The real path first; the 8.3 form only if netCDF-C refuses it.
         // `cpath` is whichever candidate worked, for every later open.
@@ -69,24 +100,56 @@ impl NcFile {
             .map_err(|_| open_err("file metadata could not be read (corrupt or unsupported)".into()))?;
         if matches!(format, FileFormat::Netcdf4 | FileFormat::Netcdf4Classic) {
             raw.fill_storage(&mut root);
+            // Does netCDF-C hide datasets? Any HDF5 error: keep netCDF-C.
+            let h5 = H5File::open(&cpath)
+                .and_then(|h5| crate::h5meta::read_h5_meta(&h5, path).map(|r| (h5, r)));
+            if let Ok((h5, h5_root)) = h5
+                && crate::h5meta::hides_datasets(&root, &h5_root)
+            {
+                let meta = Dataset { path: path.to_path_buf(), file_size, format: FileFormat::Hdf5, root: h5_root };
+                return Ok(Self::assemble(meta, Backend::Hdf5(h5), cpath));
+            }
         }
         let meta = Dataset { path: path.to_path_buf(), file_size, format, root };
+        Ok(Self::assemble(meta, Backend::Netcdf(file), cpath))
+    }
+
+    /// Opens `path` through the HDF5 library alone: the first path
+    /// candidate HDF5 accepts.
+    pub(crate) fn open_hdf5(path: &Path) -> Result<NcFile, CoreError> {
+        let open_err = |msg: String| CoreError::Open { path: path.to_path_buf(), msg };
+        let mut last_err = None;
+        for cand in c_path_candidates(path) {
+            match H5File::open(&cand) {
+                Ok(h5) => {
+                    let root = crate::h5meta::read_h5_meta(&h5, path).map_err(open_err)?;
+                    let file_size = std::fs::metadata(path).map_err(|e| open_err(e.to_string()))?.len();
+                    let meta = Dataset { path: path.to_path_buf(), file_size, format: FileFormat::Hdf5, root };
+                    return Ok(Self::assemble(meta, Backend::Hdf5(h5), cand));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(open_err(last_err.unwrap_or_else(|| "file could not be opened".into())))
+    }
+
+    fn assemble(meta: Dataset, backend: Backend, c_path: PathBuf) -> NcFile {
         let open_id = NEXT_OPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Metadata only: no variable data is read.
         let pairs = crate::vector::detect_pairs(&meta).into_iter().map(std::sync::Arc::new).collect();
-        Ok(NcFile {
+        NcFile {
             meta,
             fast: Default::default(),
-            file,
-            c_path: cpath,
+            backend,
+            c_path,
             open_id,
             pairs: std::sync::RwLock::new(pairs),
             resolved: Default::default(),
-        })
+        }
     }
 }
 
-/// The paths to try with netCDF-C, in order: the real path, then (Windows,
+/// The paths to try with netCDF-C (or HDF5), in order: the real path, then (Windows,
 /// non-ASCII only) its ASCII-only short (8.3) form, in case netCDF-C cannot
 /// open the real one through the ANSI code page.
 fn c_path_candidates(p: &Path) -> Vec<PathBuf> {
@@ -223,7 +286,7 @@ fn attr_of(a: &netcdf::Attribute) -> Option<Attr> {
 
 /// Unsigned 64-bit values stay exact `Ints` when they all fit in `i64`;
 /// otherwise the whole attribute becomes `Floats` rather than wrapping.
-fn u64s_to_attr(v: Vec<u64>) -> AttrValue {
+pub(crate) fn u64s_to_attr(v: Vec<u64>) -> AttrValue {
     match v.iter().map(|&x| i64::try_from(x)).collect::<Result<Vec<_>, _>>() {
         Ok(ints) => AttrValue::Ints(ints),
         Err(_) => AttrValue::Floats(v.into_iter().map(|x| x as f64).collect()),

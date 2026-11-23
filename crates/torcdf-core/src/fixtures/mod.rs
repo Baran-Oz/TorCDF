@@ -390,6 +390,7 @@ fn add_raw_fast_vars(path: &Path, s_i32: &[i32], fl_f32: &[f32]) {
     }
 }
 
+pub mod hdf5;
 pub mod vectors;
 
 /// netCDF-4 `unsigned.nc` (chunked + deflate, so the fast reader applies):

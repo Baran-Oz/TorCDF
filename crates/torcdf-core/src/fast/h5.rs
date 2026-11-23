@@ -70,7 +70,7 @@ impl Drop for Id {
     }
 }
 
-/// A read-only HDF5 handle on a netCDF-4 file.
+/// A read-only HDF5 handle on a netCDF-4 or plain HDF5 file.
 pub(crate) struct H5File {
     file: Arc<Id>,
     /// Userblock size: HDF5 addresses are relative to the end of it.
@@ -78,7 +78,13 @@ pub(crate) struct H5File {
 }
 
 impl H5File {
-    /// Opens `c_path`, the path netCDF-C was given for the same file.
+    /// The HDF5 file identifier. Use it only under the netCDF lock.
+    pub(crate) fn id(&self) -> hid_t {
+        self.file.id
+    }
+
+    /// Opens `c_path`, the path netCDF-C was given for the same file (or,
+    /// for the HDF5 backend, the first path candidate HDF5 accepts).
     pub(crate) fn open(c_path: &Path) -> Result<H5File, String> {
         let c = CString::new(c_path.to_str().ok_or("path is not valid UTF-8")?)
             .map_err(|e| e.to_string())?;

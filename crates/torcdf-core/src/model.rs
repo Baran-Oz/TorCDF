@@ -30,6 +30,9 @@ pub enum FileFormat {
     Cdf5,
     Netcdf4,
     Netcdf4Classic,
+    /// Plain HDF5 read through the HDF5 library: netCDF-C refused the file
+    /// or hid some of its datasets.
+    Hdf5,
 }
 
 #[derive(Debug, Clone, PartialEq)]
