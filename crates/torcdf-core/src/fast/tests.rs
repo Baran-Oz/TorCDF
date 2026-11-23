@@ -241,3 +241,24 @@ fn hdf5_fill_other_than_fillvalue_is_not_eligible() {
     assert_eq!(s.data[3], 42.0, "an unwritten chunk reads as HDF5's fill");
     assert_eq!(s.data[23], 42.0);
 }
+
+/// On the HDF5 backend the reference is H5Dread, which gives HDF5's fill
+/// for never-written chunks: the fast reader serves the dataset and agrees.
+#[test]
+fn h5_backend_fast_reader_uses_hdf5_fill() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = NcFile::open_hdf5(&write_hdf5_user_fill(dir.path())).unwrap();
+    assert!(h.fast_eligible("/v"));
+    for stride in [vec![1, 1], vec![3, 2]] {
+        let r = SliceRequest { var: "/v".into(), start: vec![0, 0], count: vec![4, 6], stride };
+        let before = h.fast_reads();
+        let fast = h.read_slice(&r).unwrap();
+        assert_eq!(h.fast_reads(), before + 1);
+        let lib = h.read_slice_via_library(&r).unwrap();
+        assert_eq!(fast.data, lib.data, "{r:?}");
+    }
+    let r = SliceRequest { var: "/v".into(), start: vec![0, 0], count: vec![4, 6], stride: vec![1, 1] };
+    let s = h.read_slice(&r).unwrap();
+    assert_eq!(&s.data[..4], &[1.0, 2.0, 3.0, 42.0]);
+    assert_eq!(s.data[23], 42.0);
+}

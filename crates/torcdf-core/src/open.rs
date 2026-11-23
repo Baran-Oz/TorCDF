@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 pub(crate) enum Backend {
     Netcdf(netcdf::File),
     /// Plain HDF5 that netCDF-C refused, or hid some datasets of.
-    #[expect(dead_code, reason = "read by the HDF5 data path, the next step")]
     Hdf5(H5File),
 }
 
@@ -52,11 +51,12 @@ impl NcFile {
         matches!(self.backend, Backend::Hdf5(_))
     }
 
-    /// The netCDF-C handle; an error for files read through HDF5.
+    /// The netCDF-C handle; an error for files read through HDF5 (only
+    /// their numbers can be read, through [`NcFile::read_slice`] and co.).
     pub(crate) fn netcdf(&self) -> Result<&netcdf::File, String> {
         match &self.backend {
             Backend::Netcdf(f) => Ok(f),
-            Backend::Hdf5(_) => Err("not yet supported".into()),
+            Backend::Hdf5(_) => Err("text values of plain HDF5 files cannot be read yet".into()),
         }
     }
 

@@ -72,7 +72,8 @@ pub(crate) fn pool() -> Option<&'static rayon::ThreadPool> {
 impl NcFile {
     /// Whether `read_slice` reads `var_path` with the fast reader: false for
     /// netCDF-3 files, unknown (e.g. virtual) paths, and variables that are
-    /// not chunked or use filters it cannot undo.
+    /// not chunked numbers or use filters it cannot undo. Plain HDF5 files
+    /// on the HDF5 backend are served too.
     pub fn fast_eligible(&self, var_path: &str) -> bool {
         self.fast_var(var_path).is_some()
     }
@@ -102,10 +103,11 @@ impl NcFile {
     fn open_fast_var(&self, path: &str) -> Option<FastVar> {
         if !matches!(
             self.meta.format,
-            FileFormat::Netcdf4 | FileFormat::Netcdf4Classic
+            FileFormat::Netcdf4 | FileFormat::Netcdf4Classic | FileFormat::Hdf5
         ) {
             return None;
         }
+        let hdf5 = self.backend_is_hdf5();
         let info = self.meta.var(path)?;
         let size = info.dtype.size()?;
         if !matches!(info.storage, Storage::Chunked { .. }) || info.shape.is_empty() {
@@ -126,13 +128,16 @@ impl NcFile {
             .iter()
             .try_fold(1usize, |a, &b| a.checked_mul(b))
             .filter(|n| n.checked_mul(size + CHECKSUM_LEN).is_some())?;
-        // Never-written chunks read as HDF5's fill value, records past the
-        // extent as netCDF's: a file from another tool may set an HDF5 fill
-        // value that differs from `_FillValue`, and then they would disagree.
-        let raw = raw_fill(info);
-        if h5
-            .fill
-            .is_some_and(|h| h != raw && !(h.is_nan() && raw.is_nan()))
+        // netCDF-C backend: never-written chunks read as HDF5's fill value,
+        // records past the extent as netCDF's: a file from another tool may
+        // set an HDF5 fill value that differs from `_FillValue`, and then
+        // they would disagree. HDF5 backend: the reference is `H5Dread`, so
+        // HDF5's fill (0 unless set) everywhere; the extent is the shape.
+        let raw = if hdf5 { h5.fill.unwrap_or(0.0) } else { raw_fill(info) };
+        if !hdf5
+            && h5
+                .fill
+                .is_some_and(|h| h != raw && !(h.is_nan() && raw.is_nan()))
         {
             return None;
         }

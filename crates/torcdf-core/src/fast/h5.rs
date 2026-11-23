@@ -19,7 +19,9 @@ use hdf5_metno_sys::h5p::{
 };
 use hdf5_metno_sys::h5s::{H5Sclose, H5Sget_simple_extent_dims, H5Sget_simple_extent_ndims};
 use hdf5_metno_sys::h5t::{
-    H5T_NATIVE_DOUBLE, H5T_class_t, H5T_order_t, H5Tclose, H5Tget_class, H5Tget_order, H5Tget_size,
+    H5T_IEEE_F32BE, H5T_IEEE_F32LE, H5T_IEEE_F64BE, H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, H5T_class_t,
+    H5T_order_t, H5Tclose, H5Tequal, H5Tget_class, H5Tget_offset, H5Tget_order, H5Tget_precision,
+    H5Tget_size,
 };
 use hdf5_metno_sys::h5z::{H5Z_FILTER_DEFLATE, H5Z_FILTER_FLETCHER32, H5Z_FILTER_SHUFFLE};
 use netcdf_sys::libnetcdf_lock;
@@ -261,6 +263,9 @@ impl H5Var {
         if elem_size == 0 {
             return Err("HDF5 could not read the type size".into());
         }
+        if !standard_layout(dtype.id, class, elem_size) {
+            return Ok(None);
+        }
         let order = match unsafe { H5Tget_order(dtype.id) } {
             H5T_order_t::H5T_ORDER_LE => ByteOrder::Little,
             H5T_order_t::H5T_ORDER_BE => ByteOrder::Big,
@@ -422,6 +427,20 @@ fn chunk_loc(
 /// The dataset's user-defined fill value converted by HDF5 to `f64`, as
 /// netCDF-C converts what it reads; None when no user value is set (HDF5's
 /// default). Caller holds the lock.
+/// Whether every bit of an element of type `t` is its value in the
+/// standard layout the decoder assumes: integers without padding, IEEE
+/// single or double floats. (netCDF types always are; a plain HDF5 file
+/// can hold others, which only HDF5 converts correctly.) Caller holds the lock.
+fn standard_layout(t: hid_t, class: H5T_class_t, size: usize) -> bool {
+    match class {
+        H5T_class_t::H5T_INTEGER => unsafe { H5Tget_offset(t) == 0 && H5Tget_precision(t) == size * 8 },
+        H5T_class_t::H5T_FLOAT => [*H5T_IEEE_F32LE, *H5T_IEEE_F32BE, *H5T_IEEE_F64LE, *H5T_IEEE_F64BE]
+            .into_iter()
+            .any(|s| unsafe { H5Tequal(t, s) } > 0),
+        _ => false,
+    }
+}
+
 fn user_fill(dcpl: &Id) -> Result<Option<f64>, String> {
     let mut status = H5D_fill_value_t::H5D_FILL_VALUE_ERROR;
     if unsafe { H5Pfill_value_defined(dcpl.id, &mut status) } < 0 {

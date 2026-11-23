@@ -178,10 +178,10 @@ fn find_group<'a>(root: &'a mut Group, path: &str) -> &'a mut Group {
 
 /// An HDF5 identifier closed when dropped. Unlike `fast::h5`'s, its drop
 /// does not take the lock: it is only used while the lock is held.
-struct Held(hid_t, unsafe extern "C" fn(hid_t) -> herr_t);
+pub(crate) struct Held(pub(crate) hid_t, unsafe extern "C" fn(hid_t) -> herr_t);
 
 impl Held {
-    fn new(id: hid_t, close: unsafe extern "C" fn(hid_t) -> herr_t, what: &str) -> Result<Held, String> {
+    pub(crate) fn new(id: hid_t, close: unsafe extern "C" fn(hid_t) -> herr_t, what: &str) -> Result<Held, String> {
         if id < 0 { Err(format!("HDF5 could not {what}")) } else { Ok(Held(id, close)) }
     }
 }
@@ -687,10 +687,9 @@ mod tests {
         assert_eq!(b.dtype, DType::I32);
         assert_eq!(m.group_of("/sub/b").dims, [dim("phony_dim_1", 3)]);
 
-        // Reads through the HDF5 backend come in a later step.
+        // Read through the HDF5 backend.
         let req = SliceRequest { var: "/a".into(), start: vec![0, 0], count: vec![2, 3], stride: vec![1, 1] };
-        let e = nc.read_slice(&req).err().expect("HDF5 reads are not yet supported");
-        assert!(matches!(&e, CoreError::Read { msg, .. } if msg == "not yet supported"), "{e}");
+        assert_eq!(nc.read_slice(&req).unwrap().data, [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
         // Neither the refused netCDF-C open nor the HDF5 one leaves the file open.
         drop(nc);
         std::fs::remove_file(&p).expect("hidden.h5 is closed");
