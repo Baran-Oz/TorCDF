@@ -309,6 +309,9 @@ impl TorApp {
         if let (Some(new), Some(prev)) = (&mut v.map, &old.map) {
             new.inherit_view(prev);
         }
+        if let (Some(new), Some(prev)) = (&mut v.arrows, &old.arrows) {
+            (new.on, new.length) = (prev.on, prev.length);
+        }
         // The slider range and colours stay as the user left them.
         let lock = self.display.lock;
         self.selection = Some(Selection::Var(old.file_id, pair.path.clone()));

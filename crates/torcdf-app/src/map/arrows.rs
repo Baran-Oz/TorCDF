@@ -1,14 +1,16 @@
 //! Where vector arrows go and which way they point (pure logic; the GPU
-//! drawing and the background job live elsewhere).
+//! drawing is `render::arrows`, the background job `view::arrow_state`).
 //!
-//! Image view: the renderer uses `Projection::Equirectangular` with a
-//! `lonlat` that returns `(ix, iy)` as "degrees"; its transform maps those
-//! world units to screen, so there the direction is just `normalize(east,
-//! north)`. That mode is the renderer's to special-case (the cells there are
-//! not real latitudes, so `screen_dir` is not meaningful for them).
-
-// Used by the renderer (next task); remove then.
-#![allow(dead_code)]
+//! Two world spaces ([`ArrowSpace`]):
+//! - Map: positions are projected world units and directions come from the
+//!   projection's tangents ([`screen_dir`]).
+//! - Image: positions are cell centres `(ix + 0.5, iy + 0.5)` in the image
+//!   view's cell units (x = column, y = row index), which
+//!   `render::arrows::image_affine` maps to the screen. No latitudes are
+//!   involved, so every row gets an arrow. North is drawn up on screen, as
+//!   the image view puts north up: +row when rows grow upwards (`flip_y`),
+//!   -row otherwise. East is divided by the cell aspect (screen width over
+//!   height of a cell) so the on-screen angle is that of `(east, north)`.
 
 use super::projection::Projection;
 use super::tiles::TileSpec;
@@ -140,12 +142,25 @@ pub struct ArrowInstance {
 /// Centre `(lon, lat)` of a full-resolution cell.
 pub type LonLatFn = Arc<dyn Fn(usize, usize) -> Option<(f64, f64)> + Send + Sync>;
 
+/// The world arrows are placed in (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ArrowSpace {
+    Map(Projection),
+    Image {
+        /// Rows grow upwards on screen.
+        flip_y: bool,
+        /// Screen width over height of one cell.
+        aspect: f32,
+    },
+}
+
 /// Owned inputs, so the build can run in a background job.
 pub struct ArrowInput {
-    pub proj: Projection,
-    /// Finest first.
+    pub space: ArrowSpace,
+    /// Finest first. Texel `(ty, tx)` of a tile is element
+    /// `ty * spec.shape()[1] + tx` of its slice.
     pub tiles: Vec<(TileSpec, Arc<Slice>)>,
-    /// Centre coordinates `(lon, lat)` of a full-resolution cell.
+    /// Centre coordinates `(lon, lat)` of a full-resolution cell (map only).
     pub lonlat: LonLatFn,
     pub cells: Vec<(usize, usize)>,
 }
@@ -177,30 +192,43 @@ pub fn build_arrows(input: &ArrowInput) -> ArrowSet {
             continue;
         }
         let Some(parts) = slice.vector.as_ref() else { continue };
-        let width = slice.shape.get(1).copied().unwrap_or(0);
-        let at = t[0] * width + t[1];
+        // Not `slice.shape`: a tile may hold the request's slice, [1, ny, nx].
+        let at = t[0] * spec.shape()[1] + t[1];
         let (Some(&east), Some(&north)) = (parts.east.get(at), parts.north.get(at)) else {
             continue;
         };
         if east.is_nan() || north.is_nan() {
             continue;
         }
-        let Some((lon, lat)) = (input.lonlat)(cell[0], cell[1]) else { continue };
-        let Some(w) = input.proj.forward(lon, lat) else { continue };
-        let Some(dir) = screen_dir(input.proj, lon, lat, east, north) else { continue };
+        let Some((pos, dir)) = place(input, cell, east, north) else { continue };
         let mag = match slice.data.get(at) {
             Some(&m) if m.is_finite() => m,
             _ => east.hypot(north),
         };
-        instances.push(ArrowInstance {
-            pos: [w[0] as f32, w[1] as f32],
-            dir,
-            mag,
-            _pad: 0.0,
-        });
+        instances.push(ArrowInstance { pos, dir, mag, _pad: 0.0 });
     }
     let p95 = p95(instances.iter().map(|i| i.mag));
     ArrowSet { instances, p95 }
+}
+
+/// World position and unit world direction of the arrow at full-resolution
+/// `cell` (`[iy, ix]`).
+fn place(input: &ArrowInput, cell: [usize; 2], east: f32, north: f32) -> Option<([f32; 2], [f32; 2])> {
+    match input.space {
+        ArrowSpace::Map(proj) => {
+            let (lon, lat) = (input.lonlat)(cell[0], cell[1])?;
+            let w = proj.forward(lon, lat)?;
+            let dir = screen_dir(proj, lon, lat, east, north)?;
+            Some(([w[0] as f32, w[1] as f32], dir))
+        }
+        ArrowSpace::Image { flip_y, aspect } => {
+            let pos = [cell[1] as f32 + 0.5, cell[0] as f32 + 0.5];
+            let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+            let v = [east / aspect, if flip_y { north } else { -north }];
+            let len = v[0].hypot(v[1]);
+            (len.is_finite() && len > 0.0).then_some((pos, [v[0] / len, v[1] / len]))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +319,7 @@ mod tests {
             tile(ov, vec![2.0; 16], vec![0.0; 16]),
         ];
         let input = ArrowInput {
-            proj: Projection::Equirectangular,
+            space: ArrowSpace::Map(Projection::Equirectangular),
             tiles,
             lonlat: Arc::new(|iy, ix| Some((ix as f64, iy as f64))),
             cells: vec![(2, 2), (12, 12), (5, 5)],
@@ -306,6 +334,50 @@ mod tests {
         assert!((b.pos[0] - 12f32.to_radians()).abs() < 1e-6);
         assert!((b.pos[1] - 12f32.to_radians()).abs() < 1e-6);
         assert!(set.p95.is_some());
+    }
+
+    #[test]
+    fn build_reads_texels_by_tile_width() {
+        // A tile holding the request's slice keeps its full shape, [1, ny, nx].
+        let spec = TileSpec { start: [0, 0], count: [2, 3], stride: [1, 1] };
+        let (_, s) = tile(spec, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![0.0; 6]);
+        let mut s = Arc::try_unwrap(s).ok().expect("sole owner");
+        s.shape = vec![1, 2, 3];
+        let input = ArrowInput {
+            space: ArrowSpace::Map(Projection::Equirectangular),
+            tiles: vec![(spec, Arc::new(s))],
+            lonlat: Arc::new(|iy, ix| Some((ix as f64, iy as f64))),
+            cells: vec![(1, 2)],
+        };
+        assert_eq!(build_arrows(&input).instances[0].mag, 6.0);
+    }
+
+    #[test]
+    fn image_mode_places_cells_and_keeps_north_up() {
+        let spec = TileSpec { start: [0, 0], count: [600, 2], stride: [1, 1] };
+        let n = 1200;
+        let (_, s) = tile(spec, vec![0.0; n], vec![1.0; n]);
+        let image = |flip_y, aspect| ArrowInput {
+            space: ArrowSpace::Image { flip_y, aspect },
+            tiles: vec![(spec, s.clone())],
+            lonlat: Arc::new(|_, _| None),
+            cells: vec![(500, 1)],
+        };
+        // Row 500 is far past any latitude, yet it gets an arrow.
+        let set = build_arrows(&image(true, 1.0));
+        assert_eq!(set.instances.len(), 1);
+        let a = set.instances[0];
+        assert_eq!(a.pos, [1.5, 500.5]);
+        // North is up on screen: +row when rows grow upwards, -row otherwise.
+        assert!(close(a.dir, [0.0, 1.0]), "{:?}", a.dir);
+        let a = build_arrows(&image(false, 1.0)).instances[0];
+        assert!(close(a.dir, [0.0, -1.0]), "{:?}", a.dir);
+        // Cells twice as wide as tall: x is halved so the screen angle holds.
+        let (_, s2) = tile(spec, vec![1.0; n], vec![1.0; n]);
+        let input = ArrowInput { tiles: vec![(spec, s2)], ..image(true, 2.0) };
+        let d = build_arrows(&input).instances[0].dir;
+        let s5 = 5f32.sqrt();
+        assert!(close(d, [1.0 / s5, 2.0 / s5]), "{d:?}");
     }
 
     #[test]

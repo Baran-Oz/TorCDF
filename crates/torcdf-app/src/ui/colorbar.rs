@@ -95,12 +95,74 @@ fn layout(
     (galley, bar)
 }
 
-/// Draw the bar (low at the bottom) with tick labels and the label above, inside `rect`.
-pub fn show(ui: &mut egui::Ui, rect: egui::Rect, colormap: Colormap, range: (f32, f32), log: bool, label: &str) {
+/// Height of the reference arrow row under the bar (arrow and its text).
+const ARROW_ROW: f32 = 34.0;
+
+/// A vector view's reference arrow: its value, length in points and units.
+pub struct ReferenceArrow<'a> {
+    pub value: f32,
+    pub len_pt: f32,
+    pub units: &'a str,
+}
+
+/// `(value, len)` stepped down the 1-2-5 sequence until `len <= max`, the
+/// length shrinking with the value.
+pub fn fit_reference(value: f64, len: f32, max: f32) -> (f64, f32) {
+    let (mut value, mut len) = (value, len);
+    for _ in 0..40 {
+        if len <= max || !(len > 0.0 && value > 0.0 && value.is_finite()) {
+            break;
+        }
+        let e = value.log10().floor() as i32;
+        let m = (value / pow10(e)).round();
+        let next = if m >= 5.0 { 2.0 * pow10(e) } else if m >= 2.0 { pow10(e) } else { 5.0 * pow10(e - 1) };
+        len *= (next / value) as f32;
+        value = next;
+    }
+    (value, len)
+}
+
+/// A horizontal arrow from `x0` of `len` points at height `y`, with
+/// "value units" below it.
+fn reference_arrow(painter: &egui::Painter, rect: egui::Rect, r: &ReferenceArrow, colour: egui::Color32) {
+    let (value, len) = fit_reference(r.value as f64, r.len_pt, rect.width() - 4.0);
+    if !(len.is_finite() && len >= 1.0) {
+        return;
+    }
+    let (x0, y) = (rect.left() + 1.0, rect.top() + 8.0);
+    let head = (0.3 * len).min(8.0);
+    let tip = egui::pos2(x0 + len, y);
+    painter.line_segment([egui::pos2(x0, y), egui::pos2(tip.x - head, y)], egui::Stroke::new(1.5, colour));
+    let tri = vec![egui::pos2(tip.x - head, y - 0.5 * head), tip, egui::pos2(tip.x - head, y + 0.5 * head)];
+    painter.add(egui::Shape::convex_polygon(tri, colour, egui::Stroke::NONE));
+    let text = format!("{} {}", fmt_value(value), r.units);
+    let font = egui::FontId::proportional(12.0);
+    painter.text(egui::pos2(x0, y + 8.0), egui::Align2::LEFT_TOP, text.trim_end(), font, colour);
+}
+
+/// Draw the bar (low at the bottom) with tick labels and the label above,
+/// inside `rect`; with `arrow`, the reference arrow under the bar.
+pub fn show(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    colormap: Colormap,
+    range: (f32, f32),
+    log: bool,
+    label: &str,
+    arrow: Option<ReferenceArrow>,
+) {
     let painter = ui.painter_at(rect);
     let text_color = ui.visuals().text_color();
     let font = egui::FontId::proportional(12.0);
 
+    let rect = match &arrow {
+        Some(a) if rect.height() > 3.0 * ARROW_ROW => {
+            let row = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - ARROW_ROW), rect.max);
+            reference_arrow(&painter, row, a, text_color);
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), row.top()))
+        }
+        _ => rect,
+    };
     let (galley, bar) = layout(&painter, rect, label, font.clone(), text_color);
     if bar.height() < 8.0 {
         return;
@@ -183,6 +245,16 @@ mod tests {
         assert_eq!(nice_ticks(0.0, 1.0, 6, true), nice_ticks(0.0, 1.0, 6, false));
         assert_eq!(nice_ticks(2.0, 5.0, 4, true), nice_ticks(2.0, 5.0, 4, false));
     }
+    #[test]
+    fn reference_steps_down_to_fit() {
+        let (v, len) = fit_reference(0.5, 300.0, 100.0);
+        assert!((v - 0.1).abs() < 1e-12 && (len - 60.0).abs() < 1e-3, "{v} {len}");
+        let (v, len) = fit_reference(200.0, 90.0, 100.0);
+        assert_eq!((v, len), (200.0, 90.0), "fits already");
+        let (v, len) = fit_reference(1.0, 150.0, 100.0);
+        assert!((v - 0.5).abs() < 1e-12 && (len - 75.0).abs() < 1e-3, "{v} {len}");
+    }
+
     #[test]
     fn label_text() {
         let v = var(vec![("long_name", "Elevation relative to sea level"), ("units", "m")]);

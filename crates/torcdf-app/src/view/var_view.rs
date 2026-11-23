@@ -16,6 +16,7 @@ use crate::map::tiles::TileSpec;
 use crate::render::colormap::Colormap;
 use crate::render::image::ImageLayer;
 use crate::ui::{inspector, plot_area};
+use crate::view::arrow_state::ArrowState;
 use crate::view::defaults::{
     AxisChoice, ViewKind, auto_range, build_request, choose_axes, choose_view, tile_request,
 };
@@ -160,6 +161,8 @@ pub struct VarView {
     pub vector: Option<Arc<VectorPair>>,
     /// Its staggering, rotation and centre coordinates, once resolved.
     pub resolved: Option<Arc<Resolved>>,
+    /// Arrow settings and set; vector views only.
+    pub arrows: Option<ArrowState>,
 }
 
 impl VarView {
@@ -230,6 +233,7 @@ impl VarView {
             hover: None,
             vector: None,
             resolved: None,
+            arrows: None,
         }
     }
 
@@ -299,6 +303,7 @@ impl VarView {
             hover: None,
             vector: Some(pair),
             resolved: None,
+            arrows: Some(ArrowState::default()),
         }
     }
 

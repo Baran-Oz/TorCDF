@@ -7,7 +7,11 @@ use eframe::egui_wgpu::RenderState;
 use egui_extras::{Column, TableBuilder};
 
 use super::{colorbar, fmt_value, inspector::log_range, map_view, slider_label};
+use crate::map::arrows::{ArrowSpace, arrow_step};
+use crate::map::tiles::TileSpec;
+use crate::render::arrows::{ARROW_IMAGE_ID, ArrowParams, image_affine, paint_arrows};
 use crate::render::image::{self as gpu, ImageParams};
+use crate::view::arrow_state::{ArrowKey, IndexWindow, image_input};
 use crate::view::defaults::{AxisChoice, ViewKind};
 use crate::view::var_view::{Display, Hover, Stats, VarView};
 
@@ -37,6 +41,9 @@ pub fn show(
     }
     if let Some(e) = &v.error {
         ui.colored_label(ui.visuals().error_fg_color, e);
+    }
+    if let Some(p) = v.arrows.as_ref().filter(|a| a.on).and_then(|a| a.problem.as_ref()) {
+        ui.colored_label(ui.visuals().warn_fg_color, p);
     }
     match v.kind {
         ViewKind::Map => map_view::show(ui, v, display, rs),
@@ -162,10 +169,57 @@ fn image(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&Rend
     };
     let params = ImageParams { range, colormap: display.colormap, log: display.log, view, flip_y };
     gpu::paint(ui, rect, &layer, &params);
+    let arrows_drawn = rs.is_some_and(|rs| image_arrows(ui, v, rs, rect, view, flip_y, grid));
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
-    colorbar::show(ui, bar, display.colormap, range, display.log, &colorbar::colorbar_label(&v.var));
+    let arrow = reference_arrow(v, arrows_drawn);
+    colorbar::show(ui, bar, display.colormap, range, display.log, &colorbar::colorbar_label(&v.var), arrow);
     uploaded
+}
+
+/// A vector view's arrows over its image: rebuilt in a job for every new
+/// slice (and lattice step), over the whole grid. True when drawn.
+fn image_arrows(
+    ui: &mut egui::Ui,
+    v: &mut VarView,
+    rs: &RenderState,
+    rect: Rect,
+    view: Rect,
+    flip_y: bool,
+    grid: Grid,
+) -> bool {
+    let aspect = v.cell_aspect();
+    let Some(slice) = v.shown.as_ref().map(|s| s.slice.clone()) else { return false };
+    let Some(a) = v.arrows.as_mut().filter(|a| a.on) else { return false };
+    a.poll_finished();
+    a.upload_ready(rs);
+    let full = [grid.ny, grid.nx];
+    let cell_pt = [rect.height() / view.height(), rect.width() / view.width()].map(f64::from);
+    let space = ArrowSpace::Image { flip_y, aspect };
+    let tile = TileSpec { start: [0, 0], count: full, stride: [1, 1] };
+    let key = ArrowKey::of(&[(tile, slice.clone())], arrow_step(cell_pt), space);
+    let core = IndexWindow::whole(full);
+    a.update(ui.ctx(), key, &core, full, move || image_input(slice, grid, space));
+    if !matches!(a.built_space(), Some(ArrowSpace::Image { .. })) {
+        return false;
+    }
+    let ppp = ui.ctx().pixels_per_point();
+    let Some(px_per_unit) = a.px_per_unit(ppp) else { return false };
+    let r = rect * ppp;
+    let p = ArrowParams {
+        affine: image_affine(view, rect, flip_y, ppp),
+        px_per_unit,
+        wrap: false,
+        rect_px: [r.min.x, r.min.y, r.width(), r.height()],
+    };
+    paint_arrows(ui, rect, ARROW_IMAGE_ID, &p);
+    true
+}
+
+/// The reference arrow under the colour bar, when arrows are `drawn`.
+pub fn reference_arrow(v: &VarView, drawn: bool) -> Option<colorbar::ReferenceArrow<'_>> {
+    let (value, len_pt) = v.arrows.as_ref().filter(|_| drawn)?.reference()?;
+    Some(colorbar::ReferenceArrow { value, len_pt, units: attr(v, "units").unwrap_or("") })
 }
 
 /// Allocates the rest of the panel: the plot rect (click and drag) and the

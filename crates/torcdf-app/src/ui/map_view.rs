@@ -10,12 +10,15 @@ use eframe::egui_wgpu::RenderState;
 use torcdf_core::SliceRequest;
 
 use super::colorbar;
-use super::plot_area::{WHEEL_ZOOM, all_missing, draw_range, plot_rects};
-use crate::map::tiles::TileSpec;
+use super::plot_area::{WHEEL_ZOOM, all_missing, draw_range, plot_rects, reference_arrow};
+use crate::map::arrows::{ArrowInput, ArrowSpace, arrow_step};
+use crate::map::tiles::{TileSpec, visible_windows};
+use crate::render::arrows::{ARROW_MAP_ID, ArrowParams, map_affine, paint_arrows};
 use crate::render::gpu_common::camera_uniform;
 use crate::render::lines::{LineParams, paint_lines};
 use crate::render::map_curv::paint_curvilinear;
 use crate::render::map_regular::{MapParams, paint_regular};
+use crate::view::arrow_state::{ArrowKey, IndexWindow, map_lonlat};
 use crate::view::defaults::AxisChoice;
 use crate::view::map_state::{BORDERS_ID, COAST_ID, GRID_ID, UploadFailure};
 use crate::view::var_view::{Display, Hover, VarView};
@@ -109,8 +112,38 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
         && map.detail_due(ui.ctx(), rect)
     {
         map.plan_detail_for(full, rect, ui.ctx().pixels_per_point(), &spec);
+        // Arrows: the step and visible window at rest (plan P4).
+        if let (Some(a), Some(loc)) = (v.arrows.as_mut(), &map.locator)
+            && let Some(vis) = visible_windows(loc, full, &map.camera, rect)
+        {
+            a.rest = Some((arrow_step(vis.cell_pt), IndexWindow::from_visible(&vis)));
+        }
     }
     map.prepare_detail(ui.ctx(), rs, axes, &v.coords, full);
+
+    // Arrows are rebuilt in a job when the tiles on show, the step, the
+    // projection or the resting window change; panning inside the built
+    // window changes only the camera.
+    if let Some(a) = v.arrows.as_mut().filter(|a| a.on) {
+        a.poll_finished();
+        a.upload_ready(rs);
+        if let (Some((k, core)), Some(ov)) = (&a.rest, map.drawable_overview()) {
+            let mut tiles = map.detail_tiles();
+            tiles.push((ov.spec, ov.data.clone()));
+            let space = ArrowSpace::Map(map.camera.proj);
+            let key = ArrowKey::of(&tiles, *k, space);
+            if a.wants(&key, core) {
+                let core = core.clone();
+                match map_lonlat(map.is_curvilinear(), &v.coords, axes, full) {
+                    Some(lonlat) => {
+                        let make = move || ArrowInput { space, tiles, lonlat, cells: Vec::new() };
+                        a.start(ui.ctx(), key, &core, full, make);
+                    }
+                    None => a.give_up(key),
+                }
+            }
+        }
+    }
 
     // Hover: pointer -> lon/lat -> cell -> value. The index shown is the
     // cell the drawn tile actually sampled, so index and value agree.
@@ -147,6 +180,13 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
         }
     }
     let wrap = map.camera.proj.wraps_x();
+    let ppp = ui.ctx().pixels_per_point();
+    let arrows = v.arrows.as_ref().filter(|a| a.on && a.built_space() == Some(ArrowSpace::Map(map.camera.proj)));
+    let px_per_unit = arrows.and_then(|a| a.px_per_unit(ppp));
+    if let Some(px_per_unit) = px_per_unit {
+        let p = ArrowParams { affine: map_affine(&camera), px_per_unit, wrap, rect_px: camera.rect_px };
+        paint_arrows(ui, rect, ARROW_MAP_ID, &p);
+    }
     let line = |colour| LineParams { camera, colour, wrap };
     if map.grid && map.grid_ready() {
         paint_lines(ui, rect, GRID_ID, &line(GRID_COLOUR));
@@ -168,7 +208,8 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
         ui.put(Rect::from_center_size(rect.center(), Vec2::splat(32.0)), egui::Spinner::new());
     }
     if let Some(range) = range {
-        colorbar::show(ui, bar, display.colormap, range, display.log, &colorbar::colorbar_label(&v.var));
+        let arrow = reference_arrow(v, px_per_unit.is_some());
+        colorbar::show(ui, bar, display.colormap, range, display.log, &colorbar::colorbar_label(&v.var), arrow);
     }
 
     match failure {

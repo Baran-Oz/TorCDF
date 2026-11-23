@@ -889,6 +889,13 @@ impl MapState {
             .map(|d| &d.tile)
     }
 
+    /// The drawable detail tiles with their data, finest first.
+    pub fn detail_tiles(&self) -> Vec<(TileSpec, Arc<Slice>)> {
+        let mut tiles: Vec<_> = self.drawable_details().map(|t| (t.spec, t.data.clone())).collect();
+        tiles.sort_by_key(|(s, _)| s.stride[0].saturating_mul(s.stride[1]));
+        tiles
+    }
+
     /// The overview tile, when it can be drawn with the current projection.
     pub fn drawable_overview(&self) -> Option<&Tile> {
         let t = self.overview.as_ref()?;
@@ -948,12 +955,13 @@ fn build_tile(
             let data = match data {
                 std::borrow::Cow::Borrowed(_) => slice.clone(),
                 std::borrow::Cow::Owned(v) => {
-                    Arc::new(Slice {
-                        shape: vec![ny, nx],
-                        valid_count: slice.valid_count,
-                        data: v,
-                        vector: None,
-                    })
+                    // Vector components are turned the same way as the values.
+                    let turn = |d: &[f32]| crate::ui::plot_area::image_data(d, &grid).into_owned();
+                    let vector = slice.vector.as_ref().map(|p| torcdf_core::VectorParts {
+                        east: turn(&p.east),
+                        north: turn(&p.north),
+                    });
+                    Arc::new(Slice { shape: vec![ny, nx], valid_count: slice.valid_count, data: v, vector })
                 }
             };
             Ok(Tile { spec, data, gpu })
@@ -971,6 +979,23 @@ mod tests {
     fn filled(spec: &TileSpec, v: f32) -> Slice {
         let [ny, nx] = spec.shape();
         Slice { shape: vec![ny, nx], data: vec![v; ny * nx], valid_count: ny * nx, vector: None }
+    }
+
+    #[test]
+    fn transposed_tile_keeps_vector_parts() {
+        let rs = crate::render::gpu_common::headless::render_state();
+        // A (lon, lat) variable: x before y, so the tile is turned to [y, x].
+        let axes = AxisChoice { y: 1, x: 0 };
+        let spec = TileSpec { start: [0, 0], count: [2, 3], stride: [1, 1] };
+        let x_major = |o: f32| (0..6).map(|i| i as f32 + o).collect::<Vec<_>>();
+        let parts = torcdf_core::VectorParts { east: x_major(10.0), north: x_major(20.0) };
+        let slice = Arc::new(Slice { shape: vec![3, 2], data: x_major(0.0), valid_count: 6, vector: Some(parts) });
+        let coords = Coords { dims: vec![Some(vec![0.0, 1.0, 2.0]), Some(vec![0.0, 1.0])], ..Default::default() };
+        let t = build_tile(&rs, 99, &slice, spec, axes, &coords, None).ok().expect("tile");
+        assert_eq!(t.data.data, vec![0.0, 2.0, 4.0, 1.0, 3.0, 5.0]);
+        let v = t.data.vector.as_ref().expect("vector parts kept");
+        assert_eq!(v.east, vec![10.0, 12.0, 14.0, 11.0, 13.0, 15.0]);
+        assert_eq!(v.north, vec![20.0, 22.0, 24.0, 21.0, 23.0, 25.0]);
     }
 
     #[test]

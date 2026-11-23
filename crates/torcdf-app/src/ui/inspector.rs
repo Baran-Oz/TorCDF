@@ -8,6 +8,7 @@ use super::{attr_text, dtype_name, fmt_value, slider_label};
 use crate::map::projection::Projection;
 use crate::app::Action;
 use crate::render::colormap::Colormap;
+use crate::view::arrow_state::LENGTH_RANGE;
 use crate::view::defaults::ViewKind;
 use crate::view::var_view::{Display, VarView};
 
@@ -25,7 +26,7 @@ pub fn show(
         if let Some(v) = view.as_deref_mut() {
             map_settings(ui, v);
         }
-        if let Some(v) = view.as_deref() {
+        if let Some(v) = view.as_deref_mut() {
             vector_section(ui, v, actions);
         }
         let view = view.as_deref();
@@ -95,14 +96,21 @@ fn settings(ui: &mut egui::Ui, display: &mut Display, view: Option<&VarView>) {
     }
 }
 
-/// Components of a vector view, what is known about their direction, and
-/// the rotation switch.
-fn vector_section(ui: &mut egui::Ui, v: &VarView, actions: &mut Vec<Action>) {
+/// Components of a vector view, what is known about their direction, the
+/// arrow switches and the rotation switch.
+fn vector_section(ui: &mut egui::Ui, v: &mut VarView, actions: &mut Vec<Action>) {
     let Some(pair) = &v.vector else { return };
     ui.separator();
     ui.heading("Vector");
     let leaf = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
     ui.label(format!("{} + {}", leaf(&pair.east), leaf(&pair.north)));
+    if let Some(a) = &mut v.arrows {
+        ui.checkbox(&mut a.on, "Arrows");
+        ui.add_enabled(
+            a.on,
+            egui::Slider::new(&mut a.length, LENGTH_RANGE).logarithmic(true).text("Arrow length"),
+        );
+    }
     let Some(r) = &v.resolved else {
         ui.weak("Working out the grid...");
         return;
