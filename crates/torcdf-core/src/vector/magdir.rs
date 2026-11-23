@@ -3,7 +3,7 @@
 
 use super::detect::{Coords, attr_str, build, join, mapping_frame, parent, units};
 use super::{Frame, PairForm, VectorPair};
-use crate::{Dataset, VarInfo};
+use crate::{Dataset, Group, VarInfo};
 
 /// Whether the direction is where the vector comes from or goes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,28 +103,39 @@ pub fn en_to_magdir(e: f64, n: f64, c: &DirConvention) -> (f64, f64) {
     (e.hypot(n), dir)
 }
 
+/// Whether `v`'s CF standard name says its direction is where the vector
+/// comes from or goes to (`*_from_direction`, `*_to_direction`,
+/// `direction_of_*`).
+pub(super) fn cf_direction(v: &VarInfo) -> Option<Towards> {
+    let s = attr_str(v, "standard_name")?.to_ascii_lowercase();
+    if s.ends_with("_from_direction") {
+        Some(Towards::From)
+    } else if s.ends_with("_to_direction") || s.starts_with("direction_of_") {
+        Some(Towards::To)
+    } else {
+        None
+    }
+}
+
 /// The convention the file declares for `direction`, with a guess (flagged
 /// in `guessed`) for what it does not say.
 pub fn convention_of(magnitude: &VarInfo, direction: &VarInfo) -> DirConvention {
-    let std_name = attr_str(direction, "standard_name").map(str::to_ascii_lowercase);
-    let declared_towards = std_name.as_deref().and_then(|s| {
-        if s.ends_with("_from_direction") {
-            Some(Towards::From)
-        } else if s.ends_with("_to_direction") || s.starts_with("direction_of_") {
-            Some(Towards::To)
+    let cf = cf_direction(direction);
+    let declared_towards = cf;
+    let text = units(direction).map(str::to_ascii_lowercase).unwrap_or_default();
+    let anti = text.contains("anticlockwise") || text.contains("anti-clockwise");
+    let declared_ref =
+        if text.contains("counterclockwise") || text.contains("counter-clockwise") || text.contains("from east") {
+            Some(AngleRef::CounterClockwiseFromEast)
+        } else if anti {
+            // "anticlockwise from north" cannot be expressed: guess.
+            None
+        } else if (text.contains("clockwise") && text.contains("north")) || cf.is_some() {
+            // CF defines its direction names clockwise from north.
+            Some(AngleRef::ClockwiseFromNorth)
         } else {
             None
-        }
-    });
-    let text = units(direction).map(str::to_ascii_lowercase).unwrap_or_default();
-    let declared_ref = if text.contains("counterclockwise") || text.contains("counter-clockwise") || text.contains("from east")
-    {
-        Some(AngleRef::CounterClockwiseFromEast)
-    } else if text.contains("clockwise") && text.contains("north") {
-        Some(AngleRef::ClockwiseFromNorth)
-    } else {
-        None
-    };
+        };
     let declared_unit = if text.starts_with("rad") {
         Some(AngleUnit::Radians)
     } else if text.starts_with("deg") {
@@ -160,11 +171,26 @@ pub fn convention_of(magnitude: &VarInfo, direction: &VarInfo) -> DirConvention 
     }
 }
 
-fn hand_check<'a>(
-    ds: &'a Dataset,
-    magnitude: &str,
-    direction: &str,
-) -> Result<(&'a VarInfo, &'a VarInfo), String> {
+/// A magnitude/direction pair of `m` and `d` (same group and grid) named
+/// after `stem`.
+pub(super) fn magdir_pair(
+    ds: &Dataset,
+    g: &Group,
+    coords: &Coords,
+    m: &VarInfo,
+    d: &VarInfo,
+    stem: &str,
+) -> VectorPair {
+    let frame = if cf_direction(d).is_some() { Frame::Geographic } else { mapping_frame(ds, g, m, d) };
+    let c = convention_of(m, d);
+    let mut p = build(ds, g, coords, m, d, stem, frame, units(m).map(str::to_string));
+    p.path = join(&g.path, &format!("{}@{}~{}", m.name, d.name, c.tag()));
+    p.name = format!("{stem} ({}, {})", m.name, d.name);
+    p.form = PairForm::MagDir(c);
+    p
+}
+
+fn hand_check<'a>(ds: &'a Dataset, magnitude: &str, direction: &str) -> Result<(&'a VarInfo, &'a VarInfo), String> {
     if magnitude == direction {
         return Err("a variable cannot be paired with itself".into());
     }
@@ -192,16 +218,8 @@ pub fn can_pair_magdir(ds: &Dataset, magnitude: &str, direction: &str) -> bool {
 pub fn pair_magdir_by_hand(ds: &Dataset, magnitude: &str, direction: &str) -> Result<VectorPair, String> {
     let (m, d) = hand_check(ds, magnitude, direction)?;
     let g = ds.group_of(magnitude);
-    let geographic = attr_str(d, "standard_name").map(str::to_ascii_lowercase).is_some_and(|s| {
-        s.ends_with("_from_direction") || s.ends_with("_to_direction") || s.starts_with("direction_of_")
-    });
-    let frame = if geographic { Frame::Geographic } else { mapping_frame(ds, g, m, d) };
-    let c = convention_of(m, d);
-    let mut p = build(ds, g, &Coords::of(ds), m, d, "vector", frame, units(m).map(str::to_string));
-    p.path = join(&g.path, &format!("{}@{}~{}", m.name, d.name, c.tag()));
-    p.name = format!("vector ({}, {})", m.name, d.name);
+    let mut p = magdir_pair(ds, g, &Coords::of(ds), m, d, "vector");
     p.by_hand = true;
-    p.form = PairForm::MagDir(c);
     Ok(p)
 }
 
@@ -209,9 +227,7 @@ pub fn pair_magdir_by_hand(ds: &Dataset, magnitude: &str, direction: &str) -> Re
 mod tests {
     use super::*;
     use crate::fixtures::vectors;
-    use crate::{
-        Attr, AttrValue, DType, Dim, FileFormat, Group, NcFile, RotateChoice, SliceRequest, Storage,
-    };
+    use crate::{Attr, AttrValue, DType, Dim, FileFormat, Group, NcFile, RotateChoice, SliceRequest, Storage};
 
     fn c(t: Towards, r: AngleRef, u: AngleUnit) -> DirConvention {
         DirConvention { towards: t, reference: r, unit: u, guessed: Guessed::default() }
@@ -236,10 +252,7 @@ mod tests {
         assert!(near(magdir_to_en(2.0, 270.0, &c(From, ClockwiseFromNorth, Degrees)), (2.0, 0.0)));
         assert!(near(magdir_to_en(2.0, 90.0, &c(To, CounterClockwiseFromEast, Degrees)), (0.0, 2.0)));
         assert!(near(magdir_to_en(2.0, 0.0, &c(From, CounterClockwiseFromEast, Degrees)), (-2.0, 0.0)));
-        assert!(near(
-            magdir_to_en(2.0, std::f64::consts::FRAC_PI_2, &c(To, ClockwiseFromNorth, Radians)),
-            (2.0, 0.0)
-        ));
+        assert!(near(magdir_to_en(2.0, std::f64::consts::FRAC_PI_2, &c(To, ClockwiseFromNorth, Radians)), (2.0, 0.0)));
         let (m, d) = en_to_magdir(2.0, 0.0, &c(From, ClockwiseFromNorth, Degrees));
         assert!((m - 2.0).abs() < 1e-9 && (d - 270.0).abs() < 1e-9);
         assert!(magdir_to_en(f64::NAN, 10.0, &c(To, ClockwiseFromNorth, Degrees)).0.is_nan());
@@ -249,10 +262,7 @@ mod tests {
     fn convention_from_arome_attrs() {
         let (_d, f) = open(vectors::write_arome_like);
         let k = convention(&f, "/wind_speed", "/wind_direction");
-        assert_eq!(
-            (k.towards, k.reference, k.unit),
-            (Towards::From, AngleRef::ClockwiseFromNorth, AngleUnit::Degrees)
-        );
+        assert_eq!((k.towards, k.reference, k.unit), (Towards::From, AngleRef::ClockwiseFromNorth, AngleUnit::Degrees));
         assert_eq!(k.guessed, Guessed::default());
     }
 
@@ -260,10 +270,7 @@ mod tests {
     fn convention_guessed_when_silent() {
         let (_d, f) = open(vectors::write_silent_magdir);
         let k = convention(&f, "/ws", "/wd");
-        assert_eq!(
-            (k.towards, k.reference, k.unit),
-            (Towards::From, AngleRef::ClockwiseFromNorth, AngleUnit::Degrees)
-        );
+        assert_eq!((k.towards, k.reference, k.unit), (Towards::From, AngleRef::ClockwiseFromNorth, AngleUnit::Degrees));
         assert_eq!(k.guessed, Guessed { towards: true, reference: true, unit: true });
     }
 
@@ -273,7 +280,39 @@ mod tests {
         let k = convention(&f, "/sea_water_speed", "/sea_water_velocity_to_direction");
         assert_eq!(k.towards, Towards::To);
         assert_eq!(k.unit, AngleUnit::Degrees);
-        assert!(!k.guessed.towards && !k.guessed.unit && k.guessed.reference);
+        assert!(!k.guessed.towards && !k.guessed.unit && !k.guessed.reference);
+        assert_eq!(k.reference, AngleRef::ClockwiseFromNorth);
+    }
+
+    #[test]
+    fn cf_direction_name_is_clockwise_from_north_unless_units_say_otherwise() {
+        let (_d, f) = open(vectors::write_current_to);
+        let m = f.meta.var("/sea_water_speed").unwrap();
+        let mut d = f.meta.var("/sea_water_velocity_to_direction").unwrap().clone();
+        d.attrs.retain(|a| a.name != "units");
+        d.attrs
+            .push(Attr { name: "units".into(), value: AttrValue::Text("degrees counterclockwise from east".into()) });
+        let k = convention_of(m, &d);
+        assert_eq!(k.reference, AngleRef::CounterClockwiseFromEast);
+        assert!(!k.guessed.reference);
+    }
+
+    #[test]
+    fn anticlockwise_needs_from_east() {
+        let (_d, f) = open(vectors::write_current_to);
+        let m = f.meta.var("/sea_water_speed").unwrap();
+        let mut d = f.meta.var("/sea_water_velocity_to_direction").unwrap().clone();
+        let mut with = |text: &str| {
+            d.attrs.retain(|a| a.name != "units");
+            d.attrs.push(Attr { name: "units".into(), value: AttrValue::Text(text.into()) });
+            convention_of(m, &d)
+        };
+        let k = with("degrees anticlockwise from east");
+        assert_eq!(k.reference, AngleRef::CounterClockwiseFromEast);
+        assert!(!k.guessed.reference);
+        let k = with("degrees anti-clockwise from north");
+        assert_eq!(k.reference, AngleRef::ClockwiseFromNorth);
+        assert!(k.guessed.reference);
     }
 
     #[test]
@@ -316,22 +355,15 @@ mod tests {
                 groups: vec![],
             },
         };
-        assert_eq!(
-            pair_magdir_by_hand(&ds, "/a", "/b").unwrap_err(),
-            "magnitude and direction need the same grid"
-        );
+        assert_eq!(pair_magdir_by_hand(&ds, "/a", "/b").unwrap_err(), "magnitude and direction need the same grid");
         assert_eq!(pair_magdir_by_hand(&ds, "/a", "/a").unwrap_err(), "a variable cannot be paired with itself");
         assert!(!can_pair_magdir(&ds, "/a", "/b"));
     }
 
     fn arome_plane(f: &NcFile, p: &VectorPair, t: usize) -> crate::Slice {
         let p = f.add_pair(p.clone());
-        let req = SliceRequest {
-            var: p.path.clone(),
-            start: vec![t, 0, 0, 0],
-            count: vec![1, 1, 4, 5],
-            stride: vec![1; 4],
-        };
+        let req =
+            SliceRequest { var: p.path.clone(), start: vec![t, 0, 0, 0], count: vec![1, 1, 4, 5], stride: vec![1; 4] };
         f.read_slice(&req).unwrap()
     }
 

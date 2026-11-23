@@ -4,6 +4,7 @@
 //! component names, units, dimensions, grid mappings, angle variables),
 //! never a list of models. Each variable is in at most one detected pair.
 
+use super::magdir::magdir_pair;
 use super::{AngleSource, Frame, PairForm, RotateChoice, VectorPair};
 use crate::cf::{Geo, detect_geo};
 use crate::{Dataset, Group, VarInfo};
@@ -65,11 +66,8 @@ fn hand_check<'a>(ds: &'a Dataset, a: &str, b: &str) -> Result<(&'a VarInfo, &'a
 }
 
 fn detect_in_group(ds: &Dataset, g: &Group, coords: &Coords, out: &mut Vec<VectorPair>) {
-    let cands: Vec<&VarInfo> = g
-        .vars
-        .iter()
-        .filter(|v| v.dtype.is_numeric() && v.shape.len() >= 2 && !coords.is_coord(v))
-        .collect();
+    let cands: Vec<&VarInfo> =
+        g.vars.iter().filter(|v| v.dtype.is_numeric() && v.shape.len() >= 2 && !coords.is_coord(v)).collect();
     let mut used = vec![false; cands.len()];
     // Rule 1 (standard names) claims its variables before rule 2 (names).
     for rule in [Rule::StandardName, Rule::CommonName] {
@@ -81,12 +79,14 @@ fn detect_in_group(ds: &Dataset, g: &Group, coords: &Coords, out: &mut Vec<Vecto
                 let (e, n) = (cands[i], cands[j]);
                 let matched = match rule {
                     Rule::StandardName => std_match(e, n),
-                    Rule::CommonName => {
-                        name_match(e, n).map(|stem| (mapping_frame(ds, g, e, n), stem))
-                    }
+                    Rule::CommonName => name_match(e, n).map(|stem| (mapping_frame(ds, g, e, n), stem)),
                 };
-                let Some((frame, stem)) = matched else { continue };
-                let Some(units) = joint_units(e, n) else { continue };
+                let Some((frame, stem)) = matched else {
+                    continue;
+                };
+                let Some(units) = joint_units(e, n) else {
+                    continue;
+                };
                 if !shapes_fit(e, n) {
                     continue;
                 }
@@ -96,6 +96,104 @@ fn detect_in_group(ds: &Dataset, g: &Group, coords: &Coords, out: &mut Vec<Vecto
             }
         }
     }
+    // Rule 3 (magnitude/direction) takes what rules 1 and 2 left.
+    for (di, d) in cands.iter().enumerate() {
+        if used[di] {
+            continue;
+        }
+        let Some(dir_stem) = direction_stem(d) else {
+            continue;
+        };
+        for (i, m) in cands.iter().enumerate() {
+            if used[i] || i == di || m.dims != d.dims || m.shape != d.shape {
+                continue;
+            }
+            let Some(mag_stem) = magnitude_stem(m) else {
+                continue;
+            };
+            if direction_stem(m).is_some() || !stem_eq(&mag_stem, &dir_stem) {
+                continue;
+            }
+            let shared = if mag_stem.0 == dir_stem.0 { &dir_stem.0 } else { &dir_stem.1 };
+            let stem = if !shared.is_empty() {
+                shared.clone()
+            } else if [m, d].iter().any(|v| has_std(v, "wind")) {
+                "wind".into()
+            } else {
+                "vector".into()
+            };
+            out.push(magdir_pair(ds, g, coords, m, d, &stem));
+            used[i] = true;
+        }
+    }
+}
+
+fn has_std(v: &VarInfo, word: &str) -> bool {
+    attr_str(v, "standard_name").is_some_and(|s| s.to_ascii_lowercase().contains(word))
+}
+
+/// A comparable stem: the name without its token, and the standard name
+/// without its token (either side may agree).
+type Stem = (String, String);
+
+fn stem_eq(a: &Stem, b: &Stem) -> bool {
+    a.0 == b.0 || (!a.1.is_empty() && a.1 == b.1)
+}
+
+/// `name` without the first matching suffix or prefix token, trimmed of `_`.
+fn strip_token(name: &str, suffixes: &[&str], prefixes: &[&str], whole: &[&str]) -> Option<String> {
+    if whole.contains(&name) {
+        return Some(String::new());
+    }
+    suffixes
+        .iter()
+        .find_map(|t| name.strip_suffix(t))
+        .or_else(|| prefixes.iter().find_map(|t| name.strip_prefix(t)))
+        .map(|s| s.trim_matches('_').to_string())
+}
+
+/// The stem of a direction candidate, or `None` when `v` is not one.
+fn direction_stem(v: &VarInfo) -> Option<Stem> {
+    let name = v.name.to_ascii_lowercase();
+    let std = attr_str(v, "standard_name").map(str::to_ascii_lowercase).unwrap_or_default();
+    let std_stem = ["_from_direction", "_to_direction"]
+        .iter()
+        .find_map(|t| std.strip_suffix(t))
+        .or_else(|| std.strip_prefix("direction_of_"))
+        .map(str::to_string);
+    let by_name = strip_token(
+        &name,
+        &["_direction", "_dir"],
+        &["direction_", "dir_", "wdir_", "wd_"],
+        &["wd", "wdir", "dir", "direction"],
+    )
+    .map(|s| {
+        // `x_from_direction` / `x_to_direction`: the stem is `x`.
+        let s = s.trim_end_matches("_from").trim_end_matches("_to");
+        s.to_string()
+    });
+    if std_stem.is_none() && by_name.is_none() {
+        return None;
+    }
+    Some((by_name.unwrap_or_else(|| name.clone()), std_stem.unwrap_or_default()))
+}
+
+/// The stem of a magnitude candidate, or `None` when `v` is not one.
+fn magnitude_stem(v: &VarInfo) -> Option<Stem> {
+    let name = v.name.to_ascii_lowercase();
+    let std = attr_str(v, "standard_name").map(str::to_ascii_lowercase).unwrap_or_default();
+    if name.contains("gust") || std.contains("gust") {
+        return None;
+    }
+    let std_stem = std.strip_suffix("_speed").map(str::to_string);
+    let by_name =
+        strip_token(&name, &["_speed", "_spd"], &["speed_", "spd_", "wspd_", "ws_"], &["ws", "wspd", "speed"]);
+    const VELOCITY: [&str; 8] = ["m/s", "m s-1", "m s**-1", "km/h", "knots", "kt", "cm/s", "cm s-1"];
+    let by_units = units(v).is_some_and(|u| VELOCITY.contains(&u.to_ascii_lowercase().as_str()));
+    if std_stem.is_none() && by_name.is_none() && !by_units {
+        return None;
+    }
+    Some((by_name.unwrap_or(name), std_stem.unwrap_or_default()))
 }
 
 /// Coordinate variables, which are never components or centre scalars
@@ -132,9 +230,8 @@ impl Coords {
             "degreese",
         ];
         self.0.contains(&v.name)
-            || attr_str(v, "standard_name").is_some_and(|s| {
-                s.eq_ignore_ascii_case("latitude") || s.eq_ignore_ascii_case("longitude")
-            })
+            || attr_str(v, "standard_name")
+                .is_some_and(|s| s.eq_ignore_ascii_case("latitude") || s.eq_ignore_ascii_case("longitude"))
             || units(v).is_some_and(|u| LAT_LON_UNITS.contains(&u.to_ascii_lowercase().as_str()))
     }
 }
@@ -146,12 +243,7 @@ enum Rule {
 }
 
 pub(super) fn attr_str<'a>(v: &'a VarInfo, name: &str) -> Option<&'a str> {
-    v.attrs
-        .iter()
-        .find(|a| a.name == name)
-        .and_then(|a| a.value.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    v.attrs.iter().find(|a| a.name == name).and_then(|a| a.value.as_str()).map(str::trim).filter(|s| !s.is_empty())
 }
 
 pub(super) fn units(v: &VarInfo) -> Option<&str> {
@@ -192,12 +284,8 @@ fn std_match(e: &VarInfo, n: &VarInfo) -> Option<(Frame, String)> {
         ("x", "y") => (Frame::GridRelative, k..=k),
         _ => return None,
     };
-    let rest: Vec<&str> = ta
-        .iter()
-        .enumerate()
-        .filter(|(i, t)| !drop.contains(i) && !t.is_empty())
-        .map(|(_, t)| *t)
-        .collect();
+    let rest: Vec<&str> =
+        ta.iter().enumerate().filter(|(i, t)| !drop.contains(i) && !t.is_empty()).map(|(_, t)| *t).collect();
     Some((frame, stem_or_vector(&rest.join("_"))))
 }
 
@@ -263,9 +351,7 @@ fn find_named<'a>(ds: &'a Dataset, g: &'a Group, name: &str) -> Option<&'a VarIn
 
 /// Axes on which the two components' dims differ (name or length).
 fn staggered_axes(e: &VarInfo, n: &VarInfo) -> Vec<usize> {
-    (0..e.dims.len())
-        .filter(|&k| e.dims[k] != n.dims[k] || e.shape[k] != n.shape[k])
-        .collect()
+    (0..e.dims.len()).filter(|&k| e.dims[k] != n.dims[k] || e.shape[k] != n.shape[k]).collect()
 }
 
 /// Same dims, or staggered: same rank (at least 2) and the same dims except
@@ -276,9 +362,7 @@ fn shapes_fit(e: &VarInfo, n: &VarInfo) -> bool {
     if r < 2 || n.dims.len() != r || e.shape.len() != r || n.shape.len() != r {
         return false;
     }
-    staggered_axes(e, n)
-        .into_iter()
-        .all(|k| k >= r - 2 && e.shape[k].abs_diff(n.shape[k]) <= 1)
+    staggered_axes(e, n).into_iter().all(|k| k >= r - 2 && e.shape[k].abs_diff(n.shape[k]) <= 1)
 }
 
 /// The pair's centre grid, coordinates and angle source. `e` and `n` must
@@ -317,12 +401,8 @@ pub(super) fn build(
         }
     };
     let (centre_lat, centre_lon, horiz) = match geo {
-        Some(Geo::Regular { lat_dim, lon_dim, lat_var, lon_var }) => {
-            (Some(lat_var), Some(lon_var), [lat_dim, lon_dim])
-        }
-        Some(Geo::Curvilinear { y_dim, x_dim, lat_var, lon_var }) => {
-            (Some(lat_var), Some(lon_var), [y_dim, x_dim])
-        }
+        Some(Geo::Regular { lat_dim, lon_dim, lat_var, lon_var }) => (Some(lat_var), Some(lon_var), [lat_dim, lon_dim]),
+        Some(Geo::Curvilinear { y_dim, x_dim, lat_var, lon_var }) => (Some(lat_var), Some(lon_var), [y_dim, x_dim]),
         _ => (None, None, [r - 2, r - 1]),
     };
     let angle = angle_source(ds, g, &centre_dims, horiz);
@@ -597,10 +677,8 @@ mod tests {
         assert_eq!(pairs[0].centre_shape, [11, 20]);
         assert_eq!(pairs[0].centre_lat, None);
         // Staggering only on the last two axes.
-        let ds = ds_with(&[
-            ("u", &[("t", 3), ("y", 10), ("x", 20)], &[]),
-            ("v", &[("t2", 4), ("y", 10), ("x", 20)], &[]),
-        ]);
+        let ds =
+            ds_with(&[("u", &[("t", 3), ("y", 10), ("x", 20)], &[]), ("v", &[("t2", 4), ("y", 10), ("x", 20)], &[])]);
         assert!(detect_pairs(&ds).is_empty());
         // Different rank, and rank below 2, never pair.
         let ds = ds_with(&[("u", &[("y", 10), ("x", 20)], &[]), ("v", &[("t", 1), ("y", 10), ("x", 20)], &[])]);
@@ -706,6 +784,71 @@ mod tests {
     }
 
     #[test]
+    fn arome_detects_one_magdir_pair() {
+        let d = tempfile::tempdir().unwrap();
+        let f = NcFile::open(&vectors::write_arome_like(d.path())).unwrap();
+        let pairs = detect_pairs(&f.meta);
+        assert_eq!(pairs.len(), 1);
+        let p = &pairs[0];
+        assert_eq!(p.path, "/wind_speed@wind_direction~from.cwn.deg");
+        assert_eq!(p.frame, Frame::Geographic);
+        let PairForm::MagDir(c) = p.form else { panic!("not a magdir pair") };
+        assert_eq!(c.guessed, super::super::Guessed::default());
+        assert!(!p.by_hand);
+    }
+
+    #[test]
+    fn silent_ws_wd_pairs_guessed() {
+        let d = tempfile::tempdir().unwrap();
+        let f = NcFile::open(&vectors::write_silent_magdir(d.path())).unwrap();
+        let pairs = detect_pairs(&f.meta);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].path, "/ws@wd~from.cwn.deg");
+        let PairForm::MagDir(c) = pairs[0].form else { panic!("not a magdir pair") };
+        assert_eq!(c.guessed, super::super::Guessed { towards: true, reference: true, unit: true });
+    }
+
+    #[test]
+    fn direction_pairs_each_height() {
+        let ds = ds_with(&[("ws_10m", YX, &[]), ("ws_100m", YX, &[]), ("wd", YX, &[])]);
+        assert!(detect_pairs(&ds).is_empty());
+        let ds = ds_with(&[
+            ("speed_10m", YX, &[]),
+            ("speed_100m", YX, &[]),
+            ("direction_10m", YX, &[]),
+            ("direction_100m", YX, &[]),
+        ]);
+        let paths: Vec<String> = detect_pairs(&ds).into_iter().map(|p| p.path).collect();
+        assert_eq!(paths, ["/speed_10m@direction_10m~from.cwn.deg", "/speed_100m@direction_100m~from.cwn.deg"]);
+    }
+
+    #[test]
+    fn gust_and_wave_height_not_paired() {
+        let ds = ds_with(&[
+            ("gust", YX, &[("standard_name", "wind_speed_of_gust"), ("units", "m/s")]),
+            ("wd", YX, &[("standard_name", "wind_from_direction")]),
+        ]);
+        assert!(detect_pairs(&ds).is_empty());
+        let ds = ds_with(&[
+            ("VHM0", YX, &[("standard_name", "sea_surface_wave_significant_height"), ("units", "m")]),
+            ("VMDR", YX, &[("standard_name", "sea_surface_wave_from_direction")]),
+        ]);
+        assert!(detect_pairs(&ds).is_empty());
+    }
+
+    #[test]
+    fn uv_rules_still_win() {
+        let ds = ds_with(&[
+            ("current_speed", YX, &[]),
+            ("current_dir", YX, &[]),
+            ("uo", YX, &[("units", "m/s")]),
+            ("vo", YX, &[("units", "m/s")]),
+        ]);
+        let paths: Vec<String> = detect_pairs(&ds).into_iter().map(|p| p.path).collect();
+        assert_eq!(paths, ["/uo+vo", "/current_speed@current_dir~to.cwn.deg"]);
+    }
+
+    #[test]
     fn with_rotate_changes_path() {
         let ds = ds_with(&[("u", YX, &[]), ("v", YX, &[])]);
         let p = detect_pairs(&ds).remove(0);
@@ -724,12 +867,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let f = NcFile::open(&vectors::write_roms_like(d.path())).unwrap();
         let read = |v: &str, shape: [usize; 3]| {
-            let r = crate::SliceRequest {
-                var: v.into(),
-                start: vec![0; 3],
-                count: shape.to_vec(),
-                stride: vec![1; 3],
-            };
+            let r = crate::SliceRequest { var: v.into(), start: vec![0; 3], count: shape.to_vec(), stride: vec![1; 3] };
             f.read_slice(&r).unwrap().data
         };
         let (s, c) = 0.5f64.sin_cos();
@@ -743,12 +881,8 @@ mod tests {
         assert!((f64::from(v[2 * 16 + 7]) - want).abs() < 1e-5);
 
         let f = NcFile::open(&vectors::write_nemo_like(d.path())).unwrap();
-        let r = crate::SliceRequest {
-            var: "/uo".into(),
-            start: vec![1, 5, 10],
-            count: vec![1, 1, 1],
-            stride: vec![1; 3],
-        };
+        let r =
+            crate::SliceRequest { var: "/uo".into(), start: vec![1, 5, 10], count: vec![1, 1, 1], stride: vec![1; 3] };
         assert!(f.read_slice(&r).unwrap().data[0].is_nan(), "uo[:,5,10] is fill");
     }
 }
