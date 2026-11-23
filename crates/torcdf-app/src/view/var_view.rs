@@ -388,6 +388,12 @@ impl VarView {
         reqs
     }
 
+    /// The slice on show is the one this view reads at slider positions `pos`.
+    pub fn shows_position(&self, pos: &[usize]) -> bool {
+        pos.len() == self.var.shape.len()
+            && self.shown.as_ref().is_some_and(|s| s.req == self.request_at(pos))
+    }
+
     /// The hyperslab the current view needs at slider positions `pos`.
     fn request_at(&self, pos: &[usize]) -> SliceRequest {
         let v = &self.var;

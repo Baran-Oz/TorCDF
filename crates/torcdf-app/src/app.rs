@@ -191,8 +191,9 @@ pub struct TorApp {
     cache_budget: usize,
     /// Animation of the current view; dropped with the view.
     pub playback: Option<Playback>,
-    /// When a slider last moved, until the next upload (for the step log).
-    slider_changed_at: Option<Instant>,
+    /// When a slider last moved and the positions it moved to, until a
+    /// slice for those positions is uploaded (for the step log).
+    slider_changed_at: Option<(Instant, Vec<usize>)>,
     log: DebugLog,
     first_image_logged: bool,
     ctx: egui::Context,
@@ -382,10 +383,6 @@ impl TorApp {
             return;
         }
         let now = Instant::now();
-        if v.loading() {
-            pb.waiting = true;
-            return;
-        }
         let dim = pb.dim;
         let (len, current) = (v.var.shape[dim], v.slider_pos[dim]);
         let components = if v.vector.is_some() { 3 } else { 1 };
@@ -396,13 +393,21 @@ impl TorApp {
             pos[dim] = i;
             v.requests_at(&pos)
         };
-        let tick = pb.tick(now, current, len, bytes, self.cache_budget, &self.service, &v.nc, &requests);
+        let budget = self.cache_budget;
+        if v.loading() {
+            // The frame on show is still being taken in: read ahead, but hold the step.
+            pb.keep_ahead(now, current, len, bytes, budget, &self.service, &v.nc, &requests);
+            let after = if pb.waiting { WAIT_RECHECK } else { pb.due_in(now) };
+            self.ctx.request_repaint_after(after);
+            return;
+        }
+        let tick = pb.tick(now, current, len, bytes, budget, &self.service, &v.nc, &requests);
         match tick {
             Tick::Show(i) => {
                 v.slider_pos[dim] = i;
                 let ready = pb.take_ready();
                 v.refresh_with(&self.ctx, &self.service, &ready);
-                self.slider_changed_at = Some(now);
+                self.slider_changed_at = Some((now, v.slider_pos.clone()));
             }
             Tick::Stop => pb.stop(),
             Tick::Idle | Tick::Wait => {}
@@ -412,6 +417,19 @@ impl TorApp {
             let after = if pb.waiting { WAIT_RECHECK } else { pb.due_in(Instant::now()) };
             self.ctx.request_repaint_after(after);
         }
+    }
+
+    /// Milliseconds from the last slider change to this upload, once the
+    /// slice on show is the one for the positions moved to (an upload of an
+    /// earlier step, whose read finished late, is not counted).
+    fn step_shown(&mut self, uploaded: bool) -> Option<f64> {
+        let (t, pos) = self.slider_changed_at.as_ref()?;
+        if !uploaded || !self.view.as_ref()?.shows_position(pos) {
+            return None;
+        }
+        let took = ms(*t);
+        self.slider_changed_at = None;
+        Some(took)
     }
 
     /// Shows `pair` again in place of the current view of the same pair
@@ -494,7 +512,7 @@ impl TorApp {
             Action::SliderMoved => {
                 if let Some(v) = &mut self.view {
                     v.refresh(&self.ctx, &self.service);
-                    self.slider_changed_at = Some(Instant::now());
+                    self.slider_changed_at = Some((Instant::now(), v.slider_pos.clone()));
                 }
             }
             Action::SetKind(kind) => {
@@ -580,7 +598,7 @@ impl TorApp {
                 }
                 v.slider_pos[d] = index;
                 v.refresh(&self.ctx, &self.service);
-                self.slider_changed_at = Some(Instant::now());
+                self.slider_changed_at = Some((Instant::now(), v.slider_pos.clone()));
             }
             Action::SavePopupCsv(id) => {
                 let Some(p) = self.popups.list.iter().find(|p| p.id == id) else { return };
@@ -609,7 +627,7 @@ impl TorApp {
                 if !pb.looping && v.slider_pos[d] + 1 >= v.var.shape[d] {
                     v.slider_pos[d] = 0;
                     v.refresh(&self.ctx, &self.service);
-                    self.slider_changed_at = Some(Instant::now());
+                    self.slider_changed_at = Some((Instant::now(), v.slider_pos.clone()));
                 }
                 // Frames keep the colours they start with (unlocking stays possible).
                 if let Some(range) = self.display.effective(v.shown.as_ref().map(|s| &s.stats)) {
@@ -737,8 +755,8 @@ impl eframe::App for TorApp {
             v.start_detail(&self.service);
         }
 
-        if uploaded && let Some(t) = self.slider_changed_at.take() {
-            self.log.log(format_args!("step shown {:.1} ms after slider change", ms(t)));
+        if let Some(took) = self.step_shown(uploaded) {
+            self.log.log(format_args!("step shown {took:.1} ms after slider change"));
         }
         if uploaded && !self.first_image_logged {
             self.first_image_logged = true;
@@ -909,6 +927,33 @@ mod tests {
         app.apply(Action::Play);
         app.apply(Action::Select(Selection::Var(1, "/ocean/vo".into())));
         assert!(app.playback.as_ref().is_none_or(|p| !p.playing));
+    }
+
+    fn wait_shown(app: &mut TorApp, pos: &[usize]) {
+        let t0 = Instant::now();
+        while !app.view.as_ref().unwrap().shows_position(pos) {
+            assert!(t0.elapsed().as_secs() < 20, "the slice for {pos:?} never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.poll();
+        }
+    }
+
+    #[test]
+    fn step_log_times_the_step_moved_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        wait_shown(&mut app, &[0, 0, 0]);
+        // The slider moved to step 1, but the upload is of step 0 (a read
+        // that finished late): not logged, and the change stays pending.
+        app.slider_changed_at = Some((Instant::now(), vec![1, 0, 0]));
+        assert_eq!(app.step_shown(true), None);
+        assert!(app.slider_changed_at.is_some());
+        app.apply(Action::JumpTo { file: 1, dim_name: "time".into(), index: 1 });
+        wait_shown(&mut app, &[1, 0, 0]);
+        assert_eq!(app.step_shown(false), None, "no upload this frame");
+        assert!(app.step_shown(true).is_some(), "step 1 is uploaded");
+        assert!(app.slider_changed_at.is_none());
+        assert_eq!(app.step_shown(true), None, "logged once");
     }
 
     #[test]

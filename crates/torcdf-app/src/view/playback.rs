@@ -179,25 +179,17 @@ impl Playback {
         if !self.playing {
             return Tick::Idle;
         }
-        let next = if current + 1 < len {
-            current + 1
-        } else if self.looping && len > 1 {
-            0
-        } else {
-            if now >= self.next_due {
-                self.stop();
-                return Tick::Stop;
-            }
-            self.ahead.clear();
-            return Tick::Idle;
-        };
-        self.fill(current, len, readahead_len(self.fps, frame_bytes, budget), service, file, requests);
-        for f in &mut self.ahead {
-            f.poll();
-        }
+        let n = readahead_len(self.fps, frame_bytes, budget);
+        let next = self.prepare(current, len, n, service, file, requests);
         if now < self.next_due {
+            // Nothing is due, so nothing is being waited for.
+            self.waiting = false;
             return Tick::Idle;
         }
+        let Some(next) = next else {
+            self.stop();
+            return Tick::Stop;
+        };
         let ready = self.ahead.front().is_some_and(|f| f.index == next && f.ready());
         #[cfg(test)]
         let ready = ready && self.held != Some(next);
@@ -225,6 +217,55 @@ impl Playback {
             self.effective_fps = (n >= 2 && secs > 0.0).then(|| (n - 1) as f32 / secs);
         }
         Tick::Show(frame.index)
+    }
+
+    /// [`Self::tick`] without stepping, for while the view is still taking
+    /// in the frame on show: the read-ahead keeps going, and `waiting` is
+    /// set only when a step is due (and so held back).
+    #[allow(clippy::too_many_arguments)]
+    pub fn keep_ahead(
+        &mut self,
+        now: Instant,
+        current: usize,
+        len: usize,
+        frame_bytes: usize,
+        budget: usize,
+        service: &SliceService,
+        file: &Arc<NcFile>,
+        requests: &dyn Fn(usize) -> Vec<SliceRequest>,
+    ) {
+        if !self.playing {
+            return;
+        }
+        let n = readahead_len(self.fps, frame_bytes, budget);
+        self.prepare(current, len, n, service, file, requests);
+        self.waiting = now >= self.next_due;
+    }
+
+    /// Fills and polls the read-ahead; returns the index to show next, or
+    /// `None` past the end without looping (nothing is read ahead then).
+    fn prepare(
+        &mut self,
+        current: usize,
+        len: usize,
+        n: usize,
+        service: &SliceService,
+        file: &Arc<NcFile>,
+        requests: &dyn Fn(usize) -> Vec<SliceRequest>,
+    ) -> Option<usize> {
+        let next = if current + 1 < len {
+            current + 1
+        } else if self.looping && len > 1 {
+            0
+        } else {
+            self.ahead.clear();
+            return None;
+        };
+        self.fill(current, len, n, service, file, requests);
+        for f in &mut self.ahead {
+            f.poll();
+        }
+        Some(next)
     }
 
     /// Makes `ahead` the frames after `current`, in order, `n` at most
@@ -360,6 +401,35 @@ mod tests {
         let ready = p.take_ready();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, uo(2));
+    }
+
+    #[test]
+    fn waiting_only_when_a_step_is_due() {
+        let (_d, f, svc) = nc4();
+        let reqs = |i: usize| vec![uo(i)];
+        let mut p = Playback::new(0);
+        let t0 = Instant::now();
+        p.start(t0);
+        let due = t0 + Duration::from_secs_f32(1.0 / p.fps);
+        // The view is still taking in its frame, but no step is due yet.
+        p.keep_ahead(t0, 1, 24, FRAME, 1 << 24, &svc, &f, &reqs);
+        assert!(!p.waiting, "nothing is due, so nothing is awaited");
+        assert!(p.ahead_len() > 0, "read-ahead keeps going while held");
+        // A stale `waiting` is cleared by a not-yet-due tick.
+        p.waiting = true;
+        assert_eq!(p.tick(t0, 1, 24, FRAME, 1 << 24, &svc, &f, &reqs), Tick::Idle);
+        assert!(!p.waiting);
+        wait_ready(&mut p, t0, 1, 24, &svc, &f, &reqs, 2);
+        assert!(!p.waiting);
+        // Due while the view is busy: the step is held back, so "loading".
+        p.keep_ahead(due, 1, 24, FRAME, 1 << 24, &svc, &f, &reqs);
+        assert!(p.waiting);
+        // Once the view is free, the held step is shown.
+        assert_eq!(p.tick(due, 1, 24, FRAME, 1 << 24, &svc, &f, &reqs), Tick::Show(2));
+        assert!(!p.waiting);
+        // The next step is not due yet: not waiting.
+        assert_eq!(p.tick(due, 2, 24, FRAME, 1 << 24, &svc, &f, &reqs), Tick::Idle);
+        assert!(!p.waiting);
     }
 
     #[test]
