@@ -833,32 +833,66 @@ mod tests {
     }
 
     #[test]
-    fn strided_vector_equals_subsampled_full() {
+    fn rotate_on_overrides_unknown() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_roms_like(d.path())).unwrap();
-        let full = f.read_slice(&plane(&f, "/u+v", 1)).unwrap();
+        let f = NcFile::open(&vectors::write_noclue(d.path(), false)).unwrap();
+        let on = f.add_pair(f.pair("/u+v").unwrap().with_rotate(RotateChoice::On));
+        assert_eq!(on.path, "/u+v#on");
+        let r = f.resolve_vector(&on).unwrap();
+        assert!(r.rotated);
+        assert!(r.angle.is_some());
+        assert_eq!(r.basis, Basis::Unknown, "the basis is kept for the notes");
+        let all = |var: &str| SliceRequest { var: var.into(), start: vec![0, 0], count: vec![15, 20], stride: vec![1, 1] };
+        let s = f.read_slice(&all(&on.path)).unwrap();
+        let u = f.read_slice(&all("/u")).unwrap().data;
+        let east = &s.vector.as_ref().unwrap().east;
+        // θ = 0.005 rad turns every vector a little: east is no longer raw u.
+        assert!(u.iter().zip(east).any(|(a, b)| (a - b).abs() > 1e-4), "east equals raw u");
+    }
+
+    /// Strided reads of pair `var` (centre plane `ny` × `nx`) at time 1 equal
+    /// the full plane subsampled, for strides (`sty`, `stx`) and `starts`.
+    fn check_strided(f: &NcFile, var: &str, (ny, nx): (usize, usize), (sty, stx): (usize, usize), starts: &[(usize, usize)]) {
+        let full = f.read_slice(&plane(f, var, 1)).unwrap();
         let fv = full.vector.as_ref().unwrap();
-        // Starts chosen so the samples reach the last row (11) and column (15).
-        for (sy, sx) in [(2, 3), (0, 0), (1, 1), (11, 15)] {
+        for &(sy, sx) in starts {
             let r = SliceRequest {
-                var: "/u+v".into(),
+                var: var.into(),
                 start: vec![1, sy, sx],
-                count: vec![1, 12 - sy, 16 - sx],
-                stride: vec![1, 3, 4],
+                count: vec![1, ny - sy, nx - sx],
+                stride: vec![1, sty, stx],
             };
             let s = f.read_slice(&r).unwrap();
-            let (ny, nx) = ((12 - sy).div_ceil(3), (16 - sx).div_ceil(4));
-            assert_eq!(s.shape, vec![1, ny, nx]);
+            let (cy, cx) = ((ny - sy).div_ceil(sty), (nx - sx).div_ceil(stx));
+            assert_eq!(s.shape, vec![1, cy, cx], "{var} start ({sy},{sx})");
             let v = s.vector.as_ref().unwrap();
-            for a in 0..ny {
-                for b in 0..nx {
-                    let (k, kf) = (a * nx + b, (sy + 3 * a) * 16 + sx + 4 * b);
-                    assert!(nan_eq(s.data[k], full.data[kf]), "start ({sy},{sx}) at ({a},{b})");
-                    assert!(nan_eq(v.east[k], fv.east[kf]));
-                    assert!(nan_eq(v.north[k], fv.north[kf]));
+            for a in 0..cy {
+                for b in 0..cx {
+                    let (k, kf) = (a * cx + b, (sy + sty * a) * nx + sx + stx * b);
+                    assert!(nan_eq(s.data[k], full.data[kf]), "{var} start ({sy},{sx}) at ({a},{b})");
+                    assert!(nan_eq(v.east[k], fv.east[kf]), "{var} east ({sy},{sx}) at ({a},{b})");
+                    assert!(nan_eq(v.north[k], fv.north[kf]), "{var} north ({sy},{sx}) at ({a},{b})");
                 }
             }
         }
+    }
+
+    #[test]
+    fn strided_vector_equals_subsampled_full() {
+        let d = tempfile::tempdir().unwrap();
+        // ROMS: both components on the minus side, windows [i−1, i].
+        let f = NcFile::open(&vectors::write_roms_like(d.path())).unwrap();
+        // Starts chosen so the samples reach the last row (11) and column (15).
+        check_strided(&f, "/u+v", (12, 16), (3, 4), &[(2, 3), (0, 0), (1, 1), (11, 15)]);
+        // WRF: both components on the plus side, windows [i, i+1], whose
+        // `count + 1` read ends at the staggered component's last row/column.
+        let f = NcFile::open(&vectors::write_wrf_like(d.path())).unwrap();
+        // 10 × 14: with strides 3 and 4, starts (0, 1), (9, 13) and (3, 5)
+        // reach the last row (9) and column (13); stride 1 reads every cell
+        // and strides (9, 13) jump straight to the last ones.
+        check_strided(&f, "/U+V", (10, 14), (3, 4), &[(0, 1), (1, 3), (9, 13), (0, 0), (3, 5)]);
+        check_strided(&f, "/U+V", (10, 14), (1, 1), &[(0, 0), (2, 2), (9, 13)]);
+        check_strided(&f, "/U+V", (10, 14), (9, 13), &[(0, 0)]);
     }
 
     #[test]
