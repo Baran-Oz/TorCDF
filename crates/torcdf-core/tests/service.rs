@@ -356,6 +356,13 @@ fn dropping_series_handle_stops_reads() {
     assert!(h.finished().is_none());
     drop(h);
     g.release.send(()).unwrap();
+    // The coordinator and its tasks hold the only other clones of `f`: once
+    // they are gone it has exited, stopped by the handle alone.
+    let end = Instant::now() + TIMEOUT;
+    while Arc::strong_count(&f) > 1 {
+        assert!(Instant::now() < end, "the series coordinator did not stop");
+        std::thread::yield_now();
+    }
     assert!(svc.reads_performed() <= 2, "reads: {}", svc.reads_performed());
 
     let (tx, rx) = bounded::<()>(1);
