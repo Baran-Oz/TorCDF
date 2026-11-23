@@ -156,6 +156,8 @@ pub struct VarView {
     pub map: Option<MapState>,
     /// One-line notice in the plot area (e.g. why the map fell back to the image).
     pub notice: Option<String>,
+    /// When the notice goes away by itself (pop-up messages); `None` = stays.
+    pub notice_until: Option<Instant>,
     pub hover: Option<Hover>,
     /// The vector pair shown, when this view is of one.
     pub vector: Option<Arc<VectorPair>>,
@@ -230,6 +232,7 @@ impl VarView {
             image: ImageState::default(),
             map,
             notice,
+            notice_until: None,
             hover: None,
             vector: None,
             resolved: None,
@@ -300,6 +303,7 @@ impl VarView {
             image: ImageState::default(),
             map,
             notice,
+            notice_until: None,
             hover: None,
             vector: Some(pair),
             resolved: None,

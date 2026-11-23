@@ -20,6 +20,9 @@ use crate::render::map_curv::paint_curvilinear;
 use crate::render::map_regular::{MapParams, paint_regular};
 use crate::view::arrow_state::{ArrowKey, IndexWindow, map_lonlat};
 use crate::view::defaults::AxisChoice;
+use crate::app::Action;
+use crate::ui::popup::draw_markers;
+use crate::view::popup::{Popup, PopupSet};
 use crate::view::map_state::{BORDERS_ID, COAST_ID, GRID_ID, UploadFailure};
 use crate::view::var_view::{Display, Hover, VarView};
 
@@ -43,7 +46,14 @@ fn centred_text(ui: &egui::Ui, rect: Rect, text: &str, colour: Color32) {
 }
 
 /// Draws the map of `v`. Returns true when a new data tile was uploaded.
-pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&RenderState>) -> bool {
+pub fn show(
+    ui: &mut egui::Ui,
+    v: &mut VarView,
+    display: &Display,
+    rs: Option<&RenderState>,
+    popups: &PopupSet,
+    actions: &mut Vec<Action>,
+) -> bool {
     // A failed background job shows once here; it is not retried.
     if let Some(m) = &v.map {
         if let Some(p) = &m.tile_problem {
@@ -86,6 +96,15 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
         if factor != 1.0 {
             map.camera.zoom_at(pos, factor as f64, rect);
         }
+    }
+    // A click (no drag) opens a pop-up at the cell under it; off the grid it does nothing.
+    if resp.clicked()
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some((lon, lat)) = map.camera.screen_to_lonlat(pos, rect)
+        && let Some(loc) = &map.locator
+        && let Some((iy, ix)) = loc.nearest(lon, lat)
+    {
+        actions.push(Action::OpenPopup { iy, ix, lonlat: Some((lon, lat)) });
     }
     if resp.double_clicked() {
         map.request_fit();
@@ -199,6 +218,12 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
             paint_lines(ui, rect, COAST_ID, &line(COAST_COLOUR));
         }
     }
+    let marker = |p: &Popup| {
+        let (lon, lat) = p.lonlat?;
+        let w = map.camera.proj.forward(lon, lat)?;
+        Some(map.camera.world_to_screen(w, rect)).filter(|s| rect.contains(*s))
+    };
+    draw_markers(ui.painter(), popups, v.file_id, &v.var.path, &marker);
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
     if v.shown.is_some() && range.is_none() {

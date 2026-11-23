@@ -4,6 +4,7 @@ pub mod colorbar;
 pub mod inspector;
 pub mod map_view;
 pub mod plot_area;
+pub mod popup;
 pub mod tree;
 
 use eframe::egui;

@@ -1,7 +1,5 @@
 //! Pop-ups of a point's time series or vertical profile: the model (what is
 //! plotted, how it fills in) and CSV export. The windows are in `ui`.
-// TODO(task 11): drop this once the pop-up windows use the model.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -258,6 +256,16 @@ impl Popup {
     /// (steps delivered, total steps).
     pub fn progress(&self) -> (usize, usize) {
         self.handle.as_ref().map_or((0, 0), SeriesHandle::progress)
+    }
+
+    /// Name of the dimension plotted along.
+    pub fn along_name(&self) -> &str {
+        &self.along_name
+    }
+
+    /// A vector pair: east and north can be added to the plot.
+    pub fn has_components(&self) -> bool {
+        !self.east_name.is_empty()
     }
 
     /// Switches between series and profile; re-requests along the other dim.

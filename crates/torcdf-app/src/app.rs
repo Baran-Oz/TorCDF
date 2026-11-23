@@ -19,7 +19,14 @@ use torcdf_core::{
 use crate::render::colormap::Colormap;
 use crate::ui::{self, inspector, plot_area, tree};
 use crate::view::defaults::ViewKind;
+use crate::view::popup::{Popup, PopupKind, PopupSet};
 use crate::view::var_view::{Display, ImageState, VarView};
+
+/// A CSV save: `None` when the dialog was cancelled, else the write result.
+type SaveOutcome = Option<Result<(), String>>;
+
+/// How long a pop-up notice stays in the plot area.
+const NOTICE_TIME: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Frames slower than this are logged (UI-thread stalls).
 const SLOW_FRAME_MS: f64 = 20.0;
@@ -132,6 +139,13 @@ pub enum Action {
     Unpair { file: u64, path: String },
     SetRotate(RotateChoice),
     FitView,
+    /// A click on the map or image: pop up the series or profile there.
+    OpenPopup { iy: usize, ix: usize, lonlat: Option<(f64, f64)> },
+    ClosePopup(u64),
+    SetPopupKind(u64, PopupKind),
+    /// A click in a pop-up: move the slider of that dimension (plan P7).
+    JumpTo { file: u64, dim_name: String, index: usize },
+    SavePopupCsv(u64),
     Exit,
 }
 
@@ -148,6 +162,9 @@ pub struct TorApp {
     pub selection: Option<Selection>,
     pub view: Option<VarView>,
     pub display: Display,
+    pub popups: PopupSet,
+    /// Pop-up id and its CSV save: `None` when the dialog was cancelled.
+    saves: Vec<(u64, Job<SaveOutcome>)>,
     service: SliceService,
     log: DebugLog,
     first_image_logged: bool,
@@ -177,6 +194,8 @@ impl TorApp {
                 lock: false,
                 range: (0.0, 1.0),
             },
+            popups: PopupSet::default(),
+            saves: Vec::new(),
             service,
             log: DebugLog::from_env(),
             first_image_logged: false,
@@ -232,6 +251,23 @@ impl TorApp {
             self.dialog = None;
             for p in r.unwrap_or_default() {
                 self.open(p);
+            }
+        }
+        self.popups.poll();
+        let mut i = 0;
+        while i < self.saves.len() {
+            let Some(r) = self.saves[i].1.poll() else {
+                i += 1;
+                continue;
+            };
+            let (id, _) = self.saves.remove(i);
+            let failed = match r {
+                Ok(Some(Err(e))) => Some(e),
+                Err(()) => Some("The CSV could not be saved.".to_string()),
+                _ => None,
+            };
+            if let (Some(e), Some(p)) = (failed, self.popups.list.iter_mut().find(|p| p.id == id)) {
+                p.error = Some(e);
             }
         }
         if let Some(v) = &mut self.view {
@@ -340,6 +376,11 @@ impl TorApp {
                     std::mem::take(&mut self.files).into_iter().partition(|f| f.id == id);
                 self.files = kept;
                 let view = self.view.take_if(|v| v.file_id == id);
+                let gone: Vec<u64> =
+                    self.popups.list.iter().filter(|p| p.file_id == id).map(|p| p.id).collect();
+                for p in gone {
+                    self.popups.close(p);
+                }
                 // The last handle closes the file (I/O, and it may wait for
                 // the netCDF lock), so it is dropped off the UI thread.
                 std::thread::spawn(move || drop((closed, view)));
@@ -420,6 +461,49 @@ impl TorApp {
                     }
                 }
             }
+            Action::OpenPopup { iy, ix, lonlat } => {
+                let Some(v) = &mut self.view else { return };
+                let id = self.popups.next_id();
+                match Popup::open(v, iy, ix, lonlat, id, &self.service) {
+                    Ok(p) => self.popups.place(p),
+                    Err(e) => {
+                        v.notice = Some(e);
+                        v.notice_until = Some(Instant::now() + NOTICE_TIME);
+                    }
+                }
+            }
+            Action::ClosePopup(id) => self.popups.close(id),
+            Action::SetPopupKind(id, kind) => {
+                if let Some(p) = self.popups.list.iter_mut().find(|p| p.id == id) {
+                    p.set_kind(kind, &self.service);
+                }
+            }
+            Action::JumpTo { file, dim_name, index } => {
+                let Some(v) = self.view.as_mut().filter(|v| v.file_id == file) else { return };
+                let Some(d) = v.var.dims.iter().position(|n| *n == dim_name) else { return };
+                if index >= v.var.shape[d] || !v.slider_dims().contains(&d) || v.slider_pos[d] == index {
+                    return;
+                }
+                v.slider_pos[d] = index;
+                v.refresh(&self.ctx, &self.service);
+            }
+            Action::SavePopupCsv(id) => {
+                let Some(p) = self.popups.list.iter().find(|p| p.id == id) else { return };
+                if self.saves.iter().any(|(s, _)| *s == id) {
+                    return;
+                }
+                let (csv, name) = (p.csv(), format!("{}.csv", p.var_name));
+                // The dialog and the write block, so they get their own thread.
+                let job = Job::spawn(&self.ctx, move || {
+                    let path = rfd::FileDialog::new()
+                        .set_title("Save the series as CSV")
+                        .set_file_name(name)
+                        .add_filter("CSV", &["csv"])
+                        .save_file()?;
+                    Some(std::fs::write(&path, csv).map_err(|e| format!("Cannot save {}: {e}", path.display())))
+                });
+                self.saves.push((id, job));
+            }
             Action::Exit => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -488,9 +572,18 @@ impl eframe::App for TorApp {
         }
         let uploaded = egui::CentralPanel::default()
             .show(ui, |ui| {
-                plot_area::show(ui, self.view.as_mut(), &self.display, frame.wgpu_render_state())
+                plot_area::show(
+                    ui,
+                    self.view.as_mut(),
+                    &self.display,
+                    frame.wgpu_render_state(),
+                    &self.popups,
+                    &mut actions,
+                )
             })
             .inner;
+        let current = self.view.as_ref().map(|v| (v.file_id, &v.var.dims[..], &v.slider_pos[..]));
+        ui::popup::show_all(ui.ctx(), &mut self.popups, current, &mut actions);
         ui::drop_overlay(ui.ctx());
         // Detail reads start only after the map has planned them for a resting camera.
         if let Some(v) = &mut self.view {
@@ -565,6 +658,8 @@ impl TorApp {
                 lock: false,
                 range: (0.0, 1.0),
             },
+            popups: PopupSet::default(),
+            saves: Vec::new(),
             service,
             log: DebugLog { tx: None, t0: Instant::now(), select: None },
             first_image_logged: false,
@@ -609,5 +704,53 @@ mod tests {
         assert!(app.view.is_none() && app.selection.is_none());
         app.apply(Action::PairWith { file: 1, east: "/aa".into(), north: "/aa".into() });
         assert_eq!(app.errors.len(), 1);
+    }
+
+    fn uo_app(dir: &Path) -> TorApp {
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir));
+        app.apply(Action::Select(Selection::Var(1, "/ocean/uo".into())));
+        app
+    }
+
+    #[test]
+    fn jump_sets_matching_slider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        let before = app.view.as_ref().unwrap().requested_at;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.apply(Action::JumpTo { file: 2, dim_name: "time".into(), index: 9 });
+        assert_eq!(app.view.as_ref().unwrap().slider_pos[0], 0);
+        app.apply(Action::JumpTo { file: 1, dim_name: "nope".into(), index: 9 });
+        assert_eq!(app.view.as_ref().unwrap().slider_pos[0], 0);
+        assert_eq!(app.view.as_ref().unwrap().requested_at, before);
+        app.apply(Action::JumpTo { file: 1, dim_name: "time".into(), index: 9 });
+        let v = app.view.as_ref().unwrap();
+        assert_eq!(v.slider_pos[0], 9);
+        assert!(v.requested_at > before, "the view was not refreshed");
+        // Past the end: ignored.
+        app.apply(Action::JumpTo { file: 1, dim_name: "time".into(), index: 999 });
+        assert_eq!(app.view.as_ref().unwrap().slider_pos[0], 9);
+    }
+
+    #[test]
+    fn open_popup_action_places() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        app.apply(Action::OpenPopup { iy: 4, ix: 7, lonlat: None });
+        assert_eq!(app.popups.list.len(), 1);
+        let first = app.popups.list[0].id;
+        app.apply(Action::OpenPopup { iy: 5, ix: 6, lonlat: None });
+        assert_eq!(app.popups.list.len(), 1);
+        assert_ne!(app.popups.list[0].id, first);
+        app.popups.list[0].pinned = true;
+        app.apply(Action::OpenPopup { iy: 1, ix: 1, lonlat: None });
+        assert_eq!(app.popups.list.len(), 2);
+        // Off the grid: nothing opens, a notice appears.
+        app.apply(Action::OpenPopup { iy: 99, ix: 99, lonlat: None });
+        assert_eq!(app.popups.list.len(), 2);
+        assert!(app.view.as_ref().unwrap().notice.is_some());
+        let id = app.popups.list[1].id;
+        app.apply(Action::ClosePopup(id));
+        assert_eq!(app.popups.list.len(), 1);
     }
 }

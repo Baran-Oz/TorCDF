@@ -13,6 +13,9 @@ use crate::render::arrows::{ARROW_IMAGE_ID, ArrowParams, image_affine, paint_arr
 use crate::render::image::{self as gpu, ImageParams};
 use crate::view::arrow_state::{ArrowKey, image_input};
 use crate::view::defaults::{AxisChoice, ViewKind};
+use crate::app::Action;
+use crate::ui::popup::draw_markers;
+use crate::view::popup::{Popup, PopupSet};
 use crate::view::var_view::{Display, Hover, Stats, VarView};
 
 /// The image panel's one GPU layer (layers are never freed, so the id is fixed).
@@ -28,6 +31,8 @@ pub fn show(
     view: Option<&mut VarView>,
     display: &Display,
     rs: Option<&RenderState>,
+    popups: &PopupSet,
+    actions: &mut Vec<Action>,
 ) -> bool {
     let Some(v) = view else {
         ui.centered_and_justified(|ui| {
@@ -36,6 +41,15 @@ pub fn show(
         return false;
     };
     header(ui, v);
+    if let Some(t) = v.notice_until {
+        let left = t.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            v.notice = None;
+            v.notice_until = None;
+        } else {
+            ui.ctx().request_repaint_after(left);
+        }
+    }
     if let Some(n) = &v.notice {
         ui.colored_label(ui.visuals().warn_fg_color, n);
     }
@@ -46,8 +60,8 @@ pub fn show(
         ui.colored_label(ui.visuals().warn_fg_color, p);
     }
     match v.kind {
-        ViewKind::Map => map_view::show(ui, v, display, rs),
-        ViewKind::Image => image(ui, v, display, rs),
+        ViewKind::Map => map_view::show(ui, v, display, rs, popups, actions),
+        ViewKind::Image => image(ui, v, display, rs, popups, actions),
         ViewKind::Line => {
             line(ui, v);
             false
@@ -79,7 +93,14 @@ fn header(ui: &mut egui::Ui, v: &VarView) {
     });
 }
 
-fn image(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&RenderState>) -> bool {
+fn image(
+    ui: &mut egui::Ui,
+    v: &mut VarView,
+    display: &Display,
+    rs: Option<&RenderState>,
+    popups: &PopupSet,
+    actions: &mut Vec<Action>,
+) -> bool {
     let Some(axes) = v.axes else {
         ui.weak("This variable has no two dimensions to draw as an image.");
         return false;
@@ -156,6 +177,13 @@ fn image(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&Rend
             }
         }
     }
+    // A click (no drag) opens a pop-up at the cell under it.
+    if resp.clicked()
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some((r, c)) = cell_at(pos, rect, view, flip_y, ny, nx)
+    {
+        actions.push(Action::OpenPopup { iy: y0 + r * sy, ix: x0 + c * sx, lonlat: None });
+    }
     if resp.double_clicked() {
         view = fit(v);
         v.image.fitted_to = rect.size();
@@ -170,6 +198,12 @@ fn image(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&Rend
     let params = ImageParams { range, colormap: display.colormap, log: display.log, view, flip_y };
     gpu::paint(ui, rect, &layer, &params);
     let arrows_drawn = rs.is_some_and(|rs| image_arrows(ui, v, rs, rect, view, flip_y, grid));
+    let marker = |p: &Popup| {
+        let r = cell_index(*p.point.get(axes.y)?, y0, sy, ny)?;
+        let c = cell_index(*p.point.get(axes.x)?, x0, sx, nx)?;
+        Some(cell_centre_screen(r, c, rect, view, flip_y))
+    };
+    draw_markers(&ui.painter().with_clip_rect(rect), popups, v.file_id, &v.var.path, &marker);
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
     let arrow = reference_arrow(v, arrows_drawn);
@@ -421,6 +455,22 @@ pub fn view_point(pos: Pos2, rect: Rect, view: Rect, flip_y: bool) -> Pos2 {
     Pos2::new(x, y)
 }
 
+/// Row or column of full-grid index `i` in a slice starting at `start` with
+/// `stride` and `n` cells, when `i` is one of them.
+fn cell_index(i: usize, start: usize, stride: usize, n: usize) -> Option<usize> {
+    let stride = stride.max(1);
+    let d = i.checked_sub(start)?;
+    (d % stride == 0 && d / stride < n).then_some(d / stride)
+}
+
+/// Screen position of the centre of cell `(row, col)`; the inverse of `view_point`.
+pub fn cell_centre_screen(row: usize, col: usize, rect: Rect, view: Rect, flip_y: bool) -> Pos2 {
+    let (x, y) = (col as f32 + 0.5, row as f32 + 0.5);
+    let u = (x - view.min.x) / view.width();
+    let v = if flip_y { (view.max.y - y) / view.height() } else { (y - view.min.y) / view.height() };
+    rect.min + Vec2::new(u, v) * rect.size()
+}
+
 /// `(row, col)` of the cell under `pos`, if it lies inside the image.
 pub fn cell_at(
     pos: Pos2,
@@ -465,6 +515,19 @@ pub fn pan_view(view: Rect, delta: Vec2, size: Vec2, flip_y: bool) -> Rect {
 mod tests {
     use super::*;
     use eframe::egui::{pos2, vec2};
+
+    #[test]
+    fn marker_position_inverts_cell_at() {
+        let rect = Rect::from_min_size(pos2(10.0, 20.0), vec2(400.0, 300.0));
+        let view = Rect::from_min_max(pos2(2.0, 1.0), pos2(12.0, 8.0));
+        for flip in [false, true] {
+            let p = cell_centre_screen(3, 5, rect, view, flip);
+            assert_eq!(cell_at(p, rect, view, flip, 8, 12), Some((3, 5)));
+        }
+        assert_eq!(cell_index(14, 4, 5, 3), Some(2));
+        assert_eq!(cell_index(15, 4, 5, 3), None);
+        assert_eq!(cell_index(3, 4, 5, 3), None);
+    }
 
     #[test]
     fn grid_squeezes_singleton_dims() {
