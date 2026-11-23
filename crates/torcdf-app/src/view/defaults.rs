@@ -134,6 +134,7 @@ mod tests {
             shape: vec![v.len()],
             data: v.to_vec(),
             valid_count: v.iter().filter(|x| !x.is_nan()).count(),
+            vector: None,
         }
     }
 
@@ -223,7 +224,7 @@ mod tests {
 
     #[test]
     fn auto_range_all_nan_is_none() {
-        let s = Slice { shape: vec![2], data: vec![f32::NAN; 2], valid_count: 0 };
+        let s = Slice { shape: vec![2], data: vec![f32::NAN; 2], valid_count: 0, vector: None };
         assert_eq!(auto_range(&s), None);
     }
 

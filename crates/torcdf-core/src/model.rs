@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("cannot open {}: {msg}", path.display())]
     Open { path: PathBuf, msg: String },

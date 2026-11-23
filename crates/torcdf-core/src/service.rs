@@ -4,7 +4,12 @@
 //! the returned [`RequestHandle`], and polls it with [`RequestHandle::try_take`]
 //! when `on_ready` wakes it. Dropping a handle cancels its job if no worker has
 //! started it yet.
+//!
+//! [`SliceService::request_series`] reads a point series progressively on a
+//! coordinator thread of its own (see [`crate::series`]); it shares the cache,
+//! the read count and `on_ready`.
 
+use crate::series::{self, SeriesHandle, SeriesRequest};
 use crate::{CoreError, NcFile, Slice, SliceRequest};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
 use lru::LruCache;
@@ -32,24 +37,24 @@ pub fn default_cache_budget_bytes() -> usize {
 
 /// (NcFile::open_id, request): the id, not the path, so a file rewritten and
 /// reopened at the same path never hits stale entries.
-type Key = (u64, SliceRequest);
+pub(crate) type Key = (u64, SliceRequest);
 type Outcome = Result<Arc<Slice>, CoreError>;
 
 /// LRU map plus a running byte total.
-struct Cache {
+pub(crate) struct Cache {
     lru: LruCache<Key, Arc<Slice>>,
     bytes: usize,
     budget: usize,
 }
 
 impl Cache {
-    fn get(&mut self, key: &Key) -> Option<Arc<Slice>> {
+    pub(crate) fn get(&mut self, key: &Key) -> Option<Arc<Slice>> {
         self.lru.get(key).cloned()
     }
 
     /// Inserts `slice`, evicting least-recently-used entries until the total
     /// is within budget. A slice larger than the budget is not stored.
-    fn insert(&mut self, key: Key, slice: Arc<Slice>) {
+    pub(crate) fn insert(&mut self, key: Key, slice: Arc<Slice>) {
         let size = slice.byte_size();
         if size > self.budget {
             return;
@@ -74,17 +79,24 @@ struct Job {
     reply: Sender<Outcome>,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     cache: Mutex<Cache>,
-    reads: AtomicUsize,
+    pub(crate) reads: AtomicUsize,
     on_ready: Arc<dyn Fn() + Send + Sync>,
+    /// Set when the service drops: series coordinators stop reading.
+    pub(crate) stopping: AtomicBool,
 }
 
 impl Shared {
     /// A poisoned lock only means another thread panicked; the cache itself
     /// is always left consistent, so keep using it.
-    fn lock(&self) -> MutexGuard<'_, Cache> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Cache> {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Calls `on_ready`. A panicking callback must not kill the caller.
+    pub(crate) fn ready(&self) {
+        let _ = catch_unwind(AssertUnwindSafe(|| (self.on_ready)()));
     }
 }
 
@@ -92,6 +104,8 @@ pub struct SliceService {
     shared: Arc<Shared>,
     jobs: Option<Sender<Job>>,
     workers: Vec<JoinHandle<()>>,
+    /// Series coordinator threads; finished ones are pruned on each request.
+    series: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl SliceService {
@@ -108,6 +122,7 @@ impl SliceService {
             }),
             reads: AtomicUsize::new(0),
             on_ready,
+            stopping: AtomicBool::new(false),
         });
         let (tx, rx) = unbounded::<Job>();
         let workers = (0..workers.max(1))
@@ -119,7 +134,22 @@ impl SliceService {
                     .expect("spawn slice worker")
             })
             .collect();
-        SliceService { shared, jobs: Some(tx), workers }
+        SliceService { shared, jobs: Some(tx), workers, series: Mutex::new(Vec::new()) }
+    }
+
+    /// Starts reading a point series in blocks, the block holding
+    /// `req.centre` first. A cached series (or an invalid request) resolves
+    /// the handle at once; otherwise `on_ready` is called after each block.
+    /// Dropping the handle stops reads that have not started.
+    pub fn request_series(&self, file: &Arc<NcFile>, req: SeriesRequest) -> SeriesHandle {
+        let (handle, thread) = series::start(&self.shared, file, req);
+        if let Some(t) = thread {
+            let mut threads = self.series.lock().unwrap_or_else(|e| e.into_inner());
+            // Dropping a finished thread's handle just detaches it.
+            threads.retain(|t| !t.is_finished());
+            threads.push(t);
+        }
+        handle
     }
 
     /// Queues a read. A cache hit resolves the handle at once, without
@@ -152,6 +182,12 @@ impl SliceService {
 
 impl Drop for SliceService {
     fn drop(&mut self) {
+        // Series stop after their current blocks.
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        let threads = std::mem::take(self.series.get_mut().unwrap_or_else(|e| e.into_inner()));
+        for t in threads {
+            let _ = t.join();
+        }
         // Closing the channel ends each worker's loop once the queue drains
         // (queued jobs are skipped quickly if their handles are gone).
         self.jobs.take();
@@ -190,8 +226,7 @@ fn worker(shared: &Shared, rx: &Receiver<Job>) {
             }
         };
         let _ = job.reply.send(outcome);
-        // A panicking callback must not kill the worker.
-        let _ = catch_unwind(AssertUnwindSafe(|| (shared.on_ready)()));
+        shared.ready();
     }
 }
 

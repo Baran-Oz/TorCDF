@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use torcdf_core::fixtures;
-use torcdf_core::{CoreError, NcFile, RequestHandle, Slice, SliceRequest, SliceService};
+use torcdf_core::{
+    CoreError, NcFile, RequestHandle, SeriesBlock, SeriesHandle, SeriesRequest, Slice, SliceRequest,
+    SliceService, series_blocks,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -241,4 +244,154 @@ fn reopening_a_rewritten_file_does_not_serve_stale_cache() {
     let f = Arc::new(NcFile::open(&path).unwrap());
     let new = wait(&mut svc.request(&f, req.clone())).unwrap();
     assert_eq!(new.data, vec![100.0, 101.0, 102.0, 103.0]);
+}
+/// Polls `h` until it finishes, returning every block in delivery order.
+fn wait_series(h: &mut SeriesHandle) -> (Vec<SeriesBlock>, Result<(), CoreError>) {
+    let end = Instant::now() + TIMEOUT;
+    let mut blocks = Vec::new();
+    loop {
+        // Read `finished` first: blocks delivered before it are then all taken below.
+        let done = h.finished();
+        blocks.extend(h.take_blocks());
+        if let Some(r) = done {
+            return (blocks, r);
+        }
+        assert!(Instant::now() < end, "timed out waiting for series");
+        std::thread::yield_now();
+    }
+}
+
+/// The blocks' values joined in order of `start`.
+fn joined(blocks: &[SeriesBlock]) -> Vec<f32> {
+    let mut sorted: Vec<&SeriesBlock> = blocks.iter().collect();
+    sorted.sort_by_key(|b| b.start);
+    sorted.iter().flat_map(|b| b.values.iter().copied()).collect()
+}
+
+fn same_values(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y || (x.is_nan() && y.is_nan()))
+}
+
+fn uo_series() -> SeriesRequest {
+    SeriesRequest { var: "/ocean/uo".into(), point: vec![0, 4, 7], along: 0, centre: 10 }
+}
+
+#[test]
+fn series_equals_slice_and_comes_centre_first() {
+    let (_d, f) = open_nc4();
+    assert!(f.fast_eligible("/ocean/uo"), "this test covers the parallel path");
+    let svc = SliceService::new(1 << 20, 1, noop());
+    let req = uo_series();
+    let mut h = svc.request_series(&f, req.clone());
+    let (blocks, done) = wait_series(&mut h);
+    done.unwrap();
+    let order: Vec<(usize, usize)> = blocks.iter().map(|b| (b.start, b.values.len())).collect();
+    assert_eq!(order, series_blocks(24, 10, 1));
+    let want = f.read_slice(&req.full_request(24)).unwrap().data;
+    assert!(same_values(&joined(&blocks), &want));
+    assert!(blocks.iter().all(|b| b.vector.is_none()));
+    assert_eq!(h.progress(), (24, 24));
+    assert!(matches!(h.finished(), Some(Ok(()))));
+}
+
+#[test]
+fn series_on_library_path() {
+    let d = tempfile::tempdir().unwrap();
+    let f = Arc::new(NcFile::open(&fixtures::write_classic(d.path())).unwrap());
+    assert!(!f.fast_eligible("/t"));
+    let svc = SliceService::new(1 << 20, 1, noop());
+    // Point (lat 0, lon 0) holds a fill value at time 0.
+    let req = SeriesRequest { var: "/t".into(), point: vec![0, 0, 0], along: 0, centre: 1 };
+    let mut h = svc.request_series(&f, req.clone());
+    let (blocks, done) = wait_series(&mut h);
+    done.unwrap();
+    let order: Vec<(usize, usize)> = blocks.iter().map(|b| (b.start, b.values.len())).collect();
+    assert_eq!(order, series_blocks(3, 1, 256));
+    assert_eq!(order, vec![(0, 3)]);
+    let want = f.read_slice(&req.full_request(3)).unwrap().data;
+    assert!(want[0].is_nan());
+    assert!(same_values(&joined(&blocks), &want));
+    assert_eq!(h.progress(), (3, 3));
+    assert!(matches!(h.finished(), Some(Ok(()))));
+}
+
+#[test]
+fn finished_series_is_cached() {
+    let (_d, f) = open_nc4();
+    let svc = SliceService::new(1 << 20, 1, noop());
+    let req = uo_series();
+    let (first, done) = wait_series(&mut svc.request_series(&f, req.clone()));
+    done.unwrap();
+    assert!(svc.cached(&f, &req.full_request(24)).is_some());
+    let reads = svc.reads_performed();
+    assert_eq!(reads, 24);
+
+    let mut h = svc.request_series(&f, req);
+    // A cache hit resolves at once, as one block.
+    assert!(matches!(h.finished(), Some(Ok(()))));
+    let blocks = h.take_blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].start, 0);
+    assert!(same_values(&blocks[0].values, &joined(&first)));
+    assert_eq!(h.progress(), (24, 24));
+    assert_eq!(svc.reads_performed(), reads);
+}
+
+#[test]
+fn dropping_series_handle_stops_reads() {
+    let d = tempfile::tempdir().unwrap();
+    let f = Arc::new(NcFile::open(&fixtures::write_long_series(d.path())).unwrap());
+    assert!(!f.fast_eligible("/v"));
+    // The coordinator blocks in on_ready after its first block.
+    let g = gate();
+    let svc = SliceService::new(1 << 20, 1, g.on_ready.clone());
+    let req = SeriesRequest { var: "/v".into(), point: vec![0], along: 0, centre: 2048 };
+    let mut h = svc.request_series(&f, req);
+    g.entered.recv_timeout(TIMEOUT).unwrap();
+    let blocks = h.take_blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].start, 2048);
+    assert_eq!(blocks[0].values, (2048..2304u16).map(f32::from).collect::<Vec<_>>());
+    assert_eq!(h.progress(), (256, 4096));
+    assert!(h.finished().is_none());
+    drop(h);
+    g.release.send(()).unwrap();
+    assert!(svc.reads_performed() <= 2, "reads: {}", svc.reads_performed());
+
+    let (tx, rx) = bounded::<()>(1);
+    std::thread::spawn(move || {
+        drop(svc);
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(TIMEOUT).expect("service drop joins the series coordinator");
+}
+
+#[test]
+fn series_error_is_reported() {
+    let (_d, f) = open_nc4();
+    let svc = SliceService::new(1 << 20, 1, noop());
+    let bad = SeriesRequest { point: vec![0, 4], ..uo_series() };
+    let (blocks, done) = wait_series(&mut svc.request_series(&f, bad));
+    assert!(blocks.is_empty());
+    assert!(matches!(done, Err(CoreError::Read { .. })));
+    // The service still works afterwards.
+    wait_series(&mut svc.request_series(&f, uo_series())).1.unwrap();
+}
+
+#[test]
+fn fast_series_blocks_follow_chunks_on_any_axis() {
+    let d = tempfile::tempdir().unwrap();
+    let f = Arc::new(NcFile::open(&fixtures::write_fast_matrix(d.path())).unwrap());
+    assert!(f.fast_eligible("/sd_f32"));
+    let svc = SliceService::new(1 << 20, 1, noop());
+    // Chunks are [2, 5, 6] over (time 7, y 13, x 17): each axis ends in a partial chunk.
+    for (along, len, block, centre) in [(0, 7, 2, 5), (1, 13, 5, 0), (2, 17, 6, 16)] {
+        let req = SeriesRequest { var: "/sd_f32".into(), point: vec![3, 4, 5], along, centre };
+        let (blocks, done) = wait_series(&mut svc.request_series(&f, req.clone()));
+        done.unwrap();
+        let order: Vec<(usize, usize)> = blocks.iter().map(|b| (b.start, b.values.len())).collect();
+        assert_eq!(order, series_blocks(len, centre, block), "along {along}");
+        let want = f.read_slice_via_library(&req.full_request(len)).unwrap().data;
+        assert!(same_values(&joined(&blocks), &want), "along {along}");
+    }
 }

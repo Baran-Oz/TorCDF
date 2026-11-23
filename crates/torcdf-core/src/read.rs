@@ -5,7 +5,7 @@
 //! hyperslabs and thinning along the last dimension here in Rust.
 
 use crate::cf::Unpack;
-use crate::{CoreError, DType, NcFile, VarInfo};
+use crate::{CoreError, DType, NcFile, VarInfo, VectorParts};
 use netcdf::Extent;
 use std::os::raw::c_char;
 
@@ -30,11 +30,15 @@ pub struct Slice {
     pub data: Vec<f32>,
     /// Number of non-NaN values in `data`.
     pub valid_count: usize,
+    /// East/north components, shaped like `data`, when the slice is of a
+    /// vector field.
+    pub vector: Option<VectorParts>,
 }
 
 impl Slice {
     pub fn byte_size(&self) -> usize {
-        self.data.len() * std::mem::size_of::<f32>()
+        let parts = self.vector.as_ref().map_or(0, |v| v.east.len() + v.north.len());
+        (self.data.len() + parts) * std::mem::size_of::<f32>()
     }
 }
 
@@ -71,7 +75,7 @@ impl NcFile {
             self.read_blocks(r, &shape, &unpack, batch, &mut data)?;
         }
         let valid_count = data.iter().filter(|v| !v.is_nan()).count();
-        Ok(Slice { shape, data, valid_count })
+        Ok(Slice { shape, data, valid_count, vector: None })
     }
 
     /// Validates `r` against its variable. Returns the variable, the output

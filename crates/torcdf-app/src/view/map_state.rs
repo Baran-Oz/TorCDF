@@ -938,7 +938,12 @@ fn build_tile(
             let data = match data {
                 std::borrow::Cow::Borrowed(_) => slice.clone(),
                 std::borrow::Cow::Owned(v) => {
-                    Arc::new(Slice { shape: vec![ny, nx], valid_count: slice.valid_count, data: v })
+                    Arc::new(Slice {
+                        shape: vec![ny, nx],
+                        valid_count: slice.valid_count,
+                        data: v,
+                        vector: None,
+                    })
                 }
             };
             Ok(Tile { spec, data, gpu })
@@ -955,7 +960,7 @@ mod tests {
 
     fn filled(spec: &TileSpec, v: f32) -> Slice {
         let [ny, nx] = spec.shape();
-        Slice { shape: vec![ny, nx], data: vec![v; ny * nx], valid_count: ny * nx }
+        Slice { shape: vec![ny, nx], data: vec![v; ny * nx], valid_count: ny * nx, vector: None }
     }
 
     #[test]
@@ -991,7 +996,12 @@ mod tests {
     #[test]
     fn value_at_reads_row_major_texels() {
         let spec = TileSpec { start: [0, 0], count: [2, 3], stride: [1, 1] };
-        let s = Slice { shape: vec![2, 3], data: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], valid_count: 6 };
+        let s = Slice {
+            shape: vec![2, 3],
+            data: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            valid_count: 6,
+            vector: None,
+        };
         assert_eq!(value_at(&[(spec, &s)], 1, 2), Some((5.0, (1, 2))));
         assert_eq!(value_at(&[(spec, &s)], 0, 1), Some((1.0, (0, 1))));
         assert_eq!(value_at(&[], 0, 0), None);
@@ -1150,6 +1160,7 @@ mod tests {
             shape: vec![1, 4],
             data: vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 7.0],
             valid_count: 3,
+            vector: None,
         };
         let tiles = [(spec, &s)];
         assert!(value_at(&tiles, 0, 0).is_some_and(|(v, _)| v.is_nan()));

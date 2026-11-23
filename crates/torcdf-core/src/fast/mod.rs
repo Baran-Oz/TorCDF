@@ -77,6 +77,11 @@ impl NcFile {
         self.fast_var(var_path).is_some()
     }
 
+    /// The HDF5 chunk shape of `var_path` when it is [`fast_eligible`](Self::fast_eligible).
+    pub(crate) fn fast_chunk(&self, var_path: &str) -> Option<Vec<usize>> {
+        self.fast_var(var_path).map(|v| v.h5.chunk.clone())
+    }
+
     /// Reads served by the fast reader so far (diagnostics).
     pub fn fast_reads(&self) -> usize {
         self.fast.reads.load(Ordering::Relaxed)
@@ -195,6 +200,7 @@ impl NcFile {
             shape,
             data,
             valid_count,
+            vector: None,
         })
     }
 }
