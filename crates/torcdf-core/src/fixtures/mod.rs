@@ -391,3 +391,38 @@ fn add_raw_fast_vars(path: &Path, s_i32: &[i32], fl_f32: &[f32]) {
 }
 
 pub mod vectors;
+
+/// netCDF-4 `unsigned.nc` (chunked + deflate, so the fast reader applies):
+/// `ub(y=2, x=3)` i8 `_Unsigned="true"` with `_FillValue` -1; `us` i16
+/// `_Unsigned="true"`, `scale_factor` 0.5, no fill; `plain` i8 with `ub`'s
+/// raw values and no `_Unsigned`.
+pub fn write_unsigned(dir: &Path) -> PathBuf {
+    let path = dir.join("unsigned.nc");
+    let mut f = netcdf::create(&path).unwrap();
+    f.add_dimension("y", 2).unwrap();
+    f.add_dimension("x", 3).unwrap();
+    let ub: [i8; 6] = [0, 1, 127, -128, -2, -1];
+    {
+        let mut v = f.add_variable::<i8>("ub", &["y", "x"]).unwrap();
+        v.set_chunking(&[2, 3]).unwrap();
+        v.set_compression(2, false).unwrap();
+        v.set_fill_value(-1i8).unwrap();
+        v.put_attribute("_Unsigned", "true").unwrap();
+        v.put_values(&ub, (0..2, 0..3)).unwrap();
+    }
+    {
+        let mut v = f.add_variable::<i16>("us", &["y", "x"]).unwrap();
+        v.set_chunking(&[2, 3]).unwrap();
+        v.set_compression(2, false).unwrap();
+        v.put_attribute("_Unsigned", "true").unwrap();
+        v.put_attribute("scale_factor", 0.5f64).unwrap();
+        v.put_values(&[0i16, 1, 32767, -32768, -2, -32767], (0..2, 0..3)).unwrap();
+    }
+    {
+        let mut v = f.add_variable::<i8>("plain", &["y", "x"]).unwrap();
+        v.set_chunking(&[2, 3]).unwrap();
+        v.set_compression(2, false).unwrap();
+        v.put_values(&ub, (0..2, 0..3)).unwrap();
+    }
+    path
+}
