@@ -175,7 +175,12 @@ impl VarView {
             Geo::Curvilinear { y_dim, x_dim, lat_var, lon_var }
                 if var.shape[*y_dim].saturating_mul(var.shape[*x_dim]) <= CURV_MAX_CELLS =>
             {
-                Some((lat_var.clone(), lon_var.clone()))
+                Some(CurvPaths {
+                    lat: lat_var.clone(),
+                    lon: lon_var.clone(),
+                    y_dim: var.dims[*y_dim].clone(),
+                    x_dim: var.dims[*x_dim].clone(),
+                })
             }
             _ => None,
         };
@@ -564,8 +569,16 @@ fn map_notice(why: &str) -> String {
     format!("Shown as an image: this variable cannot be drawn as a map because {why}.")
 }
 
+/// The 2-D latitude/longitude of a curvilinear variable and its (y, x) dims.
+struct CurvPaths {
+    lat: String,
+    lon: String,
+    y_dim: String,
+    x_dim: String,
+}
+
 /// Runs on a helper thread. Coordinates that cannot be read are left out.
-fn load_coords(nc: &NcFile, paths: &[Option<String>], curv: Option<(String, String)>) -> Coords {
+fn load_coords(nc: &NcFile, paths: &[Option<String>], curv: Option<CurvPaths>) -> Coords {
     // A coordinate this long would risk an allocation abort; labels then fall
     // back to indices.
     const MAX_COORD_LEN: usize = 10_000_000;
@@ -573,22 +586,17 @@ fn load_coords(nc: &NcFile, paths: &[Option<String>], curv: Option<(String, Stri
         let len: usize = nc.meta.var(p)?.shape.iter().product();
         if len > MAX_COORD_LEN { None } else { nc.read_coord(p).ok() }
     };
-    // 2-D lat/lon are unpacked, so fill values become NaN.
-    let read_2d = |p: &str| -> Option<Arc<Vec<f64>>> {
-        let shape = &nc.meta.var(p)?.shape;
-        if shape.iter().product::<usize>() > CURV_MAX_CELLS {
+    // 2-D lat/lon are unpacked, so fill values become NaN. Only their (y, x)
+    // plane is read: index 0 of any other dims, such as WRF's `Time`.
+    let read_2d = |p: &str, c: &CurvPaths| -> Option<Arc<Vec<f64>>> {
+        let v = nc.meta.var(p)?;
+        let len = |d: &str| v.dims.iter().position(|x| x == d).map(|i| v.shape[i]);
+        if len(&c.y_dim)?.saturating_mul(len(&c.x_dim)?) > CURV_MAX_CELLS {
             return None;
         }
-        let r = SliceRequest {
-            var: p.to_string(),
-            start: vec![0; shape.len()],
-            count: shape.clone(),
-            stride: vec![1; shape.len()],
-        };
-        let s = nc.read_slice(&r).ok()?;
-        Some(Arc::new(s.data.iter().map(|&v| f64::from(v)).collect()))
+        nc.read_horizontal(p, &c.y_dim, &c.x_dim).ok().map(Arc::new)
     };
     let dims = paths.iter().map(|p| p.as_deref().and_then(read)).collect();
-    let curv = curv.and_then(|(lat, lon)| Some((read_2d(&lat)?, read_2d(&lon)?)));
+    let curv = curv.and_then(|c| Some((read_2d(&c.lat, &c)?, read_2d(&c.lon, &c)?)));
     Coords { dims, curv }
 }

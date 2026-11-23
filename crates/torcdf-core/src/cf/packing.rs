@@ -69,6 +69,15 @@ impl Unpack {
         (raw * self.scale + self.offset) as f32
     }
 
+    /// [`apply`](Self::apply) in full precision: unpacked value, or
+    /// `f64::NAN` if `raw` is missing.
+    pub fn apply_f64(&self, raw: f64) -> f64 {
+        if raw.is_nan() || self.is_missing(raw) {
+            return f64::NAN;
+        }
+        raw * self.scale + self.offset
+    }
+
     fn is_missing(&self, raw: f64) -> bool {
         let eq = |a: f64, b: f64| if self.single { a as f32 == b as f32 } else { a == b };
         self.missing.iter().any(|&m| eq(raw, m))

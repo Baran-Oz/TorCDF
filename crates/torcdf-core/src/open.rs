@@ -18,6 +18,9 @@ pub struct NcFile {
     /// needed), so a second HDF5 open names the same file.
     pub(crate) c_path: PathBuf,
     open_id: u64,
+    /// Vector pairs: detected at open, then added or removed by hand. They
+    /// last for the session only.
+    pub(crate) pairs: std::sync::RwLock<Vec<std::sync::Arc<crate::vector::VectorPair>>>,
 }
 
 /// Source of [`NcFile::open_id`] values.
@@ -50,7 +53,16 @@ impl NcFile {
         }
         let meta = Dataset { path: path.to_path_buf(), file_size, format, root };
         let open_id = NEXT_OPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(NcFile { meta, fast: Default::default(), file, c_path: cpath, open_id })
+        // Metadata only: no variable data is read.
+        let pairs = crate::vector::detect_pairs(&meta).into_iter().map(std::sync::Arc::new).collect();
+        Ok(NcFile {
+            meta,
+            fast: Default::default(),
+            file,
+            c_path: cpath,
+            open_id,
+            pairs: std::sync::RwLock::new(pairs),
+        })
     }
 }
 

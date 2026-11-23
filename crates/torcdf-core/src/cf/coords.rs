@@ -103,8 +103,14 @@ fn classify(c: &VarInfo) -> Option<Kind> {
 }
 
 /// Positions of `c`'s dimensions within `v.dims`; `None` if any is missing.
+///
+/// A coordinate of rank 3 or more (WRF's `XLAT(Time, south_north,
+/// west_east)`) counts as 2-D (decision P6): only its last two dims, its
+/// (y, x) plane, must be in `v.dims`; readers take index 0 of the others
+/// (see [`NcFile::read_horizontal`](crate::NcFile::read_horizontal)).
 fn dim_positions(v: &VarInfo, c: &VarInfo) -> Option<Vec<usize>> {
-    c.dims.iter().map(|d| v.dims.iter().position(|x| x == d)).collect()
+    let plane = if c.dims.len() > 2 { &c.dims[c.dims.len() - 2..] } else { &c.dims[..] };
+    plane.iter().map(|d| v.dims.iter().position(|x| x == d)).collect()
 }
 
 pub fn detect_geo(ds: &Dataset, v: &VarInfo) -> Geo {

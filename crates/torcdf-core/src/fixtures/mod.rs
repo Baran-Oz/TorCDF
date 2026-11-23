@@ -369,3 +369,5 @@ fn add_raw_fast_vars(path: &Path, s_i32: &[i32], fl_f32: &[f32]) {
         ok(nc_close(ncid));
     }
 }
+
+pub mod vectors;

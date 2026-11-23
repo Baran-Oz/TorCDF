@@ -328,3 +328,35 @@ fn milliseconds_unit() {
     }
     assert_eq!(dt("ms since 2000-01-01", None, 1500.0), "2000-01-01 00:00:01.500");
 }
+/// P6: a WRF-style `XLAT(Time, south_north, west_east)` counts as 2-D.
+#[test]
+fn wrf_scalar_maps() {
+    use torcdf_core::SliceRequest;
+    let d = tempfile::tempdir().unwrap();
+    let file = NcFile::open(&fixtures::vectors::write_wrf_like(d.path())).unwrap();
+    let t2 = file.meta.var("/T2").unwrap();
+    match detect_geo(&file.meta, t2) {
+        Geo::Curvilinear { y_dim: 1, x_dim: 2, lat_var, lon_var } => {
+            assert_eq!((lat_var.as_str(), lon_var.as_str()), ("/XLAT", "/XLONG"));
+        }
+        other => panic!("T2 geo {other:?}"),
+    }
+    // The staggered components map through their own 3-D coordinates too.
+    let u = file.meta.var("/U").unwrap();
+    assert!(matches!(detect_geo(&file.meta, u), Geo::Curvilinear { y_dim: 1, x_dim: 2, .. }));
+
+    let plane = file.read_horizontal("/XLAT", "south_north", "west_east").unwrap();
+    assert_eq!(plane.len(), 140);
+    let r = SliceRequest {
+        var: "/XLAT".into(),
+        start: vec![0, 0, 0],
+        count: vec![1, 10, 14],
+        stride: vec![1, 1, 1],
+    };
+    let first = file.read_slice(&r).unwrap().data;
+    for (a, b) in plane.iter().zip(&first) {
+        assert_eq!(*a as f32, *b);
+    }
+    assert!(file.read_horizontal("/XLAT", "south_north", "nope").is_err());
+    assert!(file.read_horizontal("/XLAT", "west_east", "west_east").is_err());
+}

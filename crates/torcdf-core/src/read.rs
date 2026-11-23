@@ -212,6 +212,54 @@ impl NcFile {
         self.read_raw(var_path, &start, &count)
     }
 
+    /// The (y, x) plane of a 2-D lat/lon variable, at index 0 of any other
+    /// dims (decision P6, e.g. WRF's `XLAT(Time, south_north, west_east)`),
+    /// unpacked to f64 (missing = NaN), row-major over (y, x) whatever the
+    /// variable's own dim order.
+    pub fn read_horizontal(
+        &self,
+        var_path: &str,
+        y_dim: &str,
+        x_dim: &str,
+    ) -> Result<Vec<f64>, CoreError> {
+        let err = |msg: String| CoreError::Read { var: var_path.into(), msg };
+        let info = self.numeric_var(var_path)?;
+        let pos = |d: &str| {
+            info.dims
+                .iter()
+                .position(|x| x == d)
+                .ok_or_else(|| err(format!("has no dimension {d}")))
+        };
+        let (py, px) = (pos(y_dim)?, pos(x_dim)?);
+        if py == px {
+            return Err(err("y and x must be different dimensions".into()));
+        }
+        let (ny, nx) = (info.shape[py], info.shape[px]);
+        ny.checked_mul(nx)
+            .filter(|n| n.checked_mul(std::mem::size_of::<f64>()).is_some_and(|b| b <= isize::MAX as usize))
+            .ok_or_else(|| err("plane is too large".into()))?;
+        if info.shape.contains(&0) {
+            return Ok(Vec::new());
+        }
+        let mut count = vec![1; info.shape.len()];
+        count[py] = ny;
+        count[px] = nx;
+        let unpack = Unpack::for_var(info);
+        let raw = self.read_raw(var_path, &vec![0; count.len()], &count)?;
+        // `raw` is row-major in the variable's dim order: (y, x) or (x, y).
+        Ok(if py < px {
+            raw.iter().map(|&v| unpack.apply_f64(v)).collect()
+        } else {
+            let mut out = Vec::with_capacity(ny * nx);
+            for y in 0..ny {
+                for x in 0..nx {
+                    out.push(unpack.apply_f64(raw[x * ny + y]));
+                }
+            }
+            out
+        })
+    }
+
     /// Reads text values of a string (`NC_STRING`) or char (`NC_CHAR`)
     /// variable over the hyperslab `start`/`count` (stride 1).
     ///
@@ -382,6 +430,47 @@ unsafe fn take_nc_strings(raw: &[u8]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::fixtures;
+
+    /// `read_horizontal` takes index 0 of other dims, reorders (x, y)
+    /// storage to row-major (y, x) and unpacks to f64.
+    #[test]
+    fn read_horizontal_plane() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("plane.nc");
+        {
+            let mut f = netcdf::create(&path).unwrap();
+            f.add_dimension("t", 2).unwrap();
+            f.add_dimension("x", 3).unwrap();
+            f.add_dimension("y", 2).unwrap();
+            let mut v = f.add_variable::<i16>("lat", &["t", "x", "y"]).unwrap();
+            v.set_fill_value(-999i16).unwrap();
+            v.put_attribute("scale_factor", 0.5f64).unwrap();
+            v.put_attribute("add_offset", 1.0f64).unwrap();
+            let mut raw = Vec::new();
+            for t in 0..2i16 {
+                for x in 0..3i16 {
+                    for y in 0..2i16 {
+                        raw.push(if (t, x, y) == (0, 1, 0) { -999 } else { t * 100 + x * 10 + y });
+                    }
+                }
+            }
+            v.put_values(&raw, ..).unwrap();
+        }
+        let f = NcFile::open(&path).unwrap();
+        let got = f.read_horizontal("/lat", "y", "x").unwrap();
+        assert_eq!(got.len(), 6);
+        for y in 0..2 {
+            for x in 0..3 {
+                let g = got[y * 3 + x];
+                if (x, y) == (1, 0) {
+                    assert!(g.is_nan());
+                } else {
+                    assert_eq!(g, (x * 10 + y) as f64 * 0.5 + 1.0, "y {y} x {x}");
+                }
+            }
+        }
+        assert!(f.read_horizontal("/nope", "y", "x").is_err());
+    }
 
     /// Tiny batch limits force row splitting and last-dimension segmenting;
     /// results must equal the default path.
