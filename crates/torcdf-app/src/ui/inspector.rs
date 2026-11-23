@@ -2,10 +2,11 @@
 
 use eframe::egui;
 use torcdf_core::cf::Geo;
-use torcdf_core::{Attr, Storage};
+use torcdf_core::{Attr, RotateChoice, Storage};
 
 use super::{attr_text, dtype_name, fmt_value, slider_label};
 use crate::map::projection::Projection;
+use crate::app::Action;
 use crate::render::colormap::Colormap;
 use crate::view::defaults::ViewKind;
 use crate::view::var_view::{Display, VarView};
@@ -16,12 +17,16 @@ pub fn show(
     mut view: Option<&mut VarView>,
     var_selected: bool,
     attrs: Option<(String, &[Attr])>,
+    actions: &mut Vec<Action>,
 ) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.heading("Plot");
         settings(ui, display, view.as_deref());
         if let Some(v) = view.as_deref_mut() {
             map_settings(ui, v);
+        }
+        if let Some(v) = view.as_deref() {
+            vector_section(ui, v, actions);
         }
         let view = view.as_deref();
         ui.separator();
@@ -87,6 +92,27 @@ fn settings(ui: &mut egui::Ui, display: &mut Display, view: Option<&VarView>) {
             }
             Ok(_) => {}
         }
+    }
+}
+
+/// Components of a vector view, what is known about their direction, and
+/// the rotation switch.
+fn vector_section(ui: &mut egui::Ui, v: &VarView, actions: &mut Vec<Action>) {
+    let Some(pair) = &v.vector else { return };
+    ui.separator();
+    ui.heading("Vector");
+    let leaf = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    ui.label(format!("{} + {}", leaf(&pair.east), leaf(&pair.north)));
+    let Some(r) = &v.resolved else {
+        ui.weak("Working out the grid...");
+        return;
+    };
+    for note in &r.notes {
+        ui.add(egui::Label::new(note).wrap());
+    }
+    let mut rotated = r.rotated;
+    if ui.checkbox(&mut rotated, "Rotate to east/north").changed() {
+        actions.push(Action::SetRotate(if rotated { RotateChoice::On } else { RotateChoice::Off }));
     }
 }
 

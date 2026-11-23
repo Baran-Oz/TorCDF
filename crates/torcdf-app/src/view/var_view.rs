@@ -7,7 +7,8 @@ use std::time::Instant;
 use eframe::egui;
 use torcdf_core::cf::{Geo, TimeUnits, detect_axes, detect_geo};
 use torcdf_core::{
-    CoreError, DType, NcFile, RequestHandle, Slice, SliceRequest, SliceService, VarInfo,
+    CoreError, DType, NcFile, RequestHandle, Resolved, Slice, SliceRequest, SliceService, VarInfo,
+    VectorPair,
 };
 
 use crate::app::Job;
@@ -94,6 +95,9 @@ pub struct Coords {
     /// Curvilinear 2-D latitude and longitude, row-major over (y, x),
     /// unpacked (missing values are NaN). Shared with the map's jobs.
     pub curv: Option<CurvLatLon>,
+    /// Vector views: the pair's resolution (or why it failed), set by the
+    /// coordinates job; moved to `VarView::resolved` on arrival.
+    pub(super) vector: Option<Result<Arc<Resolved>, String>>,
 }
 
 /// Image layer and navigation state of the image view.
@@ -152,6 +156,10 @@ pub struct VarView {
     /// One-line notice in the plot area (e.g. why the map fell back to the image).
     pub notice: Option<String>,
     pub hover: Option<Hover>,
+    /// The vector pair shown, when this view is of one.
+    pub vector: Option<Arc<VectorPair>>,
+    /// Its staggering, rotation and centre coordinates, once resolved.
+    pub resolved: Option<Arc<Resolved>>,
 }
 
 impl VarView {
@@ -220,6 +228,77 @@ impl VarView {
             map,
             notice,
             hover: None,
+            vector: None,
+            resolved: None,
+        }
+    }
+
+    /// A view of a vector pair: its magnitude on the centre grid. The pair's
+    /// resolution (which reads coordinates and angles) runs in the coords job.
+    pub(crate) fn new_vector(
+        ctx: &egui::Context,
+        file_id: u64,
+        nc: Arc<NcFile>,
+        pair: Arc<VectorPair>,
+    ) -> VarView {
+        let ds = &nc.meta;
+        let var = pair.var_info();
+        let [hy, hx] = pair.horiz;
+        let regular =
+            pair.centre_lat.as_deref().and_then(|p| ds.var(p)).is_some_and(|v| v.shape.len() == 1);
+        let geo = geo_of_pair(&pair, regular);
+        let time_dim = detect_axes(ds, &var).time;
+        let mut coord_paths = dim_coord_paths(&nc, &var, &Geo::None);
+        coord_paths[hy] = None;
+        coord_paths[hx] = None;
+        let time_units = time_dim
+            .and_then(|d| coord_paths[d].as_deref())
+            .and_then(|p| ds.var(p))
+            .and_then(|c| {
+                let attr = |n: &str| {
+                    c.attrs.iter().find(|a| a.name == n).and_then(|a| a.value.as_str())
+                };
+                TimeUnits::parse(attr("units")?, attr("calendar"))
+            });
+        let mut kind = ViewKind::Map;
+        let mut notice = None;
+        if !regular && var.shape[hy].saturating_mul(var.shape[hx]) > CURV_MAX_CELLS {
+            kind = ViewKind::Image;
+            notice = Some(map_notice(&format!(
+                "its 2-D latitude/longitude has more than {} million cells",
+                CURV_MAX_CELLS / 1_000_000
+            )));
+        }
+        let map = (kind == ViewKind::Map).then(|| MapState::new(&geo));
+        let (job_nc, job_pair) = (nc.clone(), pair.clone());
+        let coords_job =
+            Some(Job::spawn(ctx, move || load_vector_coords(&job_nc, &coord_paths, &job_pair)));
+        VarView {
+            file_id,
+            axes: Some(AxisChoice { y: hy, x: hx }),
+            slider_pos: vec![0; var.shape.len()],
+            nc,
+            var,
+            kind,
+            default_kind: kind,
+            geo,
+            time_dim,
+            time_units,
+            coords: Coords::default(),
+            coords_job,
+            pending: None,
+            requested_at: Instant::now(),
+            stats_job: None,
+            shown: None,
+            text: None,
+            text_job: None,
+            error: None,
+            image: ImageState::default(),
+            map,
+            notice,
+            hover: None,
+            vector: Some(pair),
+            resolved: None,
         }
     }
 
@@ -435,6 +514,7 @@ impl VarView {
         let coords_arrived = if let Some(r) = self.coords_job.as_ref().and_then(Job::poll) {
             self.coords = r.unwrap_or_default();
             self.coords_job = None;
+            let resolve_failed = self.take_resolution();
             // Line x values come from the coordinates.
             if self.kind == ViewKind::Line
                 && let Some(s) = self.shown.take()
@@ -444,6 +524,11 @@ impl VarView {
             // Orientation and aspect may have changed.
             if !self.image.user_moved {
                 self.image.view = None;
+            }
+            // A pair that cannot be resolved is shown as an image, with why.
+            if let Some(e) = resolve_failed {
+                self.fall_back_to_image("");
+                self.notice = Some(e);
             }
             // The map's cell index is built off the UI thread.
             if let Some(m) = &mut self.map
@@ -490,6 +575,25 @@ impl VarView {
             }
         }
         (arrived, coords_arrived)
+    }
+
+    /// Moves a vector view's resolution out of the freshly arrived coords.
+    /// Returns the error to show when the pair could not be resolved. The
+    /// grid kind follows the resolved centre coordinates.
+    fn take_resolution(&mut self) -> Option<String> {
+        let pair = self.vector.as_ref()?;
+        match self.coords.vector.take()? {
+            Ok(r) => {
+                let regular = matches!(self.geo, Geo::Regular { .. });
+                if r.regular != regular && self.map.is_some() {
+                    self.geo = geo_of_pair(pair, r.regular);
+                    self.map = Some(MapState::new(&self.geo));
+                }
+                self.resolved = Some(r);
+                None
+            }
+            Err(e) => Some(e),
+        }
     }
 
     /// Draw row index increasing upwards unless the y coordinate decreases
@@ -564,6 +668,36 @@ fn dim_coord_paths(nc: &NcFile, v: &VarInfo, geo: &Geo) -> Vec<Option<String>> {
         .collect()
 }
 
+/// The grid of a pair's centre over its horizontal dimensions.
+fn geo_of_pair(pair: &VectorPair, regular: bool) -> Geo {
+    let [y, x] = pair.horiz;
+    let lat_var = pair.centre_lat.clone().unwrap_or_default();
+    let lon_var = pair.centre_lon.clone().unwrap_or_default();
+    if regular {
+        Geo::Regular { lat_dim: y, lon_dim: x, lat_var, lon_var }
+    } else {
+        Geo::Curvilinear { y_dim: y, x_dim: x, lat_var, lon_var }
+    }
+}
+
+/// Runs on a helper thread: the non-horizontal coordinates, then the pair's
+/// resolution, whose centre latitude/longitude become the horizontal ones.
+fn load_vector_coords(nc: &NcFile, paths: &[Option<String>], pair: &VectorPair) -> Coords {
+    let mut coords = load_coords(nc, paths, None);
+    let r = nc.resolve_vector(pair).map_err(|e| e.to_string());
+    if let Ok(r) = &r {
+        let [hy, hx] = pair.horiz;
+        if r.regular {
+            coords.dims[hy] = Some((*r.lat).clone());
+            coords.dims[hx] = Some((*r.lon).clone());
+        } else if !r.lat.is_empty() {
+            coords.curv = Some((r.lat.clone(), r.lon.clone()));
+        }
+    }
+    coords.vector = Some(r);
+    coords
+}
+
 /// "Map unavailable" notice for `why` (a clause about the variable).
 fn map_notice(why: &str) -> String {
     format!("Shown as an image: this variable cannot be drawn as a map because {why}.")
@@ -598,5 +732,47 @@ fn load_coords(nc: &NcFile, paths: &[Option<String>], curv: Option<CurvPaths>) -
     };
     let dims = paths.iter().map(|p| p.as_deref().and_then(read)).collect();
     let curv = curv.and_then(|c| Some((read_2d(&c.lat, &c)?, read_2d(&c.lon, &c)?)));
-    Coords { dims, curv }
+    Coords { dims, curv, vector: None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use torcdf_core::{Basis, fixtures};
+
+    fn nemo_view() -> (tempfile::TempDir, VarView) {
+        let d = tempfile::tempdir().unwrap();
+        let nc = Arc::new(NcFile::open(&fixtures::vectors::write_nemo_like(d.path())).unwrap());
+        let pair = nc.pairs().into_iter().next().expect("nemo pair detected");
+        let v = VarView::new_vector(&egui::Context::default(), 1, nc, pair);
+        (d, v)
+    }
+
+    fn poll_coords(v: &mut VarView) {
+        let ctx = egui::Context::default();
+        let t0 = Instant::now();
+        loop {
+            if v.poll(&ctx).1 {
+                return;
+            }
+            assert!(t0.elapsed().as_secs() < 20, "coords job timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn vector_view_is_map() {
+        let (_d, v) = nemo_view();
+        assert_eq!(v.kind, ViewKind::Map);
+        assert_eq!(v.axes, Some(AxisChoice { y: 1, x: 2 }));
+        assert_eq!(v.slider_dims(), vec![0]);
+    }
+
+    #[test]
+    fn vector_view_resolves() {
+        let (_d, mut v) = nemo_view();
+        poll_coords(&mut v);
+        assert_eq!(v.resolved.as_ref().expect("resolved").basis, Basis::Likely);
+        assert_eq!(v.coords.curv.as_ref().expect("curv").0.len(), 600);
+    }
 }

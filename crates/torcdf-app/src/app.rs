@@ -12,7 +12,8 @@ use std::time::Instant;
 
 use eframe::egui;
 use torcdf_core::{
-    Attr, CoreError, DEFAULT_WORKERS, NcFile, SliceService, default_cache_budget_bytes,
+    Attr, CoreError, DEFAULT_WORKERS, NcFile, RotateChoice, SliceService,
+    default_cache_budget_bytes, pair_by_hand,
 };
 
 use crate::render::colormap::Colormap;
@@ -125,6 +126,11 @@ pub enum Action {
     DismissError(usize),
     SliderMoved,
     SetKind(ViewKind),
+    /// Pair `east` and `north` of a file by hand.
+    PairWith { file: u64, east: String, north: String },
+    /// Remove a pair (and its rotation variants) for this session.
+    Unpair { file: u64, path: String },
+    SetRotate(RotateChoice),
     FitView,
     Exit,
 }
@@ -260,24 +266,54 @@ impl TorApp {
             return;
         }
         if let Selection::Var(id, path) = &sel {
-            let var = self.files.iter().find(|f| f.id == *id).and_then(|f| {
-                f.nc.meta.var(path).map(|v| (f.nc.clone(), v.clone()))
-            });
+            let found = self.files.iter().find(|f| f.id == *id);
+            let pair = found.and_then(|f| Some((f.nc.clone(), f.nc.pair(path)?)));
+            let var = found.and_then(|f| f.nc.meta.var(path).map(|v| (f.nc.clone(), v.clone())));
             // Dropping the old view drops its pending request (cancelling it).
             self.view = None;
-            if let Some((nc, var)) = var {
+            if let Some((nc, pair)) = pair {
+                self.log.log(format_args!("select {}", pair.path));
+                let v = VarView::new_vector(&self.ctx, *id, nc, pair);
+                self.show_view(v);
+            } else if let Some((nc, var)) = var {
                 self.log.log(format_args!("select {}", var.path));
-                let mut v = VarView::new(&self.ctx, *id, nc, var);
-                if let (true, Some(m)) = (self.log.enabled(), &mut v.map) {
-                    m.events = Some(Vec::new());
-                }
-                v.refresh(&self.ctx, &self.service);
-                self.view = Some(v);
-                self.display.lock = false;
-                self.first_image_logged = false;
+                let v = VarView::new(&self.ctx, *id, nc, var);
+                self.show_view(v);
             }
         }
         self.selection = Some(sel);
+    }
+
+    /// Reads the first slice of a new view and puts it on show.
+    fn show_view(&mut self, mut v: VarView) {
+        if let (true, Some(m)) = (self.log.enabled(), &mut v.map) {
+            m.events = Some(Vec::new());
+        }
+        v.refresh(&self.ctx, &self.service);
+        self.view = Some(v);
+        self.display.lock = false;
+        self.first_image_logged = false;
+    }
+
+    /// Shows `pair` again in place of the current view of the same pair
+    /// (another rotation choice): slider positions and the map camera stay.
+    fn reselect_pair(&mut self, pair: Arc<torcdf_core::VectorPair>) {
+        let Some(old) = self.view.take() else { return };
+        let mut v = VarView::new_vector(&self.ctx, old.file_id, old.nc.clone(), pair.clone());
+        if v.slider_pos.len() == old.slider_pos.len() {
+            v.slider_pos = old.slider_pos.clone();
+        }
+        v.image.view = old.image.view;
+        v.image.fitted_to = old.image.fitted_to;
+        v.image.user_moved = old.image.user_moved;
+        if let (Some(new), Some(prev)) = (&mut v.map, &old.map) {
+            new.inherit_view(prev);
+        }
+        // The slider range and colours stay as the user left them.
+        let lock = self.display.lock;
+        self.selection = Some(Selection::Var(old.file_id, pair.path.clone()));
+        self.show_view(v);
+        self.display.lock = lock;
     }
 
     fn apply(&mut self, action: Action) {
@@ -336,6 +372,40 @@ impl TorApp {
                         m.reset_tiles();
                     }
                     v.refresh(&self.ctx, &self.service);
+                }
+            }
+            Action::PairWith { file, east, north } => {
+                let Some(f) = self.files.iter().find(|f| f.id == file) else { return };
+                match pair_by_hand(&f.nc.meta, &east, &north) {
+                    Ok(p) => {
+                        let p = f.nc.add_pair(p);
+                        self.select(Selection::Var(file, p.path.clone()));
+                    }
+                    Err(e) => self.errors.push(e),
+                }
+            }
+            Action::Unpair { file, path } => {
+                let Some(f) = self.files.iter().find(|f| f.id == file) else { return };
+                for tag in ["", "#on", "#off"] {
+                    f.nc.remove_pair(&format!("{path}{tag}"));
+                }
+                let shown = matches!(&self.selection, Some(Selection::Var(id, p))
+                    if *id == file && p.strip_prefix(&path).is_some_and(|t| t.is_empty() || t.starts_with('#')));
+                if shown {
+                    self.view = None;
+                    self.selection = None;
+                }
+            }
+            Action::SetRotate(choice) => {
+                let Some(old) = self.view.as_ref().and_then(|v| Some((v.nc.clone(), v.vector.clone()?)))
+                else {
+                    return;
+                };
+                let (nc, pair) = old;
+                let new = pair.with_rotate(choice);
+                if new.path != pair.path {
+                    let new = nc.add_pair(new);
+                    self.reselect_pair(new);
                 }
             }
             Action::FitView => {
@@ -398,10 +468,15 @@ impl eframe::App for TorApp {
         egui::Panel::left("tree").default_size(300.0).show(ui, |ui| {
             tree::show(ui, &self.files, &self.opening, self.selection.as_ref(), &mut actions)
         });
-        let attrs = selected_attrs(&self.files, self.selection.as_ref());
+        // A vector pair is no variable of the file: its attributes come from the view.
+        let pair_attrs = self.view.as_ref().filter(|v| v.vector.is_some()).map(|v| v.var.attrs.clone());
+        let attrs = match (&self.selection, &pair_attrs) {
+            (Some(Selection::Var(_, path)), Some(a)) => Some((path.clone(), &a[..])),
+            _ => selected_attrs(&self.files, self.selection.as_ref()),
+        };
         let var_selected = matches!(self.selection, Some(Selection::Var(..)));
         egui::Panel::right("inspector").default_size(300.0).show(ui, |ui| {
-            inspector::show(ui, &mut self.display, self.view.as_mut(), var_selected, attrs)
+            inspector::show(ui, &mut self.display, self.view.as_mut(), var_selected, attrs, &mut actions)
         });
         if let Some(v) = &mut self.view
             && !v.slider_dims().is_empty()
@@ -458,5 +533,78 @@ impl eframe::App for TorApp {
             });
             self.log.log(format_args!("slow frame: {took:.1} ms ({doing})"));
         }
+    }
+}
+
+#[cfg(test)]
+impl TorApp {
+    /// An app without a window, with `path` already open as file 1 (opened
+    /// on the calling thread). Panics if the file cannot be opened.
+    pub fn headless(path: &Path) -> TorApp {
+        let ctx = egui::Context::default();
+        let service = SliceService::new(
+            default_cache_budget_bytes(),
+            DEFAULT_WORKERS,
+            Arc::new(|| {}),
+        );
+        let nc = NcFile::open(path).expect("fixture opens");
+        TorApp {
+            files: vec![OpenFile { id: 1, name: file_name(path), nc: Arc::new(nc) }],
+            next_id: 2,
+            opening: Vec::new(),
+            dialog: None,
+            errors: Vec::new(),
+            selection: None,
+            view: None,
+            display: Display {
+                colormap: Colormap::Viridis,
+                log: false,
+                lock: false,
+                range: (0.0, 1.0),
+            },
+            service,
+            log: DebugLog { tx: None, t0: Instant::now(), select: None },
+            first_image_logged: false,
+            ctx,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use torcdf_core::fixtures::vectors::write_nemo_like;
+
+    #[test]
+    fn rotate_toggle_reselects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        let pair = app.files[0].nc.pairs().remove(0);
+        app.apply(Action::Select(Selection::Var(1, pair.path.clone())));
+        app.view.as_mut().unwrap().slider_pos[0] = 1;
+        app.apply(Action::SetRotate(RotateChoice::Off));
+        let Some(Selection::Var(_, path)) = &app.selection else { panic!("no selection") };
+        assert!(path.ends_with("#off"), "{path}");
+        let v = app.view.as_ref().expect("view");
+        assert_eq!(v.var.path, *path);
+        assert_eq!(v.slider_pos[0], 1);
+        // The tagged variant is registered; the tree still shows one row.
+        assert!(app.files[0].nc.pair(path).is_some());
+    }
+
+    #[test]
+    fn pair_by_hand_and_unpair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = torcdf_core::fixtures::vectors::write_noclue_renamed(dir.path());
+        let mut app = TorApp::headless(&path);
+        assert!(app.files[0].nc.pairs().is_empty());
+        app.apply(Action::PairWith { file: 1, east: "/aa".into(), north: "/bb".into() });
+        let p = app.files[0].nc.pairs().remove(0);
+        assert_eq!(app.selection, Some(Selection::Var(1, p.path.clone())));
+        app.apply(Action::Unpair { file: 1, path: p.path.clone() });
+        assert!(app.files[0].nc.pairs().is_empty());
+        assert!(app.view.is_none() && app.selection.is_none());
+        app.apply(Action::PairWith { file: 1, east: "/aa".into(), north: "/aa".into() });
+        assert_eq!(app.errors.len(), 1);
     }
 }

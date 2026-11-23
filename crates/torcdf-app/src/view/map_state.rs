@@ -480,6 +480,16 @@ impl MapState {
         }
     }
 
+    /// Takes the camera and overlay switches of `old` (the same place shown
+    /// again), so the view does not jump.
+    pub fn inherit_view(&mut self, old: &MapState) {
+        self.camera = old.camera;
+        self.coast = old.coast;
+        self.borders = old.borders;
+        self.grid = old.grid;
+        self.needs_fit = false;
+    }
+
     /// Re-fit the camera to the data on the next frame.
     pub fn request_fit(&mut self) {
         self.needs_fit = true;
@@ -1185,6 +1195,7 @@ mod tests {
         let coords = Coords {
             dims: Vec::new(),
             curv: Some((Arc::new(vec![0.0; 30]), Arc::new(vec![0.0; 30]))),
+            ..Coords::default()
         };
         let spec = TileSpec::overview(5, 6);
         let proj = m.camera.proj;
@@ -1446,6 +1457,7 @@ mod tests {
         let coords = Coords {
             dims: vec![Some(vec![0.0, 10.0, 5.0]), Some(vec![0.0, 1.0, 2.0, 3.0])],
             curv: None,
+            ..Coords::default()
         };
         m.start_locator(&ctx, &geo, &coords, &[3, 4]).unwrap();
         let mut why = None;
