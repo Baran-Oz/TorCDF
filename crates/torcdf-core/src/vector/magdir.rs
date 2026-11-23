@@ -123,19 +123,21 @@ pub fn convention_of(magnitude: &VarInfo, direction: &VarInfo) -> DirConvention 
     let cf = cf_direction(direction);
     let declared_towards = cf;
     let text = units(direction).map(str::to_ascii_lowercase).unwrap_or_default();
-    let anti = text.contains("anticlockwise") || text.contains("anti-clockwise");
-    let declared_ref =
-        if text.contains("counterclockwise") || text.contains("counter-clockwise") || text.contains("from east") {
-            Some(AngleRef::CounterClockwiseFromEast)
-        } else if anti {
-            // "anticlockwise from north" cannot be expressed: guess.
-            None
-        } else if (text.contains("clockwise") && text.contains("north")) || cf.is_some() {
-            // CF defines its direction names clockwise from north.
-            Some(AngleRef::ClockwiseFromNorth)
-        } else {
-            None
-        };
+    let counter = ["counterclockwise", "counter-clockwise", "anticlockwise", "anti-clockwise"]
+        .iter()
+        .any(|t| text.contains(t));
+    let declared_ref = if counter {
+        // Counter-clockwise reads as from east unless it names north
+        // ("counterclockwise from north" cannot be expressed: guess).
+        (!text.contains("north")).then_some(AngleRef::CounterClockwiseFromEast)
+    } else if text.contains("from east") {
+        Some(AngleRef::CounterClockwiseFromEast)
+    } else if (text.contains("clockwise") && text.contains("north")) || cf.is_some() {
+        // CF defines its direction names clockwise from north.
+        Some(AngleRef::ClockwiseFromNorth)
+    } else {
+        None
+    };
     let declared_unit = if text.starts_with("rad") {
         Some(AngleUnit::Radians)
     } else if text.starts_with("deg") {

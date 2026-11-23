@@ -72,13 +72,17 @@ pub enum PairForm {
 /// A vector variable made of two component variables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorPair {
-    /// `"<group path>/<east name>+<north name>"`, plus `"#on"` / `"#off"`
+    /// `"<group path>/<east name>+<north name>"`, or for a magnitude/direction
+    /// pair `"<group path>/<magnitude name>@<direction name>~<convention>"`
+    /// (`~to.cwn.deg`: from/to, reference, unit), plus `"#on"` / `"#off"`
     /// when `rotate` is not `Auto`.
     pub path: String,
-    /// Display name: `"<stem> (<east name>, <north name>)"`.
+    /// Display name: `"<stem> (<east name>, <north name>)"` (or the
+    /// magnitude and direction names for a magnitude/direction pair).
     pub name: String,
     pub units: Option<String>,
-    /// Component variable paths (x-like, y-like).
+    /// Component variable paths (x-like, y-like); for a magnitude/direction
+    /// pair, the magnitude and direction variable paths.
     pub east: String,
     pub north: String,
     /// Dimensions and shape of the centre grid the pair is read on.

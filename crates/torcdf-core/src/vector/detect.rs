@@ -152,6 +152,12 @@ fn strip_token(name: &str, suffixes: &[&str], prefixes: &[&str], whole: &[&str])
         .map(|s| s.trim_matches('_').to_string())
 }
 
+/// `s` without a trailing `_velocity`: `sea_water_velocity_to_direction`
+/// and `sea_water_speed` share the stem `sea_water`.
+fn velocity_less(s: &str) -> String {
+    s.strip_suffix("_velocity").unwrap_or(s).to_string()
+}
+
 /// The stem of a direction candidate, or `None` when `v` is not one.
 fn direction_stem(v: &VarInfo) -> Option<Stem> {
     let name = v.name.to_ascii_lowercase();
@@ -160,7 +166,7 @@ fn direction_stem(v: &VarInfo) -> Option<Stem> {
         .iter()
         .find_map(|t| std.strip_suffix(t))
         .or_else(|| std.strip_prefix("direction_of_"))
-        .map(str::to_string);
+        .map(velocity_less);
     let by_name = strip_token(
         &name,
         &["_direction", "_dir"],
@@ -169,8 +175,7 @@ fn direction_stem(v: &VarInfo) -> Option<Stem> {
     )
     .map(|s| {
         // `x_from_direction` / `x_to_direction`: the stem is `x`.
-        let s = s.trim_end_matches("_from").trim_end_matches("_to");
-        s.to_string()
+        velocity_less(s.trim_end_matches("_from").trim_end_matches("_to"))
     });
     if std_stem.is_none() && by_name.is_none() {
         return None;
@@ -781,6 +786,17 @@ mod tests {
         f.remove_pair("/aa+bb");
         assert!(f.pair("/aa+bb").is_none());
         assert!(f.pairs().is_empty());
+    }
+
+    #[test]
+    fn current_to_detects_one_pair() {
+        let d = tempfile::tempdir().unwrap();
+        let f = NcFile::open(&vectors::write_current_to(d.path())).unwrap();
+        let pairs = detect_pairs(&f.meta);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert!(pairs[0].path.ends_with("~to.cwn.deg"), "{}", pairs[0].path);
+        let PairForm::MagDir(k) = pairs[0].form else { panic!("not magdir") };
+        assert!(!k.guessed.towards && !k.guessed.reference);
     }
 
     #[test]

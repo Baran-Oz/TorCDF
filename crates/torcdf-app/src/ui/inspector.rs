@@ -5,7 +5,7 @@ use eframe::egui;
 use torcdf_core::cf::Geo;
 use torcdf_core::{
     AngleRef, AngleUnit, Attr, DirConvention, Guessed, PairForm, RotateChoice, Storage, Towards, VectorPair,
-    en_to_magdir,
+    convention_of, en_to_magdir,
 };
 
 use super::{attr_text, dtype_name, fmt_value, slider_label};
@@ -184,7 +184,12 @@ fn arrows_section(
             }
         });
         if let (ArrowMode::MagDir, Some(PairForm::MagDir(c))) = (layer.mode, layer.pair.as_ref().map(|p| p.form)) {
-            convention(ui, c, actions);
+            let pair = layer.pair.as_ref().expect("a magnitude/direction form has a pair");
+            let file = match (v.nc.meta.var(pair.magnitude()), v.nc.meta.var(pair.direction())) {
+                (Some(m), Some(d)) => convention_of(m, d),
+                _ => c,
+            };
+            convention(ui, c, file, actions);
         }
         let problem = layer.problem.as_deref().or(layer.missing_picks().then_some(PICK_TWO));
         if let Some(p) = problem {
@@ -222,15 +227,16 @@ fn leaf(p: &str) -> &str {
 }
 
 /// Direction convention of a magnitude/direction pair: going from / to,
-/// the angle reference and unit, each marked as from the file or guessed.
-/// A change sends the new convention with that setting's guess cleared.
-fn convention(ui: &mut egui::Ui, c: DirConvention, actions: &mut Vec<Action>) {
-    let note = |ui: &mut egui::Ui, guessed: bool| ui.weak(if guessed { "guessed" } else { "from the file" });
+/// the angle reference and unit, each marked as from the file, guessed or
+/// set by you (`file` is what the file itself says). A change sends the new
+/// convention with that setting's guess cleared.
+fn convention(ui: &mut egui::Ui, c: DirConvention, file: DirConvention, actions: &mut Vec<Action>) {
+    let note = |ui: &mut egui::Ui, now_is_file: bool, file_guessed: bool| ui.weak(setting_note(now_is_file, file_guessed));
     let mut new = c;
     ui.horizontal(|ui| {
         ui.radio_value(&mut new.towards, Towards::From, "Coming from");
         ui.radio_value(&mut new.towards, Towards::To, "Going to");
-        note(ui, c.guessed.towards);
+        note(ui, c.towards == file.towards, file.guessed.towards);
     });
     let reference_name = |r: AngleRef| match r {
         AngleRef::ClockwiseFromNorth => "Clockwise from north",
@@ -247,7 +253,7 @@ fn convention(ui: &mut egui::Ui, c: DirConvention, actions: &mut Vec<Action>) {
                 ui.selectable_value(&mut new.reference, r, reference_name(r));
             }
         });
-        note(ui, c.guessed.reference);
+        note(ui, c.reference == file.reference, file.guessed.reference);
         ui.end_row();
         ui.label("Units");
         egui::ComboBox::from_id_salt("arrow units").selected_text(unit_name(c.unit)).show_ui(ui, |ui| {
@@ -255,7 +261,7 @@ fn convention(ui: &mut egui::Ui, c: DirConvention, actions: &mut Vec<Action>) {
                 ui.selectable_value(&mut new.unit, u, unit_name(u));
             }
         });
-        note(ui, c.guessed.unit);
+        note(ui, c.unit == file.unit, file.guessed.unit);
         ui.end_row();
     });
     if new != c {
@@ -266,6 +272,18 @@ fn convention(ui: &mut egui::Ui, c: DirConvention, actions: &mut Vec<Action>) {
             unit: g.unit && new.unit == c.unit,
         };
         actions.push(Action::SetConvention(new));
+    }
+}
+
+/// Where a convention setting comes from: "set by you" when it differs from
+/// what the file says (or a guess of it), else "guessed" or "from the file".
+fn setting_note(now_is_file: bool, file_guessed: bool) -> &'static str {
+    if !now_is_file {
+        "set by you"
+    } else if file_guessed {
+        "guessed"
+    } else {
+        "from the file"
     }
 }
 
@@ -522,6 +540,14 @@ pub fn log_range(range: (f32, f32), min_positive: Option<f32>) -> Result<(f32, f
 mod tests {
     use super::*;
     use torcdf_core::{AngleSource, Frame};
+
+    #[test]
+    fn setting_note_cases() {
+        assert_eq!(setting_note(true, false), "from the file");
+        assert_eq!(setting_note(true, true), "guessed");
+        assert_eq!(setting_note(false, false), "set by you");
+        assert_eq!(setting_note(false, true), "set by you");
+    }
 
     fn pair(form: PairForm) -> VectorPair {
         VectorPair {

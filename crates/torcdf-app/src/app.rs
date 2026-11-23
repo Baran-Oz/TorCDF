@@ -462,7 +462,7 @@ impl TorApp {
             }
             _ => {
                 if let Some(a) = self.view.as_mut().and_then(|v| v.arrows.as_mut()) {
-                    a.on = on;
+                    a.on = on && l.pair.is_some();
                 }
             }
         }
@@ -1394,6 +1394,38 @@ mod tests {
         assert_eq!(v.kind, ViewKind::Image);
     }
 
+    /// On a pair's own entry, switching to a form that has no pair leaves
+    /// no arrows drawn.
+    #[test]
+    fn pair_entry_mode_switch_turns_arrows_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_arome_like(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, AROME_PAIR.into())));
+        let v = app.view.as_ref().expect("view");
+        assert!(v.arrows.as_ref().is_some_and(|a| a.on), "the pair entry draws its arrows");
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        assert_eq!(app.arrow_layer.as_ref().unwrap().problem.as_deref(), Some("Pick two variables"));
+        let v = app.view.as_ref().expect("view");
+        assert!(!v.arrows.as_ref().is_some_and(|a| a.on), "no pair, no arrows");
+    }
+
+    /// A rotation change on a layered view keeps it layered over the new
+    /// (tagged) pair, which the slot now holds.
+    #[test]
+    fn rotate_on_layered_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = arome_layer(dir.path());
+        app.apply(Action::SetRotate(RotateChoice::On));
+        let want = format!("{AROME_PAIR}#on");
+        let slot = app.arrow_layer.as_ref().unwrap();
+        let p = slot.pair.as_ref().expect("paired");
+        assert_eq!((p.path.as_str(), p.rotate), (want.as_str(), RotateChoice::On));
+        let v = app.view.as_ref().unwrap();
+        assert_eq!(v.base.as_deref(), Some("/wind_speed"), "still layered");
+        assert_eq!(v.var.path, format!("/wind_speed|{want}"));
+        assert_eq!(v.vector.as_ref().map(|p| p.path.as_str()), Some(want.as_str()));
+    }
+
     /// Picks refused over one variable pair once a variable they fit is
     /// selected: the stale "do not sit on" message goes.
     #[test]
@@ -1414,8 +1446,9 @@ mod tests {
         assert_eq!(app.selection, Some(Selection::Var(1, "/thetao".into())));
     }
 
-    /// The AROME-like file has no time or vertical axis to pop up along, so
-    /// this uses the NEMO-like `thetao` (with `uo`/`vo` arrows).
+    /// The AROME-like file has a time axis but no vertical one, and its pair
+    /// is magnitude/direction; this test wants plain `uo`/`vo` arrows, so it
+    /// uses the NEMO-like `thetao`.
     #[test]
     fn popup_on_layer_reads_plain_series() {
         let dir = tempfile::tempdir().unwrap();
