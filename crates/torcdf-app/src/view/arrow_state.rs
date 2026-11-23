@@ -9,6 +9,7 @@
 
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
@@ -16,13 +17,15 @@ use torcdf_core::{Slice, VectorParts};
 
 use crate::app::Job;
 use crate::map::arrows::{
-    ARROW_SPACING_PT, ArrowInput, ArrowInstance, ArrowSet, ArrowSpace, LonLatFn, build_arrows, lattice,
+    ARROW_SPACING_PT, ArrowInput, ArrowInstance, ArrowSet, ArrowSpace, LonLatFn, arrow_step, build_arrows,
+    lattice,
 };
 use crate::map::tiles::{TileSpec, VisibleWindows};
 use crate::map::valid_lonlat;
 use crate::render::arrows::{ARROW_IMAGE_ID, ARROW_MAP_ID, upload_arrows};
-use crate::ui::plot_area::{Grid, image_data};
+use crate::ui::plot_area::Grid;
 use crate::view::defaults::AxisChoice;
+use crate::view::map_state::DETAIL_DELAY;
 use crate::view::var_view::Coords;
 
 /// Range of the "Arrow length" slider (a multiplier).
@@ -78,6 +81,7 @@ pub struct IndexWindow {
 
 impl IndexWindow {
     /// The whole `full` grid.
+    #[cfg(test)]
     pub fn whole(full: [usize; 2]) -> IndexWindow {
         IndexWindow { y: (0, full[0].saturating_sub(1)), x: vec![(0, full[1].saturating_sub(1))] }
     }
@@ -122,8 +126,15 @@ pub struct ArrowState {
     pub length: f32,
     /// 95th-percentile magnitude of the arrows on show.
     pub p95: Option<f32>,
-    /// Map only: the lattice step and visible core window at the last rest.
+    /// Map: the lattice step and visible core window at the last rest.
     pub rest: Option<([usize; 2], IndexWindow)>,
+    /// Image view: the same, refreshed by [`image_rest_due`](Self::image_rest_due).
+    pub image_rest: Option<([usize; 2], IndexWindow)>,
+    /// Image view rest timer: (view, panel, grid) last seen, since when,
+    /// and whether `image_rest` was refreshed for it.
+    image_seen: Option<(egui::Rect, egui::Rect, [usize; 2])>,
+    image_seen_at: Instant,
+    image_planned: bool,
     /// One-line message when a build failed (the arrows are hidden).
     pub problem: Option<String>,
     built: Option<(ArrowKey, IndexWindow)>,
@@ -141,6 +152,10 @@ impl Default for ArrowState {
             length: 1.0,
             p95: None,
             rest: None,
+            image_rest: None,
+            image_seen: None,
+            image_seen_at: Instant::now(),
+            image_planned: false,
             problem: None,
             built: None,
             job: None,
@@ -177,6 +192,37 @@ impl ArrowState {
         self.built.as_ref().map(|b| b.0.space)
     }
 
+    /// Arrows are on and the set on show was built for exactly `space`, so
+    /// the affine for `space` places it correctly.
+    pub fn drawable_in(&self, space: ArrowSpace) -> bool {
+        self.on && self.built_space() == Some(space)
+    }
+
+    /// Image view: once `view` (cell units), the panel `rect` and the grid
+    /// `full` have stayed the same for [`DETAIL_DELAY`] (no drag or wheel
+    /// gesture in progress), refreshes `image_rest` from them, once per
+    /// rest. Until then a repaint is scheduled for that moment.
+    pub fn image_rest_due(&mut self, ctx: &egui::Context, view: egui::Rect, rect: egui::Rect, full: [usize; 2]) {
+        let now = (view, rect, full);
+        if self.image_seen != Some(now) {
+            self.image_seen = Some(now);
+            self.image_seen_at = Instant::now();
+            self.image_planned = false;
+        }
+        if self.image_planned {
+            return;
+        }
+        let left = DETAIL_DELAY.saturating_sub(self.image_seen_at.elapsed());
+        if left.is_zero() {
+            self.image_planned = true;
+            if let Some(plan) = image_plan(view, rect, full) {
+                self.image_rest = Some(plan);
+            }
+        } else {
+            ctx.request_repaint_after(left);
+        }
+    }
+
     /// True when `key` over the visible `core` needs a new build: the key
     /// differs from the one built (or building), or `core` leaves its window.
     pub fn wants(&self, key: &ArrowKey, core: &IndexWindow) -> bool {
@@ -191,20 +237,20 @@ impl ArrowState {
     }
 
     /// Starts building `key` over `core` widened by 50% per side (clamped
-    /// to `full`); `make` runs in the job and gives the input (its cells
-    /// are filled in there). A build in flight is superseded.
+    /// to `full`); `make` runs in the job with that window and gives the
+    /// input (its cells are filled in there). A build in flight is superseded.
     pub fn start(
         &mut self,
         ctx: &egui::Context,
         key: ArrowKey,
         core: &IndexWindow,
         full: [usize; 2],
-        make: impl FnOnce() -> ArrowInput + Send + 'static,
+        make: impl FnOnce(&IndexWindow) -> ArrowInput + Send + 'static,
     ) {
         let window = core.widened(full);
-        let (specs, k) = (window.specs(), key.k);
+        let (specs, k, w) = (window.specs(), key.k, window.clone());
         let job = Job::spawn(ctx, move || {
-            let mut input = make();
+            let mut input = make(&w);
             input.cells = lattice(&specs, k).0;
             build_arrows(&input)
         });
@@ -218,7 +264,7 @@ impl ArrowState {
         key: ArrowKey,
         core: &IndexWindow,
         full: [usize; 2],
-        make: impl FnOnce() -> ArrowInput + Send + 'static,
+        make: impl FnOnce(&IndexWindow) -> ArrowInput + Send + 'static,
     ) -> bool {
         let want = self.wants(&key, core);
         if want {
@@ -279,22 +325,56 @@ pub fn map_lonlat(curvilinear: bool, coords: &Coords, axes: AxisChoice, full: [u
     Some(Arc::new(move |iy, ix| Some((*lon.get(ix)?, *lat.get(iy)?))))
 }
 
-/// Image view input: the shown slice as one `[ny, nx]` tile (transposed
-/// when the variable is x-before-y). Runs in the job.
-pub fn image_input(slice: Arc<Slice>, grid: Grid, space: ArrowSpace) -> ArrowInput {
-    let spec = TileSpec { start: [0, 0], count: [grid.ny, grid.nx], stride: [1, 1] };
-    let slice = if grid.transposed {
-        let t = |d: &[f32]| image_data(d, &grid).into_owned();
-        Arc::new(Slice {
-            shape: vec![grid.ny, grid.nx],
-            data: t(&slice.data),
-            valid_count: slice.valid_count,
-            vector: slice.vector.as_ref().map(|p| VectorParts { east: t(&p.east), north: t(&p.north) }),
-        })
-    } else {
-        slice
+/// Image view: the lattice step for the cell size on screen and the cells
+/// `view` (cell units) shows in `rect`, clamped to the `full` grid. `None`
+/// when no cell is on show.
+pub fn image_plan(view: egui::Rect, rect: egui::Rect, full: [usize; 2]) -> Option<([usize; 2], IndexWindow)> {
+    let span = |lo: f32, hi: f32, n: usize| -> Option<(usize, usize)> {
+        if n == 0 || !(lo.is_finite() && hi.is_finite()) {
+            return None;
+        }
+        let (a, b) = (lo.floor().max(0.0), (hi.ceil() - 1.0).min(n as f32 - 1.0));
+        (a <= b).then_some((a as usize, b as usize))
     };
-    ArrowInput { space, tiles: vec![(spec, slice)], lonlat: Arc::new(|_, _| None), cells: Vec::new() }
+    let core = IndexWindow {
+        y: span(view.min.y, view.max.y, full[0])?,
+        x: vec![span(view.min.x, view.max.x, full[1])?],
+    };
+    let cell_pt = [rect.height() / view.height(), rect.width() / view.width()].map(f64::from);
+    Some((arrow_step(cell_pt), core))
+}
+
+/// Image view input over `window` (image rows and columns). A plain slice
+/// is used as it is (one `[ny, nx]` tile); an x-before-y one has only the
+/// window's cells turned to `[y, x]`. Runs in the job.
+pub fn image_input(slice: Arc<Slice>, grid: Grid, space: ArrowSpace, window: &IndexWindow) -> ArrowInput {
+    let whole = TileSpec { start: [0, 0], count: [grid.ny, grid.nx], stride: [1, 1] };
+    let mut tiles = Vec::new();
+    if !grid.transposed {
+        tiles.push((whole, slice));
+    } else {
+        let x0 = window.x.iter().map(|w| w.0).min().unwrap_or(0);
+        let x1 = window.x.iter().map(|w| w.1).max().unwrap_or(0).min(grid.nx.saturating_sub(1));
+        let (y0, y1) = (window.y.0, window.y.1.min(grid.ny.saturating_sub(1)));
+        if y0 <= y1 && x0 <= x1 {
+            // `d` is nx rows (x outer) of ny values.
+            let pick = |d: &[f32]| -> Vec<f32> {
+                (y0..=y1)
+                    .flat_map(|r| (x0..=x1).map(move |c| d.get(c * grid.ny + r).copied().unwrap_or(f32::NAN)))
+                    .collect()
+            };
+            let data = pick(&slice.data);
+            let part = Slice {
+                shape: vec![y1 - y0 + 1, x1 - x0 + 1],
+                valid_count: data.iter().filter(|v| !v.is_nan()).count(),
+                data,
+                vector: slice.vector.as_ref().map(|p| VectorParts { east: pick(&p.east), north: pick(&p.north) }),
+            };
+            let spec = TileSpec { start: [y0, x0], count: [y1 - y0 + 1, x1 - x0 + 1], stride: [1, 1] };
+            tiles.push((spec, Arc::new(part)));
+        }
+    }
+    ArrowInput { space, tiles, lonlat: Arc::new(|_, _| None), cells: Vec::new() }
 }
 
 #[cfg(test)]
@@ -326,7 +406,7 @@ mod tests {
         assert_eq!(s.reference(), None);
     }
 
-    fn input() -> ArrowInput {
+    fn input(_: &IndexWindow) -> ArrowInput {
         // The whole 1000 x 1000 grid, every 100th cell.
         let spec = TileSpec { start: [0, 0], count: [1000, 1000], stride: [100, 100] };
         let slice = Slice {
@@ -380,6 +460,82 @@ mod tests {
         }
         assert_eq!(s.p95, Some(1.0));
         assert!(!s.update(&ctx, key(8), &far, full, input), "built key: nothing to do");
+        // Only a set built for exactly this space may be drawn.
+        let built = ArrowSpace::Map(Projection::Equirectangular);
+        assert!(s.drawable_in(built));
+        assert!(!s.drawable_in(ArrowSpace::Map(Projection::Mercator)));
+        assert!(!s.drawable_in(ArrowSpace::Image { flip_y: true, aspect: 1.0 }));
+        s.on = false;
+        assert!(!s.drawable_in(built), "switched off");
+    }
+
+    #[test]
+    fn image_gate_rejects_old_flip_or_aspect() {
+        let ctx = egui::Context::default();
+        let grid = Grid { ny: 4, nx: 4, transposed: false };
+        let slice = Arc::new(Slice {
+            shape: vec![4, 4],
+            data: vec![1.0; 16],
+            valid_count: 16,
+            vector: Some(VectorParts { east: vec![1.0; 16], north: vec![0.0; 16] }),
+        });
+        let space = ArrowSpace::Image { flip_y: true, aspect: 1.0 };
+        let tile = TileSpec { start: [0, 0], count: [4, 4], stride: [1, 1] };
+        let key = ArrowKey::of(&[(tile, slice.clone())], [1, 1], space);
+        let mut s = ArrowState::default();
+        let core = IndexWindow::whole([4, 4]);
+        assert!(s.update(&ctx, key, &core, [4, 4], move |w| image_input(slice, grid, space, w)));
+        let t0 = std::time::Instant::now();
+        while !s.poll_finished() {
+            assert!(t0.elapsed().as_secs() < 20, "arrow job timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(s.drawable_in(space));
+        assert!(!s.drawable_in(ArrowSpace::Image { flip_y: false, aspect: 1.0 }), "old flip_y");
+        assert!(!s.drawable_in(ArrowSpace::Image { flip_y: true, aspect: 2.0 }), "old aspect");
+    }
+
+    #[test]
+    fn image_window_follows_the_view_when_zoomed() {
+        let full = [2048, 2048];
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 800.0));
+        // 16 x 16 cells on show: 50 pt per cell, so k = 1.
+        let view = egui::Rect::from_min_max(egui::pos2(1000.0, 500.0), egui::pos2(1016.0, 516.0));
+        let (k, core) = image_plan(view, rect, full).expect("visible");
+        assert_eq!(k, arrow_step([50.0, 50.0]));
+        assert_eq!(k, [1, 1]);
+        assert_eq!(core, IndexWindow { y: (500, 515), x: vec![(1000, 1015)] });
+        // Built over the visible window plus 50%, the lattice keeps k (no thinning).
+        let window = core.widened(full);
+        assert_eq!(window, IndexWindow { y: (492, 523), x: vec![(992, 1023)] });
+        let (cells, k_used) = lattice(&window.specs(), k);
+        assert_eq!(k_used, k);
+        assert_eq!(cells.len(), 32 * 32);
+        // The whole grid would be thinned to every 16th cell: 800 pt apart.
+        assert_eq!(lattice(&IndexWindow::whole(full).specs(), k).1, [16, 16]);
+        // Partly off the image: clamped; wholly off: nothing.
+        let edge = egui::Rect::from_min_max(egui::pos2(-4.5, 2040.2), egui::pos2(3.5, 2050.0));
+        let (_, core) = image_plan(edge, rect, full).expect("partly visible");
+        assert_eq!(core, IndexWindow { y: (2040, 2047), x: vec![(0, 3)] });
+        let off = egui::Rect::from_min_max(egui::pos2(-20.0, 0.0), egui::pos2(-10.0, 10.0));
+        assert!(image_plan(off, rect, full).is_none());
+    }
+
+    #[test]
+    fn transposed_image_input_holds_only_the_window() {
+        // x before y: data is [x = 3][y = 2].
+        let grid = Grid { ny: 2, nx: 3, transposed: true };
+        let d: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let parts = VectorParts { east: d.iter().map(|v| v + 10.0).collect(), north: d.clone() };
+        let slice = Arc::new(Slice { shape: vec![3, 2], data: d, valid_count: 6, vector: Some(parts) });
+        let space = ArrowSpace::Image { flip_y: true, aspect: 1.0 };
+        let w = IndexWindow { y: (1, 1), x: vec![(1, 2)] };
+        let input = image_input(slice, grid, space, &w);
+        let (spec, s) = &input.tiles[0];
+        assert_eq!(*spec, TileSpec { start: [1, 1], count: [1, 2], stride: [1, 1] });
+        // (row 1, col 1) = data[1 * 2 + 1], (row 1, col 2) = data[2 * 2 + 1].
+        assert_eq!(s.data, vec![3.0, 5.0]);
+        assert_eq!(s.vector.as_ref().map(|p| p.east.clone()), Some(vec![13.0, 15.0]));
     }
 
     #[test]

@@ -7,11 +7,11 @@ use eframe::egui_wgpu::RenderState;
 use egui_extras::{Column, TableBuilder};
 
 use super::{colorbar, fmt_value, inspector::log_range, map_view, slider_label};
-use crate::map::arrows::{ArrowSpace, arrow_step};
+use crate::map::arrows::ArrowSpace;
 use crate::map::tiles::TileSpec;
 use crate::render::arrows::{ARROW_IMAGE_ID, ArrowParams, image_affine, paint_arrows};
 use crate::render::image::{self as gpu, ImageParams};
-use crate::view::arrow_state::{ArrowKey, IndexWindow, image_input};
+use crate::view::arrow_state::{ArrowKey, image_input};
 use crate::view::defaults::{AxisChoice, ViewKind};
 use crate::view::var_view::{Display, Hover, Stats, VarView};
 
@@ -177,8 +177,10 @@ fn image(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&Rend
     uploaded
 }
 
-/// A vector view's arrows over its image: rebuilt in a job for every new
-/// slice (and lattice step), over the whole grid. True when drawn.
+/// A vector view's arrows over its image, built in a job over the visible
+/// cells plus 50% per side (as on the map, plan P4). The step and window
+/// are refreshed only once the view has rested; a new slice rebuilds at
+/// once over the last window. True when drawn.
 fn image_arrows(
     ui: &mut egui::Ui,
     v: &mut VarView,
@@ -194,13 +196,15 @@ fn image_arrows(
     a.poll_finished();
     a.upload_ready(rs);
     let full = [grid.ny, grid.nx];
-    let cell_pt = [rect.height() / view.height(), rect.width() / view.width()].map(f64::from);
+    a.image_rest_due(ui.ctx(), view, rect, full);
     let space = ArrowSpace::Image { flip_y, aspect };
-    let tile = TileSpec { start: [0, 0], count: full, stride: [1, 1] };
-    let key = ArrowKey::of(&[(tile, slice.clone())], arrow_step(cell_pt), space);
-    let core = IndexWindow::whole(full);
-    a.update(ui.ctx(), key, &core, full, move || image_input(slice, grid, space));
-    if !matches!(a.built_space(), Some(ArrowSpace::Image { .. })) {
+    if let Some((k, core)) = a.image_rest.clone() {
+        let tile = TileSpec { start: [0, 0], count: full, stride: [1, 1] };
+        let key = ArrowKey::of(&[(tile, slice.clone())], k, space);
+        a.update(ui.ctx(), key, &core, full, move |w| image_input(slice, grid, space, w));
+    }
+    // Never a set built for another flip or aspect under this affine.
+    if !a.drawable_in(space) {
         return false;
     }
     let ppp = ui.ctx().pixels_per_point();

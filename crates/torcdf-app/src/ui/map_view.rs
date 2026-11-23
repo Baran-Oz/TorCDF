@@ -136,7 +136,7 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
                 let core = core.clone();
                 match map_lonlat(map.is_curvilinear(), &v.coords, axes, full) {
                     Some(lonlat) => {
-                        let make = move || ArrowInput { space, tiles, lonlat, cells: Vec::new() };
+                        let make = move |_: &_| ArrowInput { space, tiles, lonlat, cells: Vec::new() };
                         a.start(ui.ctx(), key, &core, full, make);
                     }
                     None => a.give_up(key),
@@ -181,7 +181,7 @@ pub fn show(ui: &mut egui::Ui, v: &mut VarView, display: &Display, rs: Option<&R
     }
     let wrap = map.camera.proj.wraps_x();
     let ppp = ui.ctx().pixels_per_point();
-    let arrows = v.arrows.as_ref().filter(|a| a.on && a.built_space() == Some(ArrowSpace::Map(map.camera.proj)));
+    let arrows = v.arrows.as_ref().filter(|a| a.drawable_in(ArrowSpace::Map(map.camera.proj)));
     let px_per_unit = arrows.and_then(|a| a.px_per_unit(ppp));
     if let Some(px_per_unit) = px_per_unit {
         let p = ArrowParams { affine: map_affine(&camera), px_per_unit, wrap, rect_px: camera.rect_px };
