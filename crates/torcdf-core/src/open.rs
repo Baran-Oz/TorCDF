@@ -14,8 +14,8 @@ pub struct NcFile {
     /// the netCDF handle.
     pub(crate) fast: crate::fast::FastState,
     pub(crate) file: netcdf::File,
-    /// The exact path given to netCDF-C (the 8.3 form on Windows when
-    /// needed), so a second HDF5 open names the same file.
+    /// The exact path netCDF-C opened (the real path, or its 8.3 form on
+    /// Windows if the real one was refused), so a second HDF5 open names the same file.
     pub(crate) c_path: PathBuf,
     open_id: u64,
     /// Vector pairs: detected at open, then added or removed by hand. They
@@ -41,9 +41,25 @@ impl NcFile {
     /// attributes, groups). Variable data is not touched.
     pub fn open(path: &Path) -> Result<NcFile, CoreError> {
         let open_err = |msg: String| CoreError::Open { path: path.to_path_buf(), msg };
-        let cpath = c_path(path)?;
-        let file = netcdf::open(&cpath).map_err(|e| open_err(e.to_string()))?;
-        let raw = RawHandle::open(&cpath).map_err(open_err)?;
+        // The real path first; the 8.3 form only if netCDF-C refuses it.
+        // `cpath` is whichever candidate worked, for every later open.
+        let mut last_err = None;
+        let mut opened = None;
+        for cand in c_path_candidates(path) {
+            let tried = netcdf::open(&cand)
+                .map_err(|e| e.to_string())
+                .and_then(|file| RawHandle::open(&cand).map(|raw| (file, raw)));
+            match tried {
+                Ok((file, raw)) => {
+                    opened = Some((cand, file, raw));
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let Some((cpath, file, raw)) = opened else {
+            return Err(open_err(last_err.unwrap_or_else(|| "file could not be opened".into())));
+        };
         let format = raw.format().map_err(open_err)?;
         let file_size = std::fs::metadata(path).map_err(|e| open_err(e.to_string()))?.len();
 
@@ -70,40 +86,40 @@ impl NcFile {
     }
 }
 
-/// The path to hand to netCDF-C. On Windows netCDF-C opens files through the
-/// ANSI code page, so a path with non-ASCII characters (which would otherwise
-/// not be found) is replaced by its ASCII-only short (8.3) form.
-fn c_path(p: &Path) -> Result<PathBuf, CoreError> {
-    let open_err = |msg: &str| CoreError::Open { path: p.to_path_buf(), msg: msg.into() };
+/// The paths to try with netCDF-C, in order: the real path, then (Windows,
+/// non-ASCII only) its ASCII-only short (8.3) form, in case netCDF-C cannot
+/// open the real one through the ANSI code page.
+fn c_path_candidates(p: &Path) -> Vec<PathBuf> {
+    let mut out = vec![p.to_path_buf()];
     if p.to_str().is_some_and(str::is_ascii) {
-        return Ok(p.to_path_buf());
+        return out;
     }
     #[cfg(windows)]
-    {
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        unsafe extern "system" {
-            fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
-        }
-        let long: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
-        let needed = unsafe { GetShortPathNameW(long.as_ptr(), std::ptr::null_mut(), 0) };
-        if needed == 0 {
-            return Err(open_err("file not found or no short path available"));
-        }
-        let mut buf = vec![0u16; needed as usize];
-        let n = unsafe { GetShortPathNameW(long.as_ptr(), buf.as_mut_ptr(), needed) } as usize;
-        if n == 0 || n >= buf.len() {
-            return Err(open_err("could not form a short path"));
-        }
-        let short = PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
-        if short.to_str().is_some_and(str::is_ascii) {
-            return Ok(short);
-        }
-        Err(open_err("path has non-ASCII characters and no ASCII short form"))
+    if let Some(short) = short_path(p) {
+        out.push(short);
     }
-    #[cfg(not(windows))]
-    {
-        p.to_str().map(|_| p.to_path_buf()).ok_or_else(|| open_err("path is not valid UTF-8"))
+    out
+}
+
+/// The 8.3 form of `p`, if the file exists, has one, and it is ASCII.
+#[cfg(windows)]
+fn short_path(p: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    unsafe extern "system" {
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
     }
+    let long: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    let needed = unsafe { GetShortPathNameW(long.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; needed as usize];
+    let n = unsafe { GetShortPathNameW(long.as_ptr(), buf.as_mut_ptr(), needed) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    let short = PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+    short.to_str().is_some_and(str::is_ascii).then_some(short)
 }
 
 // ---- structure via the netcdf crate ---------------------------------------
@@ -329,5 +345,56 @@ mod tests {
         assert_eq!(u64s_to_attr(vec![i64::MAX as u64]), AttrValue::Ints(vec![i64::MAX]));
         let big = u64::MAX - 1;
         assert_eq!(u64s_to_attr(vec![1, big]), AttrValue::Floats(vec![1.0, big as f64]));
+    }
+
+    #[test]
+    fn real_path_tried_first() {
+        let ascii = Path::new("data/file.nc");
+        assert_eq!(c_path_candidates(ascii), vec![ascii.to_path_buf()]);
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("Ölçüm 测试").join("a.nc");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"x").unwrap();
+        let c = c_path_candidates(&real);
+        assert_eq!(c[0], real);
+        #[cfg(windows)]
+        if c.len() > 1 {
+            assert_eq!(c.len(), 2);
+            assert!(c[1].to_str().unwrap().is_ascii());
+        }
+        #[cfg(not(windows))]
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn non_ascii_path_reads() {
+        use crate::{NcFile, SliceRequest};
+        let tmp = tempfile::tempdir().unwrap();
+        let ascii_dir = tmp.path().join("plain");
+        let uni_dir = tmp.path().join("Ölçüm 测试");
+        std::fs::create_dir_all(&ascii_dir).unwrap();
+        std::fs::create_dir_all(&uni_dir).unwrap();
+        let a = crate::fixtures::vectors::write_arome_like(&ascii_dir);
+        let u = uni_dir.join("arome.nc");
+        std::fs::copy(&a, &u).unwrap();
+        let req = SliceRequest {
+            var: "/wind_speed".into(),
+            start: vec![0, 0, 0, 0],
+            count: vec![2, 1, 4, 5],
+            stride: vec![1, 1, 1, 1],
+        };
+        let want = NcFile::open(&a).unwrap().read_slice(&req).unwrap().data;
+        let nc = NcFile::open(&u).unwrap();
+        let got = nc.read_slice(&req).unwrap().data;
+        assert_eq!(want.len(), got.len());
+        assert!(want.iter().zip(&got).all(|(x, y)| x == y || (x.is_nan() && y.is_nan())));
+        eprintln!(
+            "non_ascii_path_reads: netCDF-C {} the real path (c_path = {})",
+            if nc.c_path == u { "accepted" } else { "refused" },
+            nc.c_path.display()
+        );
+        eprintln!("HDF5 on the real path: {}", crate::fast::h5::H5File::open(&u).is_ok());
+        // The fast reader opens the same stored path.
+        assert!(crate::fast::h5::H5File::open(&nc.c_path).is_ok());
     }
 }
