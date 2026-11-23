@@ -49,10 +49,8 @@ fn assert_same(a: &Slice, b: &Slice, what: &str) {
     }
 }
 
-#[test]
-fn fast_equals_library_matrix() {
-    let dir = tempfile::tempdir().unwrap();
-    let nc = NcFile::open(&fixtures::write_fast_matrix(dir.path())).unwrap();
+/// Every eligible variable and request: `read_slice` equals the library.
+fn assert_matrix_matches_library(nc: &NcFile) {
     for var in ELIGIBLE {
         for r in REQUESTS {
             let r = req(var, r);
@@ -64,6 +62,30 @@ fn fast_equals_library_matrix() {
             }
         }
     }
+}
+
+#[test]
+fn fast_equals_library_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let nc = NcFile::open(&fixtures::write_fast_matrix(dir.path())).unwrap();
+    assert_matrix_matches_library(&nc);
+}
+
+/// The same matrix with chunks looked up one at a time, so pool threads
+/// make HDF5 calls (under the lock) while they decode.
+#[test]
+fn fast_equals_library_with_lookup_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let nc = NcFile::open(&fixtures::write_fast_matrix(dir.path())).unwrap();
+    super::h5::TEST_ITER_LIMIT.set(Some(0));
+    for var in ELIGIBLE {
+        let v = nc.fast_var(&format!("/{var}")).expect("eligible");
+        assert!(v.h5.uses_lookup_index(), "{var}");
+    }
+    super::h5::TEST_ITER_LIMIT.set(None);
+    let before = nc.fast_reads();
+    assert_matrix_matches_library(&nc);
+    assert_eq!(nc.fast_reads(), before + 4 * ELIGIBLE.len());
 }
 
 #[test]
@@ -124,4 +146,98 @@ fn classic_file_is_not_eligible() {
     let dir = tempfile::tempdir().unwrap();
     let nc = NcFile::open(&fixtures::write_classic(dir.path())).unwrap();
     assert!(!nc.fast_eligible("/t"));
+}
+
+/// A plain HDF5 file (as h5py would write it, no netCDF attributes): `/v`,
+/// f32 `[4, 6]` in `[2, 3]` chunks with HDF5 fill value 42 and no
+/// `_FillValue`. Only the first chunk is written.
+fn write_hdf5_user_fill(dir: &std::path::Path) -> std::path::PathBuf {
+    use hdf5_metno_sys::h5::{H5open, hsize_t};
+    use hdf5_metno_sys::h5d::{H5Dclose, H5Dcreate2, H5Dwrite};
+    use hdf5_metno_sys::h5f::{H5F_ACC_TRUNC, H5Fclose, H5Fcreate};
+    use hdf5_metno_sys::h5p::{
+        H5P_CLS_DATASET_CREATE, H5P_DEFAULT, H5Pclose, H5Pcreate, H5Pset_chunk, H5Pset_fill_value,
+    };
+    use hdf5_metno_sys::h5s::{H5S_SELECT_SET, H5Sclose, H5Screate_simple, H5Sselect_hyperslab};
+    use hdf5_metno_sys::h5t::{H5T_IEEE_F32LE, H5T_NATIVE_FLOAT};
+    use std::ffi::CString;
+    use std::ptr::null;
+
+    let path = dir.join("h5fill.h5");
+    let c = CString::new(path.to_str().unwrap()).unwrap();
+    let name = CString::new("v").unwrap();
+    let _g = netcdf_sys::libnetcdf_lock.lock();
+    unsafe {
+        assert!(H5open() >= 0);
+        let f = H5Fcreate(c.as_ptr(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+        assert!(f >= 0);
+        let dims: [hsize_t; 2] = [4, 6];
+        let space = H5Screate_simple(2, dims.as_ptr(), null());
+        let dcpl = H5Pcreate(*H5P_CLS_DATASET_CREATE);
+        let chunk: [hsize_t; 2] = [2, 3];
+        assert!(H5Pset_chunk(dcpl, 2, chunk.as_ptr()) >= 0);
+        let fill = 42.0f32;
+        assert!(H5Pset_fill_value(dcpl, *H5T_NATIVE_FLOAT, (&raw const fill).cast()) >= 0);
+        let d = H5Dcreate2(
+            f,
+            name.as_ptr(),
+            *H5T_IEEE_F32LE,
+            space,
+            H5P_DEFAULT,
+            dcpl,
+            H5P_DEFAULT,
+        );
+        assert!(d >= 0);
+        let mem = H5Screate_simple(2, chunk.as_ptr(), null());
+        let origin: [hsize_t; 2] = [0, 0];
+        let sel = H5Sselect_hyperslab(
+            space,
+            H5S_SELECT_SET,
+            origin.as_ptr(),
+            null(),
+            chunk.as_ptr(),
+            null(),
+        );
+        assert!(sel >= 0);
+        let vals: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        assert!(
+            H5Dwrite(
+                d,
+                *H5T_NATIVE_FLOAT,
+                mem,
+                space,
+                H5P_DEFAULT,
+                vals.as_ptr().cast()
+            ) >= 0
+        );
+        H5Sclose(mem);
+        H5Dclose(d);
+        H5Pclose(dcpl);
+        H5Sclose(space);
+        H5Fclose(f);
+    }
+    path
+}
+
+/// Never-written chunks read as HDF5's fill value. A file from another tool
+/// may set one that is not `_FillValue` (or the netCDF default); the fast
+/// path cannot match the library there, so the variable is not eligible.
+#[test]
+fn hdf5_fill_other_than_fillvalue_is_not_eligible() {
+    let dir = tempfile::tempdir().unwrap();
+    let nc = NcFile::open(&write_hdf5_user_fill(dir.path())).unwrap();
+    assert!(nc.meta.var("/v").unwrap().attrs.is_empty());
+    assert!(!nc.fast_eligible("/v"));
+    let r = SliceRequest {
+        var: "/v".into(),
+        start: vec![0, 0],
+        count: vec![4, 6],
+        stride: vec![1, 1],
+    };
+    let before = nc.fast_reads();
+    let s = nc.read_slice(&r).unwrap();
+    assert_eq!(nc.fast_reads(), before);
+    assert_eq!(&s.data[..3], &[1.0, 2.0, 3.0]);
+    assert_eq!(s.data[3], 42.0, "an unwritten chunk reads as HDF5's fill");
+    assert_eq!(s.data[23], 42.0);
 }

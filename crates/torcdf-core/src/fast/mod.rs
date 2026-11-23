@@ -121,8 +121,18 @@ impl NcFile {
             .iter()
             .try_fold(1usize, |a, &b| a.checked_mul(b))
             .filter(|n| n.checked_mul(size + CHECKSUM_LEN).is_some())?;
+        // Never-written chunks read as HDF5's fill value, records past the
+        // extent as netCDF's: a file from another tool may set an HDF5 fill
+        // value that differs from `_FillValue`, and then they would disagree.
+        let raw = raw_fill(info);
+        if h5
+            .fill
+            .is_some_and(|h| h != raw && !(h.is_nan() && raw.is_nan()))
+        {
+            return None;
+        }
         let unpack = Unpack::for_var(info);
-        let fill = unpack.apply(raw_fill(info));
+        let fill = unpack.apply(raw);
         Some(FastVar {
             h5,
             dtype: info.dtype.clone(),

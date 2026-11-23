@@ -7,19 +7,19 @@
 
 use hdf5_metno_sys::h5::{H5open, HADDR_UNDEF, haddr_t, herr_t, hsize_t};
 use hdf5_metno_sys::h5d::{
-    H5D_CHUNK_DONT_FILTER_PARTIAL_CHUNKS, H5D_layout_t, H5Dchunk_iter, H5Dclose,
+    H5D_CHUNK_DONT_FILTER_PARTIAL_CHUNKS, H5D_fill_value_t, H5D_layout_t, H5Dchunk_iter, H5Dclose,
     H5Dget_chunk_info_by_coord, H5Dget_create_plist, H5Dget_num_chunks, H5Dget_space, H5Dget_type,
     H5Dopen2,
 };
 use hdf5_metno_sys::h5f::{H5F_ACC_RDONLY, H5Fclose, H5Fget_create_plist, H5Fopen};
 use hdf5_metno_sys::h5i::hid_t;
 use hdf5_metno_sys::h5p::{
-    H5P_DEFAULT, H5Pclose, H5Pget_chunk, H5Pget_chunk_opts, H5Pget_filter2, H5Pget_layout,
-    H5Pget_nfilters, H5Pget_userblock,
+    H5P_DEFAULT, H5Pclose, H5Pfill_value_defined, H5Pget_chunk, H5Pget_chunk_opts,
+    H5Pget_fill_value, H5Pget_filter2, H5Pget_layout, H5Pget_nfilters, H5Pget_userblock,
 };
 use hdf5_metno_sys::h5s::{H5Sclose, H5Sget_simple_extent_dims, H5Sget_simple_extent_ndims};
 use hdf5_metno_sys::h5t::{
-    H5T_class_t, H5T_order_t, H5Tclose, H5Tget_class, H5Tget_order, H5Tget_size,
+    H5T_NATIVE_DOUBLE, H5T_class_t, H5T_order_t, H5Tclose, H5Tget_class, H5Tget_order, H5Tget_size,
 };
 use hdf5_metno_sys::h5z::{H5Z_FILTER_DEFLATE, H5Z_FILTER_FLETCHER32, H5Z_FILTER_SHUFFLE};
 use netcdf_sys::libnetcdf_lock;
@@ -33,6 +33,14 @@ use std::sync::{Arc, Mutex};
 /// Up to this many chunks the whole index is read in one `H5Dchunk_iter`
 /// pass; above it, chunks are looked up one at a time as they are asked for.
 const ITER_LIMIT: u64 = 1_000_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces `ITER_LIMIT` for `H5Var::open` calls on this thread, so a
+    /// test can force the one-lookup-at-a-time index.
+    pub(crate) static TEST_ITER_LIMIT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// An HDF5 identifier, closed under the lock when dropped.
 struct Id {
@@ -136,6 +144,9 @@ pub(crate) struct H5Var {
     /// The dataset's extent when opened. Along an unlimited dimension it can
     /// be shorter than the netCDF length: records past it were never written.
     pub shape: Vec<usize>,
+    /// The dataset's user-defined HDF5 fill value as `f64` (what reading a
+    /// never-written chunk returns); None when HDF5's default applies.
+    pub fill: Option<f64>,
     index: Index,
     base: u64,
     // Fields drop in declaration order: the dataset closes before the file.
@@ -192,7 +203,11 @@ impl H5Var {
     /// Ok(None): not eligible (contiguous/compact, other filters,
     /// DONT_FILTER_PARTIAL_CHUNKS set, or not a plain number type).
     pub(crate) fn open(f: &H5File, var_path: &str) -> Result<Option<H5Var>, String> {
-        Self::open_with_limit(f, var_path, ITER_LIMIT)
+        #[cfg(test)]
+        let limit = TEST_ITER_LIMIT.get().unwrap_or(ITER_LIMIT);
+        #[cfg(not(test))]
+        let limit = ITER_LIMIT;
+        Self::open_with_limit(f, var_path, limit)
     }
 
     fn open_with_limit(
@@ -267,6 +282,7 @@ impl H5Var {
         if cdims.contains(&0) {
             return Err("HDF5 reported an empty chunk shape".into());
         }
+        let fill = user_fill(&dcpl)?;
         let shape: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
         let chunk: Vec<usize> = cdims.iter().map(|&d| d as usize).collect();
 
@@ -306,6 +322,7 @@ impl H5Var {
             order,
             elem_size,
             shape,
+            fill,
             index,
             base: f.base,
             dset,
@@ -344,6 +361,12 @@ impl H5Var {
                 Ok(loc)
             }
         }
+    }
+
+    /// Whether chunks are looked up one at a time (`Index::ByCoord`).
+    #[cfg(test)]
+    pub(crate) fn uses_lookup_index(&self) -> bool {
+        matches!(self.index, Index::ByCoord(_))
     }
 
     /// One chunk's location straight from HDF5.
@@ -388,6 +411,25 @@ fn chunk_loc(
         size,
         filter_mask,
     }))
+}
+
+/// The dataset's user-defined fill value converted by HDF5 to `f64`, as
+/// netCDF-C converts what it reads; None when no user value is set (HDF5's
+/// default). Caller holds the lock.
+fn user_fill(dcpl: &Id) -> Result<Option<f64>, String> {
+    let mut status = H5D_fill_value_t::H5D_FILL_VALUE_ERROR;
+    if unsafe { H5Pfill_value_defined(dcpl.id, &mut status) } < 0 {
+        return Err("HDF5 could not read the fill value setting".into());
+    }
+    if status != H5D_fill_value_t::H5D_FILL_VALUE_USER_DEFINED {
+        return Ok(None);
+    }
+    let mut value = 0.0f64;
+    let rc = unsafe { H5Pget_fill_value(dcpl.id, *H5T_NATIVE_DOUBLE, (&raw mut value).cast()) };
+    if rc < 0 {
+        return Err("HDF5 could not read the fill value".into());
+    }
+    Ok(Some(value))
 }
 
 /// The filter pipeline, or None if it holds a filter the fast reader cannot
