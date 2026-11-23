@@ -100,12 +100,19 @@ impl NcFile {
             .map_err(|_| open_err("file metadata could not be read (corrupt or unsupported)".into()))?;
         if matches!(format, FileFormat::Netcdf4 | FileFormat::Netcdf4Classic) {
             raw.fill_storage(&mut root);
-            // Does netCDF-C hide datasets? Any HDF5 error: keep netCDF-C.
-            let h5 = H5File::open(&cpath)
-                .and_then(|h5| crate::h5meta::read_h5_meta(&h5, path).map(|r| (h5, r)));
-            if let Ok((h5, h5_root)) = h5
-                && crate::h5meta::hides_datasets(&root, &h5_root)
-            {
+            // Does netCDF-C hide datasets? A cheap count first; the full
+            // HDF5 metadata only when the backend switches. Any error or
+            // panic here means "not hidden": netCDF-C stays.
+            let hdf5 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let h5 = H5File::open(&cpath).ok()?;
+                let count = crate::h5meta::count_plottable(&h5).ok()?;
+                if !crate::h5meta::hides_datasets(&root, count) {
+                    return None;
+                }
+                let h5_root = crate::h5meta::read_h5_meta(&h5, path).ok()?;
+                Some((h5, h5_root))
+            }));
+            if let Ok(Some((h5, h5_root))) = hdf5 {
                 let meta = Dataset { path: path.to_path_buf(), file_size, format: FileFormat::Hdf5, root: h5_root };
                 return Ok(Self::assemble(meta, Backend::Hdf5(h5), cpath));
             }

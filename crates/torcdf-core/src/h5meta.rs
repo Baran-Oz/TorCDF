@@ -14,7 +14,7 @@ use hdf5_metno_sys::h5::{H5_INDEX_CRT_ORDER, H5_INDEX_NAME, H5_ITER_INC, herr_t,
 use hdf5_metno_sys::h5a::{H5Aclose, H5Aget_name, H5Aget_space, H5Aget_type, H5Aopen_by_idx, H5Aread};
 use hdf5_metno_sys::h5d::{H5D_layout_t, H5Dget_create_plist, H5Dget_space, H5Dget_type};
 use hdf5_metno_sys::h5g::H5Gget_create_plist;
-use hdf5_metno_sys::h5i::{H5Iget_name, hid_t};
+use hdf5_metno_sys::h5i::hid_t;
 use hdf5_metno_sys::h5l::{H5L_info2_t, H5L_type_t, H5Literate2};
 use hdf5_metno_sys::h5o::{
     H5O_INFO_BASIC, H5O_INFO_NUM_ATTRS, H5O_info2_t, H5O_token_t, H5O_type_t, H5Oclose, H5Oget_info3, H5Oopen,
@@ -33,6 +33,7 @@ use hdf5_metno_sys::h5t::{
     H5Tget_strpad, H5Tis_variable_str, H5Treclaim, H5Tset_cset, H5Tset_size,
 };
 use netcdf_sys::libnetcdf_lock;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
 use std::os::raw::{c_char, c_uint};
 use std::path::Path;
@@ -83,12 +84,16 @@ const HIDDEN_ATTRS: [&str; 8] = [
 /// The root group of the HDF5 file `f`, opened from `path`.
 pub(crate) fn read_h5_meta(f: &H5File, path: &Path) -> Result<Group, String> {
     let _g = libnetcdf_lock.lock();
-    let mut w = Walker { next_phony: 0, named: Vec::new(), seen: Vec::new() };
-    let root = Held::new(unsafe { H5Oopen(f.id(), c"/".as_ptr(), H5P_DEFAULT) }, H5Oclose, "open the root group")
+    let mut w = Walker::default();
+    let mut root = Held::new(unsafe { H5Oopen(f.id(), c"/".as_ptr(), H5P_DEFAULT) }, H5Oclose, "open the root group")
         .and_then(|g| w.group(g.0, "/", "/"))
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut root = root;
+    w.resolve_scales(&mut root);
+    let mut added = HashSet::new();
     for (group_path, dim) in w.named {
+        if !added.insert((group_path.clone(), dim.name.clone())) {
+            continue;
+        }
         let g = find_group(&mut root, &group_path);
         if !g.dims.iter().any(|d| d.name == dim.name) {
             g.dims.push(dim);
@@ -102,10 +107,61 @@ pub(crate) fn plottable(g: &Group) -> usize {
     g.vars.iter().filter(|v| v.dtype.is_numeric()).count() + g.groups.iter().map(plottable).sum::<usize>()
 }
 
-/// Whether the HDF5 walk `h5` finds more plottable datasets than netCDF-C
-/// shows numeric variables in `nc`: netCDF-C hid some.
-pub(crate) fn hides_datasets(nc: &Group, h5: &Group) -> bool {
-    plottable(h5) > plottable(nc)
+/// Whether HDF5 finds more plottable datasets (`h5_count`, from
+/// [`count_plottable`]) than netCDF-C shows numeric variables in `nc`:
+/// netCDF-C hid some.
+pub(crate) fn hides_datasets(nc: &Group, h5_count: usize) -> bool {
+    h5_count > plottable(nc)
+}
+
+/// The number of datasets [`read_h5_meta`] would list as numeric, found
+/// cheaply: links, object types, type classes and dimension-scale names
+/// only (no attributes, no dimension names).
+pub(crate) fn count_plottable(f: &H5File) -> Result<usize, String> {
+    fn walk(gid: hid_t, seen: &mut HashSet<[u8; 16]>) -> Result<usize, String> {
+        seen.insert(token_key(&obj_info(gid)?.token));
+        let mut n = 0;
+        for link in link_names(gid)? {
+            let Ok(obj) = Held::new(unsafe { H5Oopen(gid, link.as_ptr(), H5P_DEFAULT) }, H5Oclose, "open") else {
+                continue;
+            };
+            let Ok(oi) = obj_info(obj.0) else { continue };
+            match oi.type_ {
+                H5O_type_t::H5O_TYPE_GROUP if !seen.contains(&token_key(&oi.token)) => {
+                    n += walk(obj.0, seen).unwrap_or(0);
+                }
+                H5O_type_t::H5O_TYPE_DATASET => n += usize::from(dataset_is_plottable(obj.0)),
+                _ => {}
+            }
+        }
+        Ok(n)
+    }
+    let _g = libnetcdf_lock.lock();
+    let root = Held::new(unsafe { H5Oopen(f.id(), c"/".as_ptr(), H5P_DEFAULT) }, H5Oclose, "open the root group")?;
+    walk(root.0, &mut HashSet::new())
+}
+
+/// Whether [`read_h5_meta`] lists dataset `did` as numeric.
+fn dataset_is_plottable(did: hid_t) -> bool {
+    let Ok(space) = Held::new(unsafe { H5Dget_space(did) }, H5Sclose, "read the dataset's shape") else {
+        return false;
+    };
+    if !matches!(extent(space.0), Ok((_, _, false))) {
+        return false;
+    }
+    let Ok(ty) = Held::new(unsafe { H5Dget_type(did) }, H5Tclose, "read the dataset's type") else {
+        return false;
+    };
+    if !dtype_of(ty.0).is_numeric() {
+        return false;
+    }
+    !(unsafe { ffi::H5DSis_scale(did) } > 0 && scale_name(did).is_some_and(|n| n.starts_with(DIM_WITHOUT_VARIABLE)))
+}
+
+/// An object token as a hashable key.
+fn token_key(t: &H5O_token_t) -> [u8; 16] {
+    // SAFETY: H5O_token_t is a `repr(C)` wrapper of 16 bytes.
+    unsafe { std::mem::transmute::<H5O_token_t, [u8; 16]>(*t) }
 }
 
 /// The group at `path` below `root`; `root` itself if there is none.
@@ -136,6 +192,7 @@ impl Drop for Held {
     }
 }
 
+#[derive(Default)]
 struct Walker {
     /// Number of the next phony dimension, counted over the whole file.
     next_phony: usize,
@@ -143,7 +200,22 @@ struct Walker {
     /// that holds the scale; added to the groups after the walk.
     named: Vec<(String, Dim)>,
     /// Groups already walked: hard links can form cycles.
-    seen: Vec<H5O_token_t>,
+    seen: HashSet<[u8; 16]>,
+    /// Every dataset walked, by object token: its group path and name.
+    datasets: HashMap<[u8; 16], (String, String)>,
+    /// Axes on a dimension scale, by variable path; named once the walk has
+    /// seen every dataset (the scale may come later).
+    scaled: HashMap<String, Vec<ScaledAxis>>,
+}
+
+/// An axis whose dimension is the attached scale `token`.
+struct ScaledAxis {
+    axis: usize,
+    token: [u8; 16],
+    unlimited: bool,
+    /// The scale's `NAME`, used if the scale itself was not walked (e.g.
+    /// reachable only through a soft link).
+    fallback: String,
 }
 
 impl Walker {
@@ -151,7 +223,7 @@ impl Walker {
     /// described are left out.
     fn group(&mut self, gid: hid_t, name: &str, path: &str) -> Result<Group, String> {
         let info = obj_info(gid)?;
-        self.seen.push(info.token);
+        self.seen.insert(token_key(&info.token));
         let mut g = Group {
             name: name.into(),
             path: path.into(),
@@ -168,12 +240,14 @@ impl Walker {
             let link = link.to_string_lossy();
             let child = join(path, &link);
             match oi.type_ {
-                H5O_type_t::H5O_TYPE_GROUP if !self.seen.contains(&oi.token) => {
+                H5O_type_t::H5O_TYPE_GROUP if !self.seen.contains(&token_key(&oi.token)) => {
                     if let Ok(sub) = self.group(obj.0, &link, &child) {
                         g.groups.push(sub);
                     }
                 }
                 H5O_type_t::H5O_TYPE_DATASET => {
+                    let key = token_key(&oi.token);
+                    self.datasets.entry(key).or_insert_with(|| (g.path.clone(), link.to_string()));
                     if let Ok(Some(v)) = self.dataset(obj.0, &link, &child, oi.num_attrs, &mut g) {
                         g.vars.push(v);
                     }
@@ -208,10 +282,11 @@ impl Walker {
 
         let mut dims: Vec<String> = Vec::with_capacity(shape.len());
         for (d, (&len, &unl)) in shape.iter().zip(&unlimited).enumerate() {
-            let dim_name = if let Some(scale) = (!is_scale).then(|| attached_scale(did, d)).flatten() {
-                let (group_path, base) = split_path(&scale);
-                self.named.push((group_path.into(), Dim { name: base.into(), len, unlimited: unl }));
-                base.to_string()
+            let dim_name = if let Some((token, fallback)) = (!is_scale).then(|| attached_scale(did, d)).flatten() {
+                // Named by `resolve_scales` after the walk.
+                let axis = ScaledAxis { axis: d, token, unlimited: unl, fallback: fallback.clone() };
+                self.scaled.entry(path.to_string()).or_default().push(axis);
+                fallback
             } else if is_scale && shape.len() == 1 {
                 self.named.push((g.path.clone(), Dim { name: name.into(), len, unlimited: unl }));
                 name.to_string()
@@ -231,6 +306,24 @@ impl Walker {
         }))
     }
 
+    /// Names every axis on a dimension scale after the scale dataset, and
+    /// records the dimension for the scale's group.
+    fn resolve_scales(&mut self, g: &mut Group) {
+        for v in &mut g.vars {
+            for s in self.scaled.remove(&v.path).unwrap_or_default() {
+                let (group_path, name) =
+                    self.datasets.get(&s.token).cloned().unwrap_or_else(|| (g.path.clone(), s.fallback));
+                if let (Some(slot), Some(&len)) = (v.dims.get_mut(s.axis), v.shape.get(s.axis)) {
+                    slot.clone_from(&name);
+                    self.named.push((group_path, Dim { name, len, unlimited: s.unlimited }));
+                }
+            }
+        }
+        for sub in &mut g.groups {
+            self.resolve_scales(sub);
+        }
+    }
+
     /// A phony dimension of `len` in `group_dims` that `used` (the axes of
     /// the same dataset so far) does not already use; created if needed.
     fn phony(&mut self, group_dims: &mut Vec<Dim>, used: &[String], len: usize, unlimited: bool) -> String {
@@ -247,15 +340,6 @@ impl Walker {
 
 fn join(parent: &str, name: &str) -> String {
     if parent == "/" { format!("/{name}") } else { format!("{parent}/{name}") }
-}
-
-/// `"/g/x"` to `("/g", "x")`; `"/x"` to `("/", "x")`.
-fn split_path(p: &str) -> (&str, &str) {
-    match p.rfind('/') {
-        Some(0) => ("/", &p[1..]),
-        Some(i) => (&p[..i], &p[i + 1..]),
-        None => ("/", p),
-    }
 }
 
 fn obj_info(id: hid_t) -> Result<H5O_info2_t, String> {
@@ -333,37 +417,28 @@ fn scale_name(did: hid_t) -> Option<String> {
     CStr::from_bytes_until_nul(&buf).ok().map(|s| s.to_string_lossy().into_owned())
 }
 
-/// Full path of the first dimension scale attached to axis `d` of `did`.
-fn attached_scale(did: hid_t, d: usize) -> Option<String> {
+/// The first dimension scale attached to axis `d` of `did`: its object
+/// token (cheap, unlike its path, which HDF5 finds by searching the file)
+/// and its `NAME` (`"scale"` if none).
+fn attached_scale(did: hid_t, d: usize) -> Option<([u8; 16], String)> {
     let d = c_uint::try_from(d).ok()?;
     if unsafe { ffi::H5DSget_num_scales(did, d) } <= 0 {
         return None;
     }
-    let mut out: Option<String> = None;
+    let mut out: Option<([u8; 16], String)> = None;
     let data = (&raw mut out).cast::<c_void>();
     unsafe { ffi::H5DSiterate_scales(did, d, null_mut(), Some(first_scale), data) };
     out
 }
 
-/// `H5DSiterate_scales` visitor: stores the scale's path in the
-/// `Option<String>` behind `data` and stops.
+/// `H5DSiterate_scales` visitor: stores the scale's token and `NAME` in
+/// the `Option<([u8; 16], String)>` behind `data` and stops.
 unsafe extern "C" fn first_scale(_did: hid_t, _dim: c_uint, dsid: hid_t, data: *mut c_void) -> herr_t {
-    let out = unsafe { &mut *data.cast::<Option<String>>() };
-    *out = obj_path(dsid);
+    let out = unsafe { &mut *data.cast::<Option<([u8; 16], String)>>() };
+    let Ok(info) = obj_info(dsid) else { return -1 };
+    let name = scale_name(dsid).filter(|n| !n.is_empty()).unwrap_or_else(|| "scale".into());
+    *out = Some((token_key(&info.token), name));
     1 // stop
-}
-
-/// The path HDF5 knows object `id` by, e.g. `/g/x`.
-fn obj_path(id: hid_t) -> Option<String> {
-    let n = unsafe { H5Iget_name(id, null_mut(), 0) };
-    if n <= 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; n as usize + 1];
-    if unsafe { H5Iget_name(id, buf.as_mut_ptr().cast(), buf.len()) } <= 0 {
-        return None;
-    }
-    CStr::from_bytes_until_nul(&buf).ok().map(|s| s.to_string_lossy().into_owned())
 }
 
 fn class_name(c: H5T_class_t) -> &'static str {
@@ -634,6 +709,12 @@ mod tests {
             let h5 = H5File::open(&nc.c_path).unwrap();
             let root = read_h5_meta(&h5, &p).unwrap();
             assert_eq!(plottable(&root), plottable(&nc.meta.root), "{}", p.display());
+            assert_eq!(count_plottable(&h5).unwrap(), plottable(&root), "{}", p.display());
+            let h5_meta = Dataset { path: p.clone(), file_size: 0, format: FileFormat::Hdf5, root };
+            for v in nc.meta.all_vars() {
+                let h = h5_meta.var(&v.path).unwrap_or_else(|| panic!("{} missing", v.path));
+                assert_eq!(h.dims, v.dims, "{} dims", v.path);
+            }
         }
         let classic = NcFile::open(&fixtures::write_classic(d)).unwrap();
         assert_eq!(classic.meta.format, FileFormat::Classic);
@@ -662,7 +743,49 @@ mod tests {
         let nc = group(vec![var("a", DType::F32), var("s", DType::Str)]);
         let same = group(vec![var("a", DType::F32), var("t", DType::Other("compound".into()))]);
         let more = group(vec![var("a", DType::F32), var("h", DType::I16)]);
-        assert!(!hides_datasets(&nc, &same));
-        assert!(hides_datasets(&nc, &more));
+        assert!(!hides_datasets(&nc, plottable(&same)));
+        assert!(hides_datasets(&nc, plottable(&more)));
+    }
+
+    /// A netCDF-4 file with many variables: every axis has a dimension
+    /// scale, so the hidden-dataset check must not resolve scale paths.
+    #[test]
+    fn many_variables_open_quickly() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("many.nc");
+        {
+            let mut f = netcdf::create(&p).unwrap();
+            f.add_dimension("time", 2).unwrap();
+            f.add_dimension("y", 3).unwrap();
+            f.add_dimension("x", 4).unwrap();
+            for i in 0..2000 {
+                f.add_variable::<f32>(&format!("v{i}"), &["time", "y", "x"]).unwrap();
+            }
+        }
+        let secs = std::time::Duration::from_secs;
+        let t = std::time::Instant::now();
+        let nc = NcFile::open(&p).unwrap();
+        let took = t.elapsed();
+        assert!(!nc.backend_is_hdf5());
+        assert_eq!(plottable(&nc.meta.root), 2000);
+        // With a full walk resolving scale paths, the open took about 85 s
+        // (debug build); now about 5 s, nearly all of it outside the check.
+        assert!(took < secs(30), "open took {took:?}");
+
+        let h5 = H5File::open(&nc.c_path).unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(count_plottable(&h5).unwrap(), 2000, "the hidden check counts what netCDF-C shows");
+        let count = t.elapsed();
+        assert!(count < secs(2), "count took {count:?}");
+
+        // The full walk (used when the backend switches) names dimensions by
+        // scale token, not by searching the file for each scale's path.
+        let t = std::time::Instant::now();
+        let root = read_h5_meta(&h5, &p).unwrap();
+        let full = t.elapsed();
+        assert_eq!(root.dims.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["time", "y", "x"]);
+        assert!(root.vars.iter().all(|v| v.dims == ["time", "y", "x"]));
+        assert!(full < secs(10), "full walk took {full:?}");
+        eprintln!("many_variables_open_quickly: open {took:?}, count {count:?}, full walk {full:?}");
     }
 }
