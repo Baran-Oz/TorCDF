@@ -3655,6 +3655,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "egui_plot",
+ "png",
  "pollster",
  "rayon",
  "rfd",

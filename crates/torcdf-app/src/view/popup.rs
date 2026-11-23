@@ -58,6 +58,8 @@ pub struct Popup {
     pub north: Vec<Option<f32>>,
     pub show_east: bool,
     pub show_north: bool,
+    /// The window's rectangle as drawn last frame (for the PNG save).
+    pub rect: Option<eframe::egui::Rect>,
     pub error: Option<String>,
     /// Name of the dimension `along` (the CSV's first column).
     along_name: String,
@@ -183,6 +185,7 @@ impl Popup {
             north: Vec::new(),
             show_east: false,
             show_north: false,
+            rect: None,
             error: None,
             along_name: String::new(),
             east_name,

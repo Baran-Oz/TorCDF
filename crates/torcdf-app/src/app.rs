@@ -23,10 +23,25 @@ use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO, candidates};
 use crate::view::defaults::{AxisChoice, ViewKind};
 use crate::view::playback::{FPS_RANGE, Playback, Tick, frame_bytes};
 use crate::view::popup::{Popup, PopupKind, PopupSet};
+use crate::view::png_export;
 use crate::view::var_view::{Display, ImageState, VarView};
 
 /// A CSV save: `None` when the dialog was cancelled, else the write result.
 type SaveOutcome = Option<Result<(), String>>;
+
+/// A PNG save: `None` when the dialog was cancelled, else the saved file's
+/// name or the error.
+type PngOutcome = Option<Result<String, String>>;
+
+/// A screenshot asked for and not yet delivered: what to cut out of it.
+struct Shot {
+    rx: Receiver<Arc<egui::ColorImage>>,
+    rect: egui::Rect,
+    ppp: f32,
+    name: String,
+    /// The pop-up being saved; `None` for the plot area.
+    popup: Option<u64>,
+}
 
 /// How long a pop-up click message (`VarView::flash`) stays in the plot area.
 const NOTICE_TIME: std::time::Duration = std::time::Duration::from_secs(4);
@@ -171,6 +186,9 @@ pub enum Action {
     /// A click in a pop-up: move the slider of that dimension (plan P7).
     JumpTo { file: u64, dim_name: String, index: usize },
     SavePopupCsv(u64),
+    /// Save the plot area with its colour bar as a PNG.
+    SaveImage,
+    SavePopupPng(u64),
     /// Animate the playback dimension (locks the colour range as shown).
     Play,
     Pause,
@@ -200,6 +218,12 @@ pub struct TorApp {
     pub panel_tab: PanelTab,
     /// Pop-up id and its CSV save: `None` when the dialog was cancelled.
     saves: Vec<(u64, Job<SaveOutcome>)>,
+    /// The central plot area (colour bar included) as drawn last frame.
+    plot_rect: Option<egui::Rect>,
+    /// Screenshots requested, waiting to arrive.
+    shots: Vec<Shot>,
+    /// PNG encodes and saves in progress.
+    png_saves: Vec<Job<PngOutcome>>,
     service: SliceService,
     /// The service's cache budget (read-ahead holds at most an eighth).
     cache_budget: usize,
@@ -241,6 +265,9 @@ impl TorApp {
             arrow_layer: None,
             panel_tab: PanelTab::Plot,
             saves: Vec::new(),
+            plot_rect: None,
+            shots: Vec::new(),
+            png_saves: Vec::new(),
             service,
             cache_budget,
             playback: None,
@@ -302,6 +329,7 @@ impl TorApp {
             }
         }
         self.popups.poll();
+        self.poll_png();
         let mut i = 0;
         while i < self.saves.len() {
             let Some(r) = self.saves[i].1.poll() else {
@@ -885,6 +913,15 @@ impl TorApp {
                 });
                 self.saves.push((id, job));
             }
+            Action::SaveImage => {
+                let (Some(v), Some(rect)) = (&self.view, self.plot_rect) else { return };
+                self.request_shot(rect, png_export::default_name(v), None);
+            }
+            Action::SavePopupPng(id) => {
+                let Some(p) = self.popups.list.iter().find(|p| p.id == id) else { return };
+                let Some(rect) = p.rect else { return };
+                self.request_shot(rect, png_export::popup_name(&p.var_name), Some(id));
+            }
             Action::Play => {
                 let (Some(pb), Some(v)) = (&mut self.playback, &mut self.view) else { return };
                 if !v.slider_dims().contains(&pb.dim) {
@@ -960,6 +997,75 @@ fn selected_attrs<'a>(files: &'a [OpenFile], sel: Option<&Selection>) -> Option<
     }
 }
 
+impl TorApp {
+    /// Asks for a screenshot; `rect` is cut out of it when it arrives.
+    fn request_shot(&mut self, rect: egui::Rect, name: String, popup: Option<u64>) {
+        if self.shots.iter().any(|s| s.popup == popup) {
+            return;
+        }
+        let (tx, rx) = channel();
+        let wake = self.ctx.clone();
+        self.ctx.request_screenshot(move |image| {
+            let _ = tx.send(image);
+            wake.request_repaint();
+        });
+        self.shots.push(Shot { rx, rect, ppp: self.ctx.pixels_per_point(), name, popup });
+    }
+
+    /// Screenshots that arrived go to a save job (crop, encode, dialog,
+    /// write); finished jobs report in the plot area or the error banner.
+    fn poll_png(&mut self) {
+        let mut i = 0;
+        while i < self.shots.len() {
+            match self.shots[i].rx.try_recv() {
+                Err(TryRecvError::Empty) => i += 1,
+                Err(TryRecvError::Disconnected) => {
+                    self.shots.remove(i);
+                    self.errors.push("The screenshot could not be taken.".into());
+                }
+                Ok(image) => {
+                    let s = self.shots.remove(i);
+                    let job = Job::spawn(&self.ctx, move || {
+                        let cut = png_export::crop(&image, s.rect, s.ppp);
+                        let png = match png_export::encode_png(&cut) {
+                            Ok(b) => b,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        let path = rfd::FileDialog::new()
+                            .set_title("Save as PNG")
+                            .set_file_name(s.name)
+                            .add_filter("PNG image", &["png"])
+                            .save_file()?;
+                        Some(match std::fs::write(&path, png) {
+                            Ok(()) => Ok(file_name(&path)),
+                            Err(e) => Err(format!("Cannot save {}: {e}", path.display())),
+                        })
+                    });
+                    self.png_saves.push(job);
+                }
+            }
+        }
+        let mut i = 0;
+        while i < self.png_saves.len() {
+            let Some(r) = self.png_saves[i].poll() else {
+                i += 1;
+                continue;
+            };
+            self.png_saves.remove(i);
+            match r {
+                Ok(Some(Ok(name))) => {
+                    if let Some(v) = &mut self.view {
+                        v.set_flash(format!("Saved {name}"), NOTICE_TIME);
+                    }
+                }
+                Ok(Some(Err(e))) => self.errors.push(e),
+                Err(()) => self.errors.push("The PNG could not be saved.".into()),
+                Ok(None) => {}
+            }
+        }
+    }
+}
+
 /// A new map view of the same file keeps the projection, overlay switches
 /// and camera of the map it replaces; any other view starts from defaults.
 fn keep_map_settings(v: &mut VarView, old: Option<&crate::view::map_state::MapState>) {
@@ -1020,6 +1126,10 @@ impl eframe::App for TorApp {
         }
 
         let mut actions = Vec::new();
+        let save_key = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+        if self.view.is_some() && ui.ctx().input_mut(|i| i.consume_shortcut(&save_key)) {
+            actions.push(Action::SaveImage);
+        }
         egui::Panel::top("menu").show(ui, |ui| ui::menu_bar(ui, self.view.as_ref(), &mut actions));
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| ui::error_banners(ui, &self.errors, &mut actions));
@@ -1053,18 +1163,18 @@ impl eframe::App for TorApp {
             let pb = self.playback.as_ref();
             egui::Panel::bottom("sliders").show(ui, |ui| ui::slider_strip(ui, v, pb, &mut actions));
         }
-        let uploaded = egui::CentralPanel::default()
-            .show(ui, |ui| {
-                plot_area::show(
-                    ui,
-                    self.view.as_mut(),
-                    &self.display,
-                    frame.wgpu_render_state(),
-                    &self.popups,
-                    &mut actions,
-                )
-            })
-            .inner;
+        let central = egui::CentralPanel::default().show(ui, |ui| {
+            plot_area::show(
+                ui,
+                self.view.as_mut(),
+                &self.display,
+                frame.wgpu_render_state(),
+                &self.popups,
+                &mut actions,
+            )
+        });
+        let uploaded = central.inner;
+        self.plot_rect = Some(central.response.rect);
         let current = self.view.as_ref().map(|v| (v.file_id, &v.var.dims[..], &v.slider_pos[..]));
         ui::popup::show_all(ui.ctx(), &mut self.popups, current, &mut actions);
         ui::drop_overlay(ui.ctx());
@@ -1149,6 +1259,9 @@ impl TorApp {
             arrow_layer: None,
             panel_tab: PanelTab::Plot,
             saves: Vec::new(),
+            plot_rect: None,
+            shots: Vec::new(),
+            png_saves: Vec::new(),
             service,
             cache_budget,
             playback: None,

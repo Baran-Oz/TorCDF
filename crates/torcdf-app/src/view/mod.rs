@@ -6,3 +6,4 @@ pub mod arrow_layer;
 pub mod popup;
 pub mod click;
 pub mod playback;
+pub mod png_export;

@@ -39,11 +39,12 @@ pub fn show_all(
 ) {
     for p in &mut set.list {
         let mut open = true;
-        egui::Window::new(p.title.clone())
+        let shown = egui::Window::new(p.title.clone())
             .id(egui::Id::NULL.with(("popup", p.id)))
             .default_size([440.0, 330.0])
             .open(&mut open)
             .show(ctx, |ui| contents(ui, p, current, actions));
+        p.rect = shown.map(|r| r.response.rect);
         if !open {
             actions.push(Action::ClosePopup(p.id));
         }
@@ -63,6 +64,9 @@ fn contents(ui: &mut egui::Ui, p: &mut Popup, current: Option<Current<'_>>, acti
         ui.toggle_value(&mut p.pinned, "Pin").on_hover_text("Keep this pop-up when another point is clicked");
         if ui.button("Save CSV…").clicked() {
             actions.push(Action::SavePopupCsv(p.id));
+        }
+        if ui.button("PNG").clicked() {
+            actions.push(Action::SavePopupPng(p.id));
         }
         if p.has_components() {
             ui.separator();
