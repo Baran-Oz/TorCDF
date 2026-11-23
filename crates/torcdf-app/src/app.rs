@@ -351,15 +351,17 @@ impl TorApp {
             let found = self.files.iter().find(|f| f.id == *id);
             let pair = found.and_then(|f| Some((f.nc.clone(), f.nc.pair(path)?)));
             let var = found.and_then(|f| f.nc.meta.var(path).map(|v| (f.nc.clone(), v.clone())));
-            // Dropping the old view drops its pending request (cancelling it).
-            self.view = None;
+            // Dropping the old view drops its pending request (cancelling it);
+            // its map settings may carry over to a map of the same file.
+            let old_map = self.view.take().filter(|v| v.file_id == *id).and_then(|v| v.map);
             // Its playback (and so its read-ahead) goes with it.
             self.playback = None;
             if let Some((nc, pair)) = pair {
                 self.log.log(format_args!("select {}", pair.path));
                 // A pair's own entry draws its own arrows.
                 self.arrow_layer = Some(ArrowLayer::of_pair(*id, pair.clone()));
-                let v = VarView::new_vector(&self.ctx, *id, nc, pair);
+                let mut v = VarView::new_vector(&self.ctx, *id, nc, pair);
+                keep_map_settings(&mut v, old_map.as_ref());
                 self.show_view(v);
             } else if let Some((nc, var)) = var {
                 self.log.log(format_args!("select {}", var.path));
@@ -371,7 +373,8 @@ impl TorApp {
                 }
                 // Picks refused over the previous variable may fit this one.
                 let retry = keep && self.arrow_layer.as_ref().is_some_and(|l| l.pair.is_none() && !l.missing_picks());
-                let v = self.x_view(*id, nc, var);
+                let mut v = self.x_view(*id, nc, var);
+                keep_map_settings(&mut v, old_map.as_ref());
                 self.show_view(v);
                 if retry {
                     self.pair_from_picks(true);
@@ -856,7 +859,7 @@ impl TorApp {
                 if self.saves.iter().any(|(s, _)| *s == id) {
                     return;
                 }
-                let (csv, name) = (p.csv(), format!("{}.csv", p.var_name));
+                let (csv, name) = (p.csv_file_bytes(), format!("{}.csv", p.var_name));
                 // The dialog and the write block, so they get their own thread.
                 let job = Job::spawn(&self.ctx, move || {
                     let path = rfd::FileDialog::new()
@@ -940,6 +943,14 @@ fn selected_attrs<'a>(files: &'a [OpenFile], sel: Option<&Selection>) -> Option<
             let v = file(id)?.nc.meta.var(path)?;
             Some((v.path.clone(), &v.attrs[..]))
         }
+    }
+}
+
+/// A new map view of the same file keeps the projection, overlay switches
+/// and camera of the map it replaces; any other view starts from defaults.
+fn keep_map_settings(v: &mut VarView, old: Option<&crate::view::map_state::MapState>) {
+    if let (Some(new), Some(old)) = (&mut v.map, old) {
+        new.inherit_view(old);
     }
 }
 
@@ -1478,6 +1489,28 @@ mod tests {
         let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir));
         app.apply(Action::Select(Selection::Var(1, "/ocean/uo".into())));
         app
+    }
+
+    #[test]
+    fn map_settings_survive_variable_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        let default_proj = app.view.as_ref().unwrap().map.as_ref().expect("uo is a map").camera.proj;
+        {
+            let m = app.view.as_mut().unwrap().map.as_mut().unwrap();
+            m.set_projection(crate::map::projection::Projection::Mercator);
+            m.coast = !m.coast;
+            m.borders = !m.borders;
+            m.grid = !m.grid;
+        }
+        let before = {
+            let m = app.view.as_ref().unwrap().map.as_ref().unwrap();
+            (m.camera, m.coast, m.borders, m.grid)
+        };
+        assert_ne!(before.0.proj, default_proj);
+        app.apply(Action::Select(Selection::Var(1, "/ocean/vo".into())));
+        let m = app.view.as_ref().unwrap().map.as_ref().expect("vo is a map");
+        assert_eq!((m.camera, m.coast, m.borders, m.grid), before);
     }
 
     #[test]

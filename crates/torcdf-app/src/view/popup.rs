@@ -276,6 +276,14 @@ impl Popup {
         }
     }
 
+    /// The CSV as written to a file: UTF-8 with a byte order mark, so Excel
+    /// reads units such as "degC" right.
+    pub fn csv_file_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0xEF, 0xBB, 0xBF];
+        out.extend_from_slice(self.csv().as_bytes());
+        out
+    }
+
     /// The plotted data as CSV: the coordinate (ISO dates when time
     /// decodes), the value, and the vector components when shown. Missing or
     /// unloaded values are empty fields.
@@ -662,6 +670,18 @@ mod tests {
         p.time = None;
         p.var_name = "a,b".into();
         assert_eq!(p.csv().lines().next(), Some("time,\"a,b (m s-1)\""));
+    }
+
+    #[test]
+    fn csv_starts_with_bom() {
+        let d = tempfile::tempdir().unwrap();
+        let v = view_of(fixtures::write_nc4(d.path()), "/ocean/uo");
+        let svc = SliceService::new(1 << 20, 1, noop());
+        let mut p = bare(1, &svc, &v);
+        p.units = Some("\u{b0}C".into());
+        let bytes = p.csv_file_bytes();
+        assert_eq!(&bytes[..3], [0xEF, 0xBB, 0xBF]);
+        assert_eq!(&bytes[3..], p.csv().as_bytes());
     }
 
     #[test]

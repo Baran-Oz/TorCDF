@@ -11,6 +11,7 @@ use crate::map::arrows::ArrowSpace;
 use crate::map::tiles::TileSpec;
 use crate::render::arrows::{ARROW_IMAGE_ID, ArrowParams, image_affine, paint_arrows};
 use crate::render::image::{self as gpu, ImageParams};
+use crate::view::click::ClickStep;
 use crate::view::arrow_state::{ArrowKey, image_input};
 use crate::view::defaults::{AxisChoice, ViewKind};
 use crate::app::Action;
@@ -56,9 +57,9 @@ pub fn show(
     if let Some(p) = v.arrows.as_ref().filter(|a| a.on).and_then(|a| a.problem.as_ref()) {
         ui.colored_label(ui.visuals().warn_fg_color, p);
     }
-    match v.kind {
-        ViewKind::Map => map_view::show(ui, v, display, rs, popups, actions),
-        ViewKind::Image => image(ui, v, display, rs, popups, actions),
+    let uploaded = match v.kind {
+        ViewKind::Map => map_view::show(ui, v, display, rs, popups),
+        ViewKind::Image => image(ui, v, display, rs, popups),
         ViewKind::Line => {
             line(ui, v);
             false
@@ -67,7 +68,15 @@ pub fn show(
             table(ui, v);
             false
         }
+    };
+    // A single click opens its pop-up once no second click can follow.
+    let double_click_time = ui.ctx().options(|o| o.input_options.max_double_click_delay);
+    match v.pending_click.poll(std::time::Instant::now(), double_click_time) {
+        Ok((iy, ix, lonlat)) => actions.push(Action::OpenPopup { iy, ix, lonlat }),
+        Err(ClickStep::Wait(left)) => ui.ctx().request_repaint_after(left),
+        Err(_) => {}
     }
+    uploaded
 }
 
 fn attr<'a>(v: &'a VarView, name: &str) -> Option<&'a str> {
@@ -96,7 +105,6 @@ fn image(
     display: &Display,
     rs: Option<&RenderState>,
     popups: &PopupSet,
-    actions: &mut Vec<Action>,
 ) -> bool {
     let Some(axes) = v.axes else {
         ui.weak("This variable has no two dimensions to draw as an image.");
@@ -177,13 +185,17 @@ fn image(
         }
     }
     // A click (no drag) opens a pop-up at the cell under it.
+    // It waits out the double-click time first (see `show`): a double-click
+    // only fits the view.
     if resp.clicked()
+        && !resp.double_clicked()
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some((r, c)) = cell_at(pos, rect, view, flip_y, ny, nx)
     {
-        actions.push(Action::OpenPopup { iy: y0 + r * sy, ix: x0 + c * sx, lonlat: None });
+        v.pending_click.click(std::time::Instant::now(), (y0 + r * sy, x0 + c * sx, None));
     }
     if resp.double_clicked() {
+        v.pending_click.cancel();
         view = fit(v);
         v.image.fitted_to = rect.size();
         v.image.user_moved = false;

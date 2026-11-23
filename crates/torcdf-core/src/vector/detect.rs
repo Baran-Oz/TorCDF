@@ -306,6 +306,8 @@ fn name_match(e: &VarInfo, n: &VarInfo) -> Option<String> {
         ("uu", "vv"),
         ("ubar", "vbar"),
     ];
+    // Stems of fields that merely end in u/v (masks, map factors, coordinates).
+    const NOT_VELOCITY: [&str; 7] = ["mask", "mapfac", "lat", "lon", "xlat", "xlong", "area"];
     let (a, b) = (e.name.to_ascii_lowercase(), n.name.to_ascii_lowercase());
     // ASCII lowercasing keeps byte offsets, so `e.name` slices like `a`.
     // `u_<s>`/`v_<s>`, then `<p>_u`/`<p>_v`, then `<p>u`/`<p>v`.
@@ -320,6 +322,7 @@ fn name_match(e: &VarInfo, n: &VarInfo) -> Option<String> {
                 .map(|p| &e.name[..p.len()])
         });
     match pattern {
+        Some(stem) if NOT_VELOCITY.contains(&stem.trim_matches('_').to_ascii_lowercase().as_str()) => None,
         Some(stem) => Some(stem_or_vector(stem)),
         None if LISTED.contains(&(a.as_str(), b.as_str())) => Some("vector".into()),
         None => None,
@@ -850,6 +853,14 @@ mod tests {
             ("VMDR", YX, &[("standard_name", "sea_surface_wave_from_direction")]),
         ]);
         assert!(detect_pairs(&ds).is_empty());
+    }
+
+    #[test]
+    fn mask_and_mapfac_not_paired() {
+        let ds = ds_with(&[("mask_u", YX, &[]), ("mask_v", YX, &[]), ("MAPFAC_U", YX, &[]), ("MAPFAC_V", YX, &[])]);
+        assert!(detect_pairs(&ds).is_empty());
+        let ds = ds_with(&[("wind_u", YX, &[]), ("wind_v", YX, &[])]);
+        assert_eq!(detect_pairs(&ds).len(), 1);
     }
 
     #[test]

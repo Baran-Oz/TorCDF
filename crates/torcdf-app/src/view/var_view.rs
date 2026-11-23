@@ -17,6 +17,7 @@ use crate::render::colormap::Colormap;
 use crate::render::image::ImageLayer;
 use crate::ui::{inspector, plot_area};
 use crate::view::arrow_state::ArrowState;
+use crate::view::click::PendingClick;
 use crate::view::defaults::{
     AxisChoice, ViewKind, auto_range, build_request, choose_axes, choose_view, tile_request,
 };
@@ -167,6 +168,8 @@ pub struct VarView {
     /// goes; shown under `notice`, which it never replaces.
     pub flash: Option<(String, Instant)>,
     pub hover: Option<Hover>,
+    /// A click waiting out the double-click time before it opens a pop-up.
+    pub pending_click: PendingClick<(usize, usize, Option<(f64, f64)>)>,
     /// The vector pair shown, when this view is of one.
     pub vector: Option<Arc<VectorPair>>,
     /// Its staggering, rotation and centre coordinates, once resolved.
@@ -278,6 +281,7 @@ impl VarView {
             notice,
             flash: None,
             hover: None,
+            pending_click: PendingClick::default(),
             vector: None,
             resolved: None,
             arrows: None,
@@ -304,7 +308,10 @@ impl VarView {
         let (time_dim, time_units) = time_axis(ds, &var, &mut coord_paths);
         let mut kind = ViewKind::Map;
         let mut notice = None;
-        if !regular && var.shape[hy].saturating_mul(var.shape[hx]) > CURV_MAX_CELLS {
+        if pair.centre_lat.is_none() {
+            // Nothing says where it is: an image, without a map notice.
+            kind = ViewKind::Image;
+        } else if !regular && var.shape[hy].saturating_mul(var.shape[hx]) > CURV_MAX_CELLS {
             kind = ViewKind::Image;
             notice = Some(map_notice(&format!(
                 "its 2-D latitude/longitude has more than {} million cells",
@@ -341,6 +348,7 @@ impl VarView {
             notice,
             flash: None,
             hover: None,
+            pending_click: PendingClick::default(),
             vector: Some(pair),
             resolved: None,
             arrows: Some(ArrowState::default()),
@@ -902,6 +910,20 @@ mod tests {
             assert!(t0.elapsed().as_secs() < 20, "coords job timed out");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn pair_without_latlon_starts_as_image() {
+        let d = tempfile::tempdir().unwrap();
+        let nc = Arc::new(NcFile::open(&fixtures::vectors::write_noclue(d.path(), false)).unwrap());
+        // The fixture carries 2-D lat/lon; drop them from the pair, as when none is found.
+        let mut pair = (*nc.pairs().into_iter().next().expect("u/v pair")).clone();
+        pair.centre_lat = None;
+        pair.centre_lon = None;
+        let pair = Arc::new(pair);
+        let v = VarView::new_vector(&egui::Context::default(), 1, nc, pair);
+        assert_eq!(v.kind, ViewKind::Image);
+        assert!(v.map.is_none());
     }
 
     #[test]

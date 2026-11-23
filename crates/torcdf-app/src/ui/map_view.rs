@@ -20,7 +20,6 @@ use crate::render::map_curv::paint_curvilinear;
 use crate::render::map_regular::{MapParams, paint_regular};
 use crate::view::arrow_state::{ArrowKey, IndexWindow, map_lonlat};
 use crate::view::defaults::AxisChoice;
-use crate::app::Action;
 use crate::ui::popup::draw_markers;
 use crate::view::popup::{Popup, PopupSet};
 use crate::view::map_state::{BORDERS_ID, COAST_ID, GRID_ID, UploadFailure};
@@ -52,7 +51,6 @@ pub fn show(
     display: &Display,
     rs: Option<&RenderState>,
     popups: &PopupSet,
-    actions: &mut Vec<Action>,
 ) -> bool {
     // A failed background job shows once here; it is not retried.
     if let Some(m) = &v.map {
@@ -98,15 +96,19 @@ pub fn show(
         }
     }
     // A click (no drag) opens a pop-up at the cell under it; off the grid it does nothing.
+    // It waits out the double-click time first (see `plot_area::show`): a
+    // double-click only fits the view.
     if resp.clicked()
+        && !resp.double_clicked()
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some((lon, lat)) = map.camera.screen_to_lonlat(pos, rect)
         && let Some(loc) = &map.locator
         && let Some((iy, ix)) = loc.nearest(lon, lat)
     {
-        actions.push(Action::OpenPopup { iy, ix, lonlat: Some((lon, lat)) });
+        v.pending_click.click(std::time::Instant::now(), (iy, ix, Some((lon, lat))));
     }
     if resp.double_clicked() {
+        v.pending_click.cancel();
         map.request_fit();
         map.fit_if_needed(rect);
     }
