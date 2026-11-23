@@ -385,6 +385,9 @@ mod tests {
         p.start(t0);
         p.hold(2);
         wait_ready(&mut p, t0, 1, 24, &svc, &f, &reqs, 3);
+        // Frame 2's read is done too (`frame_ready` ignores the hold), so
+        // after the release nothing but the hold could have kept it back.
+        wait_ready(&mut p, t0, 1, 24, &svc, &f, &reqs, 2);
         let step = Duration::from_secs_f32(1.0 / p.fps);
         for k in 1..=5 {
             let at = t0 + step * k;
