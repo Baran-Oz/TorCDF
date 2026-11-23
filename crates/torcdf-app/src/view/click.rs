@@ -22,6 +22,9 @@ pub fn click_decision(now: Instant, last_click: Option<Instant>, double_click_ti
     if age >= window { ClickStep::Open } else { ClickStep::Wait(window - age) }
 }
 
+/// Where a pop-up opens: `(iy, ix)` and the map position clicked, if a map.
+pub type ClickTarget = (usize, usize, Option<(f64, f64)>);
+
 /// The click waiting to open a pop-up, with its target.
 #[derive(Debug, Clone, Default)]
 pub struct PendingClick<T> {

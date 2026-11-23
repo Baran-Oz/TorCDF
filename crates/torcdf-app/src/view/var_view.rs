@@ -17,7 +17,7 @@ use crate::render::colormap::Colormap;
 use crate::render::image::ImageLayer;
 use crate::ui::{inspector, plot_area};
 use crate::view::arrow_state::ArrowState;
-use crate::view::click::PendingClick;
+use crate::view::click::{ClickTarget, PendingClick};
 use crate::view::defaults::{
     AxisChoice, ViewKind, auto_range, build_request, choose_axes, choose_view, tile_request,
 };
@@ -169,7 +169,7 @@ pub struct VarView {
     pub flash: Option<(String, Instant)>,
     pub hover: Option<Hover>,
     /// A click waiting out the double-click time before it opens a pop-up.
-    pub pending_click: PendingClick<(usize, usize, Option<(f64, f64)>)>,
+    pub pending_click: PendingClick<ClickTarget>,
     /// The vector pair shown, when this view is of one.
     pub vector: Option<Arc<VectorPair>>,
     /// Its staggering, rotation and centre coordinates, once resolved.
