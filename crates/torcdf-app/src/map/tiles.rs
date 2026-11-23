@@ -65,31 +65,35 @@ const _: () = assert!(OVERVIEW_TARGET <= MAX_SIDE);
 /// Sample points per screen axis (edges included).
 const SAMPLES: usize = 33;
 
-/// Plans 0, 1 or 2 strided detail tiles covering the visible window.
+/// The visible part of a grid, before any margin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisibleWindows {
+    /// Inclusive row window.
+    pub y: (usize, usize),
+    /// Inclusive column windows (two when the view crosses a wrapping seam).
+    pub x: Vec<(usize, usize)>,
+    /// Points per full-resolution cell on screen, `[y, x]`.
+    pub cell_pt: [f64; 2],
+}
+
+/// The core windows of the cells visible in `rect`.
 ///
 /// The rect is sampled on a 33 x 33 grid (points evenly spaced, edges
 /// included) through the camera and `loc.nearest`; misses are skipped. The
 /// window is the hit bounding box (on a lon-wrapping grid: the complement of
 /// the largest circular gap in the hit columns, split in two when it crosses
-/// the seam), widened by 10% per side and clamped to `full`. The plan also
-/// keeps each tile's window before the margin (`core`).
-///
-/// `window_px`, the framebuffer extent the window covers on an axis, is
-/// `rect_px * hit_fraction * window_cells / hit_cells`, where `hit_fraction`
-/// is the share of sample rows (columns) that hit the grid.
-pub fn plan_detail(
+/// the seam). `cell_pt` is `rect_pt * hit_fraction / core_cells`, where
+/// `hit_fraction` is the share of sample rows (columns) that hit the grid.
+pub fn visible_windows(
     loc: &CellLocator,
     full: [usize; 2],
     cam: &MapCamera,
     rect: Rect,
-    pixels_per_point: f32,
-    overview: &TileSpec,
-) -> DetailPlan {
-    let ppp = pixels_per_point as f64;
-    let rect_px = [rect.height() as f64 * ppp, rect.width() as f64 * ppp];
+) -> Option<VisibleWindows> {
+    let rect_pt = [rect.height() as f64, rect.width() as f64];
     let sane = |v: f64| v.is_finite() && v > 0.0;
-    if full.contains(&0) || !sane(rect_px[0]) || !sane(rect_px[1]) {
-        return DetailPlan::default();
+    if full.contains(&0) || !sane(rect_pt[0]) || !sane(rect_pt[1]) {
+        return None;
     }
     let (mut ys, mut xs) = (Vec::new(), Vec::new());
     // Sample rows / columns that hit: [min, max].
@@ -114,7 +118,7 @@ pub fn plan_detail(
         }
     }
     if ys.is_empty() {
-        return DetailPlan::default();
+        return None;
     }
     let frac = |a: usize| (span[a][1] - span[a][0] + 1) as f64 / SAMPLES as f64;
 
@@ -137,6 +141,36 @@ pub fn plan_detail(
             x_core = vec![(xs[i], full[1] - 1), (0, xs[i - 1])];
         }
     }
+    let core_cells = [y_core.1 - y_core.0 + 1, x_core.iter().map(|&(l, h)| h - l + 1).sum::<usize>()];
+    let cell_pt = [0, 1].map(|a| rect_pt[a] * frac(a) / core_cells[a] as f64);
+    Some(VisibleWindows { y: y_core, x: x_core, cell_pt })
+}
+
+/// Plans 0, 1 or 2 strided detail tiles covering the visible window.
+///
+/// The window is `visible_windows`, widened by 10% per side and clamped to
+/// `full`. The plan also keeps each tile's window before the margin (`core`).
+///
+/// `window_px`, the framebuffer extent the window covers on an axis, is
+/// `rect_px * hit_fraction * window_cells / hit_cells`, where `hit_fraction`
+/// is the share of sample rows (columns) that hit the grid.
+pub fn plan_detail(
+    loc: &CellLocator,
+    full: [usize; 2],
+    cam: &MapCamera,
+    rect: Rect,
+    pixels_per_point: f32,
+    overview: &TileSpec,
+) -> DetailPlan {
+    let ppp = pixels_per_point as f64;
+    if !(ppp.is_finite() && ppp > 0.0) {
+        return DetailPlan::default();
+    }
+    let Some(vis) = visible_windows(loc, full, cam, rect) else {
+        return DetailPlan::default();
+    };
+    let (y_core, x_core) = (vis.y, vis.x);
+    let x_total: usize = x_core.iter().map(|&(l, h)| h - l + 1).sum();
 
     // 10% margin on each side of the whole window, clamped to the grid.
     let widen = |(lo, hi): (usize, usize), total: usize, n: usize| {
@@ -144,16 +178,14 @@ pub fn plan_detail(
         (lo.saturating_sub(m), (hi + m).min(n - 1))
     };
     let y_win = widen(y_core, y_core.1 - y_core.0 + 1, full[0]);
-    let x_total: usize = x_core.iter().map(|&(l, h)| h - l + 1).sum();
     let x_win: Vec<(usize, usize)> = x_core.iter().map(|&w| widen(w, x_total, full[1])).collect();
 
     let cells = |ws: &[(usize, usize)]| ws.iter().map(|&(l, h)| h - l + 1).sum::<usize>();
-    let core_cells = [y_core.1 - y_core.0 + 1, x_total];
     let win_cells = [cells(&[y_win]), cells(&x_win)];
     let mut stride = [1usize; 2];
     let longest = [y_win.1 - y_win.0 + 1, x_win.iter().map(|&(l, h)| h - l + 1).max().unwrap_or(1)];
     for a in 0..2 {
-        let px = (rect_px[a] * frac(a) * win_cells[a] as f64 / core_cells[a] as f64).max(1.0);
+        let px = (vis.cell_pt[a] * ppp * win_cells[a] as f64).max(1.0);
         stride[a] = ((win_cells[a] as f64 / px).floor() as usize).max(1);
         // Never coarser than the overview on any axis, then the texture cap.
         // For the app's overview (OVERVIEW_TARGET <= MAX_SIDE per side) the
