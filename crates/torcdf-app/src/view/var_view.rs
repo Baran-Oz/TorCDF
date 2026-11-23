@@ -8,7 +8,7 @@ use eframe::egui;
 use torcdf_core::cf::{Geo, TimeUnits, detect_axes, detect_geo};
 use torcdf_core::{
     CoreError, DType, NcFile, RequestHandle, Resolved, Slice, SliceRequest, SliceService, VarInfo,
-    VectorPair,
+    VectorPair, layer_path,
 };
 
 use crate::app::Job;
@@ -134,7 +134,11 @@ pub struct TextTable {
 pub struct VarView {
     pub file_id: u64,
     pub nc: Arc<NcFile>,
+    /// What the view reads: a variable, a pair, or (layered views) a
+    /// variable with a pair's arrows, at the layer path.
     pub var: VarInfo,
+    /// Layered views: the coloured variable's own path; `None` otherwise.
+    pub base: Option<String>,
     pub kind: ViewKind,
     default_kind: ViewKind,
     pub axes: Option<AxisChoice>,
@@ -170,6 +174,45 @@ pub struct VarView {
 
 impl VarView {
     pub(crate) fn new(ctx: &egui::Context, file_id: u64, nc: Arc<NcFile>, var: VarInfo) -> VarView {
+        VarView::build(ctx, file_id, nc, var, None)
+    }
+
+    /// Plain variable `x` coloured, with `pair`'s arrows on top: the view
+    /// reads the layer path, so slices carry `x`'s values and the pair's
+    /// east/north. `x`'s coordinates stay the view's; the coords job also
+    /// resolves the pair (for its notes and the rotation switch).
+    pub(crate) fn new_layered(
+        ctx: &egui::Context,
+        file_id: u64,
+        nc: Arc<NcFile>,
+        x: VarInfo,
+        pair: Arc<VectorPair>,
+    ) -> VarView {
+        let base = x.path.clone();
+        let mut v = VarView::build(ctx, file_id, nc, x, Some(pair.clone()));
+        v.var.path = layer_path(&base, &pair.path);
+        v.base = Some(base);
+        v.vector = Some(pair);
+        let mut arrows = ArrowState::default();
+        arrows.on = true;
+        v.arrows = Some(arrows);
+        v
+    }
+
+    /// The variable's own path: `x`'s for a layered view, else the view's.
+    pub fn plain_path(&self) -> &str {
+        self.base.as_deref().unwrap_or(&self.var.path)
+    }
+
+    /// A view of plain variable `var`; its coords job also resolves `pair`
+    /// when there is one.
+    fn build(
+        ctx: &egui::Context,
+        file_id: u64,
+        nc: Arc<NcFile>,
+        var: VarInfo,
+        pair: Option<Arc<VectorPair>>,
+    ) -> VarView {
         let ds = &nc.meta;
         let kind = choose_view(ds, &var);
         let geo = detect_geo(ds, &var);
@@ -199,9 +242,16 @@ impl VarView {
         }
         let map = (kind == ViewKind::Map).then(|| MapState::new(&geo));
         let job_nc = nc.clone();
-        let coords_job = Some(Job::spawn(ctx, move || load_coords(&job_nc, &coord_paths, curv)));
+        let coords_job = Some(Job::spawn(ctx, move || {
+            let mut coords = load_coords(&job_nc, &coord_paths, curv);
+            if let Some(p) = pair {
+                coords.vector = Some(job_nc.resolve_vector(&p).map_err(|e| e.to_string()));
+            }
+            coords
+        }));
         VarView {
             file_id,
+            base: None,
             axes: choose_axes(ds, &var),
             slider_pos: vec![0; var.shape.len()],
             nc,
@@ -264,6 +314,7 @@ impl VarView {
             Some(Job::spawn(ctx, move || load_vector_coords(&job_nc, &coord_paths, &job_pair)));
         VarView {
             file_id,
+            base: None,
             axes: Some(AxisChoice { y: hy, x: hx }),
             slider_pos: vec![0; var.shape.len()],
             nc,
@@ -638,10 +689,17 @@ impl VarView {
     /// grid kind follows the resolved centre coordinates.
     fn take_resolution(&mut self) -> Option<String> {
         let pair = self.vector.as_ref()?;
+        let layered = self.base.is_some();
         match self.coords.vector.take()? {
+            // A layered view keeps its variable's grid and view; only the
+            // arrows' notes are missing.
+            Err(e) if layered => {
+                self.notice.get_or_insert(e);
+                None
+            }
             Ok(r) => {
                 let regular = matches!(self.geo, Geo::Regular { .. });
-                if r.regular != regular && self.map.is_some() {
+                if !layered && r.regular != regular && self.map.is_some() {
                     self.geo = geo_of_pair(pair, r.regular);
                     self.map = Some(MapState::new(&self.geo));
                 }
@@ -849,6 +907,25 @@ mod tests {
         assert_eq!(v.kind, ViewKind::Map);
         assert_eq!(v.axes, Some(AxisChoice { y: 1, x: 2 }));
         assert_eq!(v.slider_dims(), vec![0]);
+    }
+
+    /// A layered view keeps its variable's coordinates and also resolves
+    /// the pair (for its notes and the rotation switch).
+    #[test]
+    fn layered_view_resolves_pair_on_own_grid() {
+        let d = tempfile::tempdir().unwrap();
+        let nc = Arc::new(NcFile::open(&fixtures::vectors::write_nemo_like(d.path())).unwrap());
+        let pair = nc.pairs().into_iter().next().expect("nemo pair detected");
+        let x = nc.meta.var("/thetao").unwrap().clone();
+        let mut v = VarView::new_layered(&egui::Context::default(), 1, nc, x, pair.clone());
+        assert_eq!(v.var.path, layer_path("/thetao", &pair.path));
+        assert_eq!(v.plain_path(), "/thetao");
+        let geo_before = format!("{:?}", v.geo);
+        poll_coords(&mut v);
+        assert!(v.resolved.is_some(), "pair resolved");
+        assert_eq!(format!("{:?}", v.geo), geo_before, "the variable's own grid");
+        assert_eq!(v.coords.curv.as_ref().expect("thetao's lat/lon").0.len(), 600);
+        assert!(v.arrows.as_ref().is_some_and(|a| a.on));
     }
 
     #[test]

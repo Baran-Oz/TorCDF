@@ -200,7 +200,7 @@ fn image(
         let c = cell_index(*p.point.get(axes.x)?, x0, sx, nx)?;
         Some(cell_centre_screen(r, c, rect, view, flip_y))
     };
-    draw_markers(&ui.painter().with_clip_rect(rect), popups, v.file_id, &v.var.path, &marker);
+    draw_markers(&ui.painter().with_clip_rect(rect), popups, v.file_id, v.plain_path(), &marker);
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
     let arrow = reference_arrow(v, arrows_drawn);

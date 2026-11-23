@@ -223,7 +223,8 @@ pub fn show(
         let w = map.camera.proj.forward(lon, lat)?;
         Some(map.camera.world_to_screen(w, rect)).filter(|s| rect.contains(*s))
     };
-    draw_markers(ui.painter(), popups, v.file_id, &v.var.path, &marker);
+    // Field by field: `map` is still borrowed (a layered view marks its own variable).
+    draw_markers(ui.painter(), popups, v.file_id, v.base.as_deref().unwrap_or(&v.var.path), &marker);
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
     if v.shown.is_some() && range.is_none() {

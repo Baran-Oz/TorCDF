@@ -12,12 +12,13 @@ use std::time::Instant;
 
 use eframe::egui;
 use torcdf_core::{
-    Attr, CoreError, DEFAULT_WORKERS, NcFile, RotateChoice, SliceService,
-    default_cache_budget_bytes, pair_by_hand,
+    Attr, CoreError, DEFAULT_WORKERS, DirConvention, NcFile, PairForm, RotateChoice, SliceService, VarInfo,
+    VectorPair, default_cache_budget_bytes, layer_path, pair_by_hand, pair_magdir_by_hand,
 };
 
 use crate::render::colormap::Colormap;
 use crate::ui::{self, inspector, plot_area, tree};
+use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO};
 use crate::view::defaults::ViewKind;
 use crate::view::playback::{FPS_RANGE, Playback, Tick, frame_bytes};
 use crate::view::popup::{Popup, PopupKind, PopupSet};
@@ -141,6 +142,7 @@ pub enum Selection {
 }
 
 /// What the panels asked for this frame; applied after drawing.
+#[cfg_attr(not(test), expect(dead_code, reason = "the Plot tab's Arrows section sends the arrow actions"))]
 pub enum Action {
     OpenDialog,
     Select(Selection),
@@ -148,11 +150,15 @@ pub enum Action {
     DismissError(usize),
     SliderMoved,
     SetKind(ViewKind),
-    /// Pair `east` and `north` of a file by hand.
-    PairWith { file: u64, east: String, north: String },
     /// Remove a pair (and its rotation variants) for this session.
     Unpair { file: u64, path: String },
     SetRotate(RotateChoice),
+    /// Arrows section: Off, x & y, or magnitude & direction.
+    SetArrowMode(ArrowMode),
+    /// Arrows section drop-down: slot 0 = x / magnitude, 1 = y / direction.
+    PickArrowVar { slot: usize, path: String },
+    /// Direction convention of the arrows' magnitude/direction pair.
+    SetConvention(DirConvention),
     FitView,
     /// A click on the map or image: pop up the series or profile there.
     OpenPopup { iy: usize, ix: usize, lonlat: Option<(f64, f64)> },
@@ -184,6 +190,8 @@ pub struct TorApp {
     pub view: Option<VarView>,
     pub display: Display,
     pub popups: PopupSet,
+    /// The window's arrow slot (the Plot tab's Arrows section).
+    pub arrow_layer: Option<ArrowLayer>,
     /// Pop-up id and its CSV save: `None` when the dialog was cancelled.
     saves: Vec<(u64, Job<SaveOutcome>)>,
     service: SliceService,
@@ -224,6 +232,7 @@ impl TorApp {
                 range: (0.0, 1.0),
             },
             popups: PopupSet::default(),
+            arrow_layer: None,
             saves: Vec::new(),
             service,
             cache_budget,
@@ -343,15 +352,151 @@ impl TorApp {
             self.playback = None;
             if let Some((nc, pair)) = pair {
                 self.log.log(format_args!("select {}", pair.path));
+                // A pair's own entry draws its own arrows.
+                self.arrow_layer = Some(ArrowLayer::of_pair(*id, pair.clone()));
                 let v = VarView::new_vector(&self.ctx, *id, nc, pair);
                 self.show_view(v);
             } else if let Some((nc, var)) = var {
                 self.log.log(format_args!("select {}", var.path));
-                let v = VarView::new(&self.ctx, *id, nc, var);
+                // Arrows never carry over between files; while Off, the
+                // pre-fill follows the selected variable.
+                let keep = self.arrow_layer.as_ref().is_some_and(|l| l.file == *id && l.mode != ArrowMode::Off);
+                if !keep {
+                    self.arrow_layer = Some(ArrowLayer::fresh(*id, &nc, &var));
+                }
+                let v = self.x_view(*id, nc, var);
                 self.show_view(v);
             }
         }
         self.selection = Some(sel);
+    }
+
+    /// The view of plain variable `x` under the arrow slot: layered when
+    /// the slot's pair fits `x`'s grid; plain otherwise, with a note when
+    /// arrows are on but hidden.
+    fn x_view(&self, file: u64, nc: Arc<NcFile>, x: VarInfo) -> VarView {
+        match self.slot_pair(file) {
+            Some(p) if nc.layer_fits(&x.path, &p) => VarView::new_layered(&self.ctx, file, nc, x, p),
+            Some(_) => {
+                let note = hidden_note(&x.name);
+                let mut v = VarView::new(&self.ctx, file, nc, x);
+                v.notice = Some(match v.notice.take() {
+                    Some(n) => format!("{n}\n{note}"),
+                    None => note,
+                });
+                v
+            }
+            None => VarView::new(&self.ctx, file, nc, x),
+        }
+    }
+
+    /// The pair the slot draws on `file`, when arrows are on.
+    fn slot_pair(&self, file: u64) -> Option<Arc<VectorPair>> {
+        self.arrow_layer.as_ref().filter(|l| l.file == file && l.mode != ArrowMode::Off)?.pair.clone()
+    }
+
+    /// The coloured plain variable of the current view (plain or layered);
+    /// `None` for a pair's own entry or no view.
+    fn current_x(&self) -> Option<(u64, Arc<NcFile>, VarInfo)> {
+        let v = self.view.as_ref()?;
+        if v.base.is_none() && v.vector.is_some() {
+            return None;
+        }
+        let x = v.nc.meta.var(v.plain_path())?.clone();
+        Some((v.file_id, v.nc.clone(), x))
+    }
+
+    /// Brings the current view in line with the arrow slot: a plain or
+    /// layered view of the coloured variable, or a pair's own entry.
+    fn show_slot(&mut self) {
+        let Some(v) = &self.view else { return };
+        if let Some((file, nc, x)) = self.current_x() {
+            let target = match self.slot_pair(file) {
+                Some(p) if nc.layer_fits(&x.path, &p) => layer_path(&x.path, &p.path),
+                _ => x.path.clone(),
+            };
+            let hidden = self.slot_pair(file).is_some() && target == x.path;
+            let shown_hidden = v.notice.as_deref().is_some_and(|n| n.contains(&hidden_note(&x.name)));
+            if target != v.var.path || hidden != shown_hidden {
+                let new = self.x_view(file, nc, x);
+                self.replace_view(new);
+            }
+            return;
+        }
+        // A pair's own entry: it shows the slot's pair, or no arrows when Off.
+        let (file, nc) = (v.file_id, v.nc.clone());
+        let Some(l) = self.arrow_layer.as_ref().filter(|l| l.file == file) else { return };
+        let on = l.mode != ArrowMode::Off;
+        match l.pair.clone() {
+            Some(p) if on && p.path != v.var.path => {
+                let new = VarView::new_vector(&self.ctx, file, nc, p);
+                self.replace_view(new);
+            }
+            _ => {
+                if let Some(a) = self.view.as_mut().and_then(|v| v.arrows.as_mut()) {
+                    a.on = on;
+                }
+            }
+        }
+    }
+
+    /// Pairs the slot's picks in its mode and shows the result. With
+    /// `replace`, the slot's previous pair is unregistered (with its
+    /// rotation variants) once the new one is made. Any failure leaves the
+    /// slot without a pair and says why.
+    fn pair_from_picks(&mut self, replace: bool) {
+        let x = self.current_x();
+        let Some(l) = self.arrow_layer.as_mut() else { return };
+        let Some(nc) = self.files.iter().find(|f| f.id == l.file).map(|f| f.nc.clone()) else { return };
+        let old = l.pair.take();
+        let [Some(a), Some(b)] = l.picks.clone() else {
+            l.problem = Some(PICK_TWO.into());
+            self.show_slot();
+            return;
+        };
+        let mode = l.mode;
+        // A registered pair of these two in this form is used as it is
+        // (a detected pair keeps its settings), preferring the one on show
+        // (a pair's own entry keeps its rotation variant).
+        let same = |p: &VectorPair| p.east == a && p.north == b && ArrowMode::of_form(p.form) == mode;
+        let shown = self.view.as_ref().and_then(|v| v.vector.clone());
+        let existing = shown
+            .filter(|p| same(p) && nc.pair(&p.path).is_some())
+            .or_else(|| nc.pairs().into_iter().find(|p| same(p)));
+        let (pair, registered) = match existing {
+            Some(p) => (p, true),
+            None => {
+                let made = match mode {
+                    ArrowMode::EastNorth => pair_by_hand(&nc.meta, &a, &b),
+                    ArrowMode::MagDir => pair_magdir_by_hand(&nc.meta, &a, &b),
+                    ArrowMode::Off => return,
+                };
+                match made {
+                    Ok(p) => (Arc::new(p), false),
+                    Err(e) => {
+                        l.problem = Some(e);
+                        self.show_slot();
+                        return;
+                    }
+                }
+            }
+        };
+        // Nothing is registered for a pair off the coloured variable's grid.
+        if let Some((_, _, x)) = &x
+            && !nc.layer_fits(&x.path, &pair)
+        {
+            l.problem = Some(off_grid(&x.name));
+            self.show_slot();
+            return;
+        }
+        if let Some(o) = old.filter(|o| replace && family(&o.path) != family(&pair.path)) {
+            remove_family(&nc, &o.path);
+        }
+        let pair = if registered { pair } else { register(&nc, Arc::unwrap_or_clone(pair)) };
+        l.pair = Some(pair);
+        l.problem = None;
+        l.remember_picks();
+        self.show_slot();
     }
 
     /// Reads the first slice of a new view and puts it on show.
@@ -432,11 +577,15 @@ impl TorApp {
         Some(took)
     }
 
-    /// Shows `pair` again in place of the current view of the same pair
-    /// (another rotation choice): slider positions and the map camera stay.
-    fn reselect_pair(&mut self, pair: Arc<torcdf_core::VectorPair>) {
-        let Some(old) = self.view.take() else { return };
-        let mut v = VarView::new_vector(&self.ctx, old.file_id, old.nc.clone(), pair.clone());
+    /// Shows `v` in place of the current view of the same grid (another
+    /// rotation, convention or arrow layer): slider positions, the camera,
+    /// the arrow length, the colour lock and the playback settings stay.
+    fn replace_view(&mut self, mut v: VarView) {
+        self.selection = Some(Selection::Var(v.file_id, v.plain_path().to_string()));
+        let Some(old) = self.view.take() else {
+            self.show_view(v);
+            return;
+        };
         if v.slider_pos.len() == old.slider_pos.len() {
             v.slider_pos = old.slider_pos.clone();
         }
@@ -447,12 +596,15 @@ impl TorApp {
             new.inherit_view(prev);
         }
         if let (Some(new), Some(prev)) = (&mut v.arrows, &old.arrows) {
-            (new.on, new.length) = (prev.on, prev.length);
+            new.length = prev.length;
+            // A pair's own entry keeps its switch (a layered view is on).
+            if v.base.is_none() {
+                new.on = prev.on;
+            }
         }
         // The slider range and colours stay as the user left them.
         let lock = self.display.lock;
         let settings = self.playback.as_ref().map(|p| (p.dim, p.fps, p.looping));
-        self.selection = Some(Selection::Var(old.file_id, pair.path.clone()));
         self.show_view(v);
         self.display.lock = lock;
         // The new view starts paused, with the same playback settings.
@@ -481,6 +633,7 @@ impl TorApp {
                 let (closed, kept): (Vec<_>, Vec<_>) =
                     std::mem::take(&mut self.files).into_iter().partition(|f| f.id == id);
                 self.files = kept;
+                self.arrow_layer.take_if(|l| l.file == id);
                 let view = self.view.take_if(|v| v.file_id == id);
                 if view.is_some() {
                     // Its read-ahead stops with it.
@@ -529,27 +682,26 @@ impl TorApp {
                     v.refresh(&self.ctx, &self.service);
                 }
             }
-            Action::PairWith { file, east, north } => {
-                let Some(f) = self.files.iter().find(|f| f.id == file) else { return };
-                match pair_by_hand(&f.nc.meta, &east, &north) {
-                    Ok(p) => {
-                        let p = f.nc.add_pair(p);
-                        self.select(Selection::Var(file, p.path.clone()));
-                    }
-                    Err(e) => self.errors.push(e),
-                }
-            }
             Action::Unpair { file, path } => {
                 let Some(f) = self.files.iter().find(|f| f.id == file) else { return };
                 for tag in ["", "#on", "#off"] {
                     f.nc.remove_pair(&format!("{path}{tag}"));
                 }
-                let shown = matches!(&self.selection, Some(Selection::Var(id, p))
-                    if *id == file && p.strip_prefix(&path).is_some_and(|t| t.is_empty() || t.starts_with('#')));
+                let of_it = |p: &str| p.strip_prefix(&path).is_some_and(|t| t.is_empty() || t.starts_with('#'));
+                let shown = matches!(&self.selection, Some(Selection::Var(id, p)) if *id == file && of_it(p));
                 if shown {
                     self.view = None;
                     self.playback = None;
                     self.selection = None;
+                }
+                // The live arrow layer of it turns Off; a layered view of
+                // it becomes the plain view of its variable.
+                if let Some(l) = self.arrow_layer.as_mut().filter(|l| l.file == file)
+                    && l.pair.as_ref().is_some_and(|p| of_it(&p.path))
+                {
+                    l.mode = ArrowMode::Off;
+                    l.pair = None;
+                    self.show_slot();
                 }
             }
             Action::SetRotate(choice) => {
@@ -561,8 +713,64 @@ impl TorApp {
                 let new = pair.with_rotate(choice);
                 if new.path != pair.path {
                     let new = nc.add_pair(new);
-                    self.reselect_pair(new);
+                    // The slot follows the pair drawn (rotation is per pair).
+                    if let Some(l) = self.arrow_layer.as_mut()
+                        && l.pair.as_ref().is_some_and(|p| p.path == pair.path)
+                    {
+                        l.pair = Some(new.clone());
+                    }
+                    let (file, layered) = self.view.as_ref().map_or((0, false), |v| (v.file_id, v.base.is_some()));
+                    if layered {
+                        if let Some((file, nc, x)) = self.current_x() {
+                            let v = VarView::new_layered(&self.ctx, file, nc, x, new);
+                            self.replace_view(v);
+                        }
+                    } else {
+                        let v = VarView::new_vector(&self.ctx, file, nc, new);
+                        self.replace_view(v);
+                    }
                 }
+            }
+            Action::SetArrowMode(mode) => {
+                let Some(l) = self.arrow_layer.as_mut() else { return };
+                if l.mode == mode {
+                    return;
+                }
+                l.mode = mode;
+                // The old pair stays registered; the slot no longer draws it.
+                l.pair = None;
+                if mode == ArrowMode::Off {
+                    l.problem = l.missing_picks().then(|| PICK_TWO.to_string());
+                    self.show_slot();
+                } else {
+                    // Each form starts from its own picks.
+                    l.load_prefill(mode);
+                    self.pair_from_picks(false);
+                }
+            }
+            Action::PickArrowVar { slot, path } => {
+                let Some(l) = self.arrow_layer.as_mut() else { return };
+                if slot > 1 || (l.picks[slot].as_deref() == Some(path.as_str()) && l.pair.is_some()) {
+                    return;
+                }
+                l.picks[slot] = Some(path);
+                // While Off the picks are only kept.
+                if l.mode != ArrowMode::Off {
+                    self.pair_from_picks(true);
+                }
+            }
+            Action::SetConvention(c) => {
+                let Some(l) = self.arrow_layer.as_mut() else { return };
+                let Some(old) = l.pair.clone().filter(|p| matches!(p.form, PairForm::MagDir(_))) else { return };
+                let Some(nc) = self.files.iter().find(|f| f.id == l.file).map(|f| f.nc.clone()) else { return };
+                let new = old.with_convention(c);
+                if new == *old {
+                    return;
+                }
+                // The pair is replaced at its new path, never added beside it.
+                remove_family(&nc, &old.path);
+                l.pair = Some(register(&nc, new));
+                self.show_slot();
             }
             Action::FitView => {
                 if let Some(v) = &mut self.view {
@@ -689,6 +897,38 @@ fn selected_attrs<'a>(files: &'a [OpenFile], sel: Option<&Selection>) -> Option<
     }
 }
 
+/// The note on a plain view while the arrow layer cannot sit on `var`.
+fn hidden_note(var: &str) -> String {
+    format!("Arrows hidden: {var} is on a different grid")
+}
+
+/// Why picked variables were not paired over `var`.
+fn off_grid(var: &str) -> String {
+    format!("These two do not sit on {var}'s grid")
+}
+
+/// A pair path without its rotation tag.
+fn family(path: &str) -> &str {
+    path.strip_suffix("#on").or_else(|| path.strip_suffix("#off")).unwrap_or(path)
+}
+
+/// Unregisters the pair at `path` with its rotation variants.
+fn remove_family(nc: &NcFile, path: &str) {
+    let base = family(path);
+    for tag in ["", "#on", "#off"] {
+        nc.remove_pair(&format!("{base}{tag}"));
+    }
+}
+
+/// Registers `p`; a rotation variant also registers its untagged pair,
+/// which is the tree's row for it.
+fn register(nc: &NcFile, p: VectorPair) -> Arc<VectorPair> {
+    if p.rotate != RotateChoice::Auto {
+        nc.add_pair(p.with_rotate(RotateChoice::Auto));
+    }
+    nc.add_pair(p)
+}
+
 fn find_group<'a>(g: &'a torcdf_core::Group, path: &str) -> Option<&'a torcdf_core::Group> {
     if g.path == path {
         return Some(g);
@@ -717,7 +957,8 @@ impl eframe::App for TorApp {
             tree::show(ui, &self.files, &self.opening, self.selection.as_ref(), &mut actions)
         });
         // A vector pair is no variable of the file: its attributes come from the view.
-        let pair_attrs = self.view.as_ref().filter(|v| v.vector.is_some()).map(|v| v.var.attrs.clone());
+        let pair_attrs =
+            self.view.as_ref().filter(|v| v.vector.is_some() && v.base.is_none()).map(|v| v.var.attrs.clone());
         let attrs = match (&self.selection, &pair_attrs) {
             (Some(Selection::Var(_, path)), Some(a)) => Some((path.clone(), &a[..])),
             _ => selected_attrs(&self.files, self.selection.as_ref()),
@@ -825,6 +1066,7 @@ impl TorApp {
                 range: (0.0, 1.0),
             },
             popups: PopupSet::default(),
+            arrow_layer: None,
             saves: Vec::new(),
             service,
             cache_budget,
@@ -840,8 +1082,10 @@ impl TorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::arrow_layer::ArrowMode;
     use std::time::Duration;
-    use torcdf_core::fixtures::vectors::write_nemo_like;
+    use torcdf_core::fixtures::vectors::{write_arome_like, write_nemo_like};
+    use torcdf_core::{AngleRef, AngleUnit, DirConvention, Guessed, SliceRequest, Towards, layer_path};
 
     #[test]
     fn rotate_toggle_reselects() {
@@ -866,14 +1110,221 @@ mod tests {
         let path = torcdf_core::fixtures::vectors::write_noclue_renamed(dir.path());
         let mut app = TorApp::headless(&path);
         assert!(app.files[0].nc.pairs().is_empty());
-        app.apply(Action::PairWith { file: 1, east: "/aa".into(), north: "/bb".into() });
+        app.apply(Action::Select(Selection::Var(1, "/h".into())));
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        let slot = app.arrow_layer.as_ref().expect("slot");
+        assert_eq!(slot.problem.as_deref(), Some("Pick two variables"));
+        assert!(slot.pair.is_none());
+        app.apply(Action::PickArrowVar { slot: 0, path: "/aa".into() });
+        app.apply(Action::PickArrowVar { slot: 1, path: "/bb".into() });
         let p = app.files[0].nc.pairs().remove(0);
-        assert_eq!(app.selection, Some(Selection::Var(1, p.path.clone())));
+        assert_eq!((p.east.as_str(), p.north.as_str()), ("/aa", "/bb"));
+        assert_eq!(app.selection, Some(Selection::Var(1, "/h".into())));
+        assert_eq!(app.view.as_ref().unwrap().var.path, layer_path("/h", &p.path));
+        // Its own tree entry, then Unpair: the view goes with the pair.
+        app.apply(Action::Select(Selection::Var(1, p.path.clone())));
         app.apply(Action::Unpair { file: 1, path: p.path.clone() });
         assert!(app.files[0].nc.pairs().is_empty());
         assert!(app.view.is_none() && app.selection.is_none());
-        app.apply(Action::PairWith { file: 1, east: "/aa".into(), north: "/aa".into() });
-        assert_eq!(app.errors.len(), 1);
+        // A variable cannot be paired with itself: the slot says why.
+        app.apply(Action::Select(Selection::Var(1, "/h".into())));
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        app.apply(Action::PickArrowVar { slot: 0, path: "/aa".into() });
+        app.apply(Action::PickArrowVar { slot: 1, path: "/aa".into() });
+        let slot = app.arrow_layer.as_ref().unwrap();
+        assert!(slot.problem.is_some() && slot.pair.is_none());
+        assert!(app.files[0].nc.pairs().is_empty());
+        assert!(app.errors.is_empty());
+    }
+
+    const AROME_PAIR: &str = "/wind_speed@wind_direction~from.cwn.deg";
+
+    /// AROME-like file 1, `/wind_speed` coloured, its own magnitude/direction
+    /// pair as arrows (picked in the Plot tab).
+    fn arome_layer(dir: &Path) -> TorApp {
+        let mut app = TorApp::headless(&write_arome_like(dir));
+        app.apply(Action::Select(Selection::Var(1, "/wind_speed".into())));
+        app.apply(Action::SetArrowMode(ArrowMode::MagDir));
+        app.apply(Action::PickArrowVar { slot: 0, path: "/wind_speed".into() });
+        app.apply(Action::PickArrowVar { slot: 1, path: "/wind_direction".into() });
+        app
+    }
+
+    #[test]
+    fn magdir_layer_from_picks() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = arome_layer(dir.path());
+        let v = app.view.as_ref().expect("view");
+        assert_eq!(v.var.path, format!("/wind_speed|{AROME_PAIR}"));
+        assert_eq!(v.base.as_deref(), Some("/wind_speed"));
+        assert_eq!(v.plain_path(), "/wind_speed");
+        assert!(v.arrows.as_ref().is_some_and(|a| a.on));
+        let slot = app.arrow_layer.as_ref().expect("slot");
+        assert_eq!(slot.mode, ArrowMode::MagDir);
+        assert_eq!(slot.pair.as_ref().map(|p| p.path.as_str()), Some(AROME_PAIR));
+        assert_eq!(slot.problem, None);
+        assert_eq!(app.selection, Some(Selection::Var(1, "/wind_speed".into())));
+    }
+
+    /// Each form has its own pre-fill: x & y has none on this file, and
+    /// switching to it never pairs speed/direction as east/north.
+    #[test]
+    fn mode_switch_uses_that_forms_picks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_arome_like(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, "/wind_speed".into())));
+        let slot = app.arrow_layer.as_ref().expect("slot");
+        assert_eq!((slot.file, slot.mode), (1, ArrowMode::Off));
+        assert_eq!(slot.picks, [Some("/wind_speed".to_string()), Some("/wind_direction".to_string())]);
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        let slot = app.arrow_layer.as_ref().unwrap();
+        assert_eq!(slot.picks, [None, None]);
+        assert_eq!(slot.problem.as_deref(), Some("Pick two variables"));
+        assert!(slot.pair.is_none());
+        assert_eq!(app.view.as_ref().unwrap().var.path, "/wind_speed");
+        assert_eq!(app.files[0].nc.pairs().len(), 1);
+        app.apply(Action::SetArrowMode(ArrowMode::MagDir));
+        assert_eq!(app.view.as_ref().unwrap().var.path, format!("/wind_speed|{AROME_PAIR}"));
+        app.apply(Action::SetArrowMode(ArrowMode::Off));
+        let v = app.view.as_ref().unwrap();
+        assert_eq!((v.var.path.as_str(), v.base.as_deref()), ("/wind_speed", None));
+        assert!(v.vector.is_none());
+        assert_eq!(app.arrow_layer.as_ref().unwrap().mode, ArrowMode::Off);
+    }
+
+    #[test]
+    fn layer_over_own_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = arome_layer(dir.path());
+        let pos = app.view.as_ref().unwrap().slider_pos.clone();
+        wait_shown(&mut app, &pos);
+        let v = app.view.as_ref().unwrap();
+        let shown = v.shown.as_ref().expect("shown");
+        assert!(shown.slice.vector.is_some(), "the layer carries the arrows");
+        let plain = SliceRequest { var: "/wind_speed".into(), ..shown.req.clone() };
+        let speed = v.nc.read_slice(&plain).expect("plain read");
+        let same = |a: &[f32], b: &[f32]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y || (x.is_nan() && y.is_nan()))
+        };
+        assert!(same(&shown.slice.data, &speed.data), "colours are wind_speed's");
+    }
+
+    #[test]
+    fn layer_kept_on_same_grid_hidden_on_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        let pair = app.files[0].nc.pairs().remove(0);
+        app.apply(Action::Select(Selection::Var(1, "/thetao".into())));
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        let layered = layer_path("/thetao", &pair.path);
+        assert_eq!(app.view.as_ref().unwrap().var.path, layered);
+        // uo sits on the u-grid: plain, with the note; the slot stays.
+        app.apply(Action::Select(Selection::Var(1, "/uo".into())));
+        let v = app.view.as_ref().unwrap();
+        assert_eq!((v.var.path.as_str(), v.base.as_deref()), ("/uo", None));
+        assert!(v.vector.is_none());
+        assert_eq!(v.notice.as_deref(), Some("Arrows hidden: uo is on a different grid"));
+        let slot = app.arrow_layer.as_ref().unwrap();
+        assert_eq!(slot.mode, ArrowMode::EastNorth);
+        assert_eq!(slot.pair.as_ref().map(|p| p.path.clone()), Some(pair.path.clone()));
+        // Back on the centre grid: the arrows come back.
+        app.apply(Action::Select(Selection::Var(1, "/thetao".into())));
+        assert_eq!(app.view.as_ref().unwrap().var.path, layered);
+    }
+
+    /// A pair whose centre is not the coloured variable's grid is refused.
+    #[test]
+    fn picks_off_grid_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        let before: Vec<String> = app.files[0].nc.pairs().iter().map(|p| p.path.clone()).collect();
+        app.apply(Action::Select(Selection::Var(1, "/uo".into())));
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        assert_eq!(app.arrow_layer.as_ref().unwrap().problem.as_deref(), Some("Pick two variables"));
+        app.apply(Action::PickArrowVar { slot: 0, path: "/uo".into() });
+        app.apply(Action::PickArrowVar { slot: 1, path: "/vo".into() });
+        let slot = app.arrow_layer.as_ref().unwrap();
+        assert_eq!(slot.problem.as_deref(), Some("These two do not sit on uo's grid"));
+        assert!(slot.pair.is_none());
+        let after: Vec<String> = app.files[0].nc.pairs().iter().map(|p| p.path.clone()).collect();
+        assert_eq!(after, before);
+        assert_eq!(app.view.as_ref().unwrap().var.path, "/uo");
+    }
+
+    #[test]
+    fn convention_change_replaces_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = arome_layer(dir.path());
+        let to = DirConvention {
+            towards: Towards::To,
+            reference: AngleRef::ClockwiseFromNorth,
+            unit: AngleUnit::Degrees,
+            guessed: Guessed::default(),
+        };
+        app.apply(Action::SetConvention(to));
+        let nc = app.files[0].nc.clone();
+        assert!(nc.pair(AROME_PAIR).is_none(), "the old path is gone");
+        let new = app.arrow_layer.as_ref().unwrap().pair.clone().expect("pair");
+        assert!(new.path.ends_with("~to.cwn.deg"), "{}", new.path);
+        assert!(nc.pair(&new.path).is_some());
+        assert_eq!(nc.pairs().len(), 1);
+        assert_eq!(app.view.as_ref().unwrap().var.path, layer_path("/wind_speed", &new.path));
+    }
+
+    #[test]
+    fn other_file_clears_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = arome_layer(dir.path());
+        let nemo = NcFile::open(&write_nemo_like(dir.path())).unwrap();
+        app.files.push(OpenFile { id: 2, name: "nemo.nc".into(), nc: Arc::new(nemo) });
+        app.apply(Action::Select(Selection::Var(2, "/thetao".into())));
+        let slot = app.arrow_layer.as_ref().expect("slot");
+        assert_eq!((slot.file, slot.mode), (2, ArrowMode::Off));
+        assert!(slot.pair.is_none());
+        let v = app.view.as_ref().unwrap();
+        assert_eq!((v.var.path.as_str(), v.base.as_deref()), ("/thetao", None));
+        assert!(v.vector.is_none());
+    }
+
+    #[test]
+    fn unpair_turns_layer_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = arome_layer(dir.path());
+        app.apply(Action::Unpair { file: 1, path: AROME_PAIR.into() });
+        let slot = app.arrow_layer.as_ref().unwrap();
+        assert_eq!(slot.mode, ArrowMode::Off);
+        assert!(slot.pair.is_none());
+        let v = app.view.as_ref().expect("the plain view");
+        assert_eq!((v.var.path.as_str(), v.base.as_deref()), ("/wind_speed", None));
+        assert!(v.vector.is_none());
+        assert_eq!(app.selection, Some(Selection::Var(1, "/wind_speed".into())));
+    }
+
+    /// The AROME-like file has no time or vertical axis to pop up along, so
+    /// this uses the NEMO-like `thetao` (with `uo`/`vo` arrows).
+    #[test]
+    fn popup_on_layer_reads_plain_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, "/thetao".into())));
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        assert!(app.view.as_ref().unwrap().base.is_some(), "layered");
+        app.apply(Action::OpenPopup { iy: 1, ix: 1, lonlat: None });
+        assert_eq!(app.popups.list.len(), 1);
+        let p = &app.popups.list[0];
+        assert_eq!(p.var_path, "/thetao");
+        assert!(!p.has_components());
+        let t0 = Instant::now();
+        while app.popups.list[0].values.iter().any(Option::is_none) && app.popups.list[0].error.is_none() {
+            assert!(t0.elapsed().as_secs() < 20, "the series never arrived");
+            std::thread::sleep(Duration::from_millis(2));
+            app.popups.poll();
+        }
+        let p = &app.popups.list[0];
+        assert_eq!(p.error, None);
+        // thetao = 10 + 0.01 (p + q) at every time step.
+        assert_eq!(p.values.len(), 2);
+        assert!(p.values.iter().all(|v| v.is_some_and(|x| (x - 10.02).abs() < 1e-4)), "{:?}", p.values);
     }
 
     fn uo_app(dir: &Path) -> TorApp {
@@ -966,6 +1417,7 @@ mod tests {
         assert_ne!(app.popups.list[0].id, first);
         app.popups.list[0].pinned = true;
         app.apply(Action::OpenPopup { iy: 1, ix: 1, lonlat: None });
+        eprintln!("FLASH {:?}", app.view.as_ref().unwrap().flash);
         assert_eq!(app.popups.list.len(), 2);
         // Off the grid: nothing opens, a passing message appears.
         app.apply(Action::OpenPopup { iy: 99, ix: 99, lonlat: None });

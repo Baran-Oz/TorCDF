@@ -130,7 +130,13 @@ impl Popup {
         id: u64,
         service: &SliceService,
     ) -> Result<Popup, String> {
-        let var = &view.var;
+        // A layered view pops up its coloured variable's own series; only a
+        // pair's own entry adds its components.
+        let var = match &view.base {
+            Some(p) => view.nc.meta.var(p).ok_or_else(|| NOTHING.to_string())?,
+            None => &view.var,
+        };
+        let pair = view.vector.as_ref().filter(|_| view.base.is_none());
         let shape = &var.shape;
         if view.slider_pos.len() != shape.len() {
             return Err(NOTHING.into());
@@ -148,24 +154,19 @@ impl Popup {
         let mut infos = Vec::new();
         for (kind, dim) in [(PopupKind::Series, view.time_dim), (PopupKind::Profile, vertical)] {
             if let Some(d) = dim.filter(|&d| d < shape.len() && shape[d] > 0) {
-                infos.push(kind_info(view, kind, d, &point, lonlat));
+                infos.push(kind_info(view, var, kind, d, &point, lonlat));
             }
         }
         let Some(first) = infos.first() else { return Err(NOTHING.into()) };
-        let (east_name, north_name) = view
-            .vector
-            .as_ref()
-            .map(|p| (leaf(&p.east).to_string(), leaf(&p.north).to_string()))
-            .unwrap_or_default();
+        let (east_name, north_name) =
+            pair.map(|p| (leaf(&p.east).to_string(), leaf(&p.north).to_string())).unwrap_or_default();
         let mut popup = Popup {
             id,
             pinned: false,
             file_id: view.file_id,
             var_path: var.path.clone(),
             var_name: var.name.clone(),
-            units: view
-                .vector
-                .as_ref()
+            units: pair
                 .and_then(|p| p.units.clone())
                 .or_else(|| attr(var, "units").map(str::to_string)),
             point,
@@ -316,15 +317,16 @@ impl Popup {
     }
 }
 
-/// Axis, title and orientation of the pop-up along dimension `d`.
+/// Axis, title and orientation of the pop-up of `var` (the view's plain
+/// variable) along dimension `d`.
 fn kind_info(
     view: &VarView,
+    var: &VarInfo,
     kind: PopupKind,
     d: usize,
     point: &[usize],
     lonlat: Option<(f64, f64)>,
 ) -> KindInfo {
-    let var = &view.var;
     let len = var.shape[d];
     let coord = |dim: usize| {
         view.coords.dims.get(dim).and_then(|c| c.as_ref()).filter(|c| c.len() == var.shape[dim])
