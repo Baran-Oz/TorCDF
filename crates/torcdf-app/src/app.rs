@@ -20,7 +20,7 @@ use crate::render::colormap::Colormap;
 use crate::ui::inspector::{PanelInput, PanelTab};
 use crate::ui::{self, inspector, plot_area, tree};
 use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO, candidates};
-use crate::view::defaults::ViewKind;
+use crate::view::defaults::{AxisChoice, ViewKind};
 use crate::view::playback::{FPS_RANGE, Playback, Tick, frame_bytes};
 use crate::view::popup::{Popup, PopupKind, PopupSet};
 use crate::view::var_view::{Display, ImageState, VarView};
@@ -150,6 +150,8 @@ pub enum Action {
     DismissError(usize),
     SliderMoved,
     SetKind(ViewKind),
+    /// Plot tab "Axes": the dimensions on the plotted y and x.
+    SetAxes { y: usize, x: usize },
     /// Remove a pair (and its rotation variants) for this session.
     Unpair { file: u64, path: String },
     SetRotate(RotateChoice),
@@ -631,9 +633,12 @@ impl TorApp {
         if v.var.shape == old.var.shape && v.kinds().contains(&old.kind) {
             v.kind = old.kind;
         }
-        v.image.view = old.image.view;
-        v.image.fitted_to = old.image.fitted_to;
-        v.image.user_moved = old.image.user_moved;
+        // A pan or zoom over other axes (chosen in the old view) is not kept.
+        if v.axes == old.axes {
+            v.image.view = old.image.view;
+            v.image.fitted_to = old.image.fitted_to;
+            v.image.user_moved = old.image.user_moved;
+        }
         if let (Some(new), Some(prev)) = (&mut v.map, &old.map) {
             new.inherit_view(prev);
         }
@@ -715,6 +720,10 @@ impl TorApp {
                     && v.kind != kind
                 {
                     v.kind = kind;
+                    // The map draws lat/lon, whatever the image had on its axes.
+                    if kind == ViewKind::Map {
+                        v.restore_geo_axes();
+                    }
                     v.shown = None;
                     v.image = ImageState::default();
                     // The map keeps its camera and cell index, not its tile.
@@ -722,6 +731,11 @@ impl TorApp {
                         m.reset_tiles();
                     }
                     v.refresh(&self.ctx, &self.service);
+                }
+            }
+            Action::SetAxes { y, x } => {
+                if let Some(v) = &mut self.view {
+                    v.set_axes(&self.ctx, &self.service, AxisChoice { y, x });
                 }
             }
             Action::Unpair { file, path } => {
@@ -1625,5 +1639,151 @@ mod tests {
         assert!(v.expire_flash(Instant::now() + NOTICE_TIME).is_none());
         assert!(v.flash.is_none());
         assert_eq!(v.notice.as_deref(), Some(why));
+    }
+
+    /// `profile.nc`'s `t(depth, y, x)`, `t[k, j, i] = k * 100 + j * 10 + i`,
+    /// shown as an image on (y, x).
+    fn profile_app(dir: &Path) -> TorApp {
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_profile(dir));
+        app.apply(Action::Select(Selection::Var(1, "/t".into())));
+        app
+    }
+
+    /// The image on show, `ny` rows of `nx` values.
+    fn shown_image(app: &TorApp) -> (usize, usize, Vec<f32>) {
+        let v = app.view.as_ref().unwrap();
+        let s = v.shown.as_ref().expect("a slice on show");
+        let grid = plot_area::plot_grid(&s.slice.shape, v.axes.expect("axes"));
+        (grid.ny, grid.nx, plot_area::image_data(&s.slice.data, &grid).into_owned())
+    }
+
+    #[test]
+    fn swap_axes_transposes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = profile_app(dir.path());
+        assert_eq!(app.view.as_ref().unwrap().kind, ViewKind::Image);
+        app.apply(Action::JumpTo { file: 1, dim_name: "depth".into(), index: 1 });
+        wait_shown(&mut app, &[1, 0, 0]);
+        let (ny, nx, before) = shown_image(&app);
+        assert_eq!((ny, nx), (3, 4));
+        assert_eq!(before[2 * 4 + 3], 123.0);
+        app.apply(Action::SetAxes { y: 2, x: 1 });
+        let v = app.view.as_ref().unwrap();
+        assert_eq!(v.axes, Some(AxisChoice { y: 2, x: 1 }));
+        assert_eq!(v.slider_dims(), vec![0]);
+        assert_eq!(v.slider_pos[0], 1, "the depth slider stays");
+        wait_shown(&mut app, &[1, 0, 0]);
+        let (ny, nx, after) = shown_image(&app);
+        assert_eq!((ny, nx), (4, 3));
+        for r in 0..4 {
+            for c in 0..3 {
+                assert_eq!(after[r * 3 + c], before[c * 4 + r], "cell ({r}, {c})");
+            }
+        }
+    }
+
+    #[test]
+    fn axis_onto_slider_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = profile_app(dir.path());
+        app.apply(Action::JumpTo { file: 1, dim_name: "depth".into(), index: 2 });
+        app.apply(Action::SetAxes { y: 0, x: 2 });
+        let v = app.view.as_ref().unwrap();
+        assert_eq!(v.axes, Some(AxisChoice { y: 0, x: 2 }));
+        assert_eq!(v.slider_dims(), vec![1], "y gets a slider, depth has none");
+        assert_eq!(v.slider_pos[1], 0);
+        wait_shown(&mut app, &[0, 0, 0]);
+        let (ny, nx, img) = shown_image(&app);
+        assert_eq!((ny, nx), (5, 4));
+        for r in 0..5 {
+            for c in 0..4 {
+                assert_eq!(img[r * 4 + c], (r * 100 + c) as f32, "cell ({r}, {c})");
+            }
+        }
+    }
+
+    #[test]
+    fn same_dim_on_both_axes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = profile_app(dir.path());
+        let before = app.view.as_ref().unwrap().requested_at;
+        app.apply(Action::SetAxes { y: 2, x: 2 });
+        app.apply(Action::SetAxes { y: 1, x: 7 });
+        let v = app.view.as_ref().unwrap();
+        assert_eq!(v.axes, Some(AxisChoice { y: 1, x: 2 }));
+        assert_eq!(v.requested_at, before, "nothing re-read");
+    }
+
+    #[test]
+    fn axes_not_choosable_for_vectors_or_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pair's own view keeps its horizontal axes.
+        let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        let pair = app.files[0].nc.pairs().remove(0);
+        app.apply(Action::Select(Selection::Var(1, pair.path.clone())));
+        let v = app.view.as_ref().unwrap();
+        assert!(!v.axes_choosable());
+        let axes = v.axes;
+        app.apply(Action::SetAxes { y: 0, x: 2 });
+        assert_eq!(app.view.as_ref().unwrap().axes, axes);
+        // So does a layered view, in any view kind.
+        let mut app = arome_layer(dir.path());
+        app.apply(Action::SetKind(ViewKind::Image));
+        let v = app.view.as_ref().unwrap();
+        assert!(v.base.is_some());
+        assert!(!v.axes_choosable());
+        // A map keeps lat/lon; its image and table views can choose.
+        let mut app = uo_app(dir.path());
+        assert!(!app.view.as_ref().unwrap().axes_choosable());
+        app.apply(Action::SetKind(ViewKind::Image));
+        assert!(app.view.as_ref().unwrap().axes_choosable());
+        app.apply(Action::SetKind(ViewKind::Table));
+        assert!(app.view.as_ref().unwrap().axes_choosable());
+        // Plain image: yes; one long dimension (a line): no.
+        let app = profile_app(dir.path());
+        assert!(app.view.as_ref().unwrap().axes_choosable());
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_long_series(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, "/v".into())));
+        assert!(!app.view.as_ref().unwrap().axes_choosable());
+    }
+
+    /// Arrows on over chosen axes: the layered view is on the grid's axes,
+    /// fitted afresh rather than at the old axes' pan and zoom.
+    #[test]
+    fn arrows_over_chosen_axes_refit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_arome_like(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, "/wind_speed".into())));
+        app.apply(Action::SetKind(ViewKind::Image));
+        app.apply(Action::SetAxes { y: 0, x: 3 });
+        app.view.as_mut().unwrap().image.user_moved = true;
+        app.apply(Action::SetArrowMode(ArrowMode::MagDir));
+        app.apply(Action::PickArrowVar { slot: 0, path: "/wind_speed".into() });
+        app.apply(Action::PickArrowVar { slot: 1, path: "/wind_direction".into() });
+        let v = app.view.as_ref().unwrap();
+        assert!(v.base.is_some(), "layered");
+        assert_eq!(v.axes, Some(AxisChoice { y: 2, x: 3 }));
+        assert!(!v.image.user_moved);
+    }
+
+    /// Back on the map, lat/lon are the axes again.
+    #[test]
+    fn map_view_restores_lat_lon_axes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        let geo = app.view.as_ref().unwrap().axes;
+        assert_eq!(geo, Some(AxisChoice { y: 1, x: 2 }));
+        app.apply(Action::JumpTo { file: 1, dim_name: "time".into(), index: 5 });
+        app.apply(Action::SetKind(ViewKind::Image));
+        app.apply(Action::SetAxes { y: 0, x: 2 });
+        let v = app.view.as_ref().unwrap();
+        assert_eq!(v.slider_dims(), vec![1]);
+        assert!(!v.on_geo_axes());
+        app.apply(Action::SetKind(ViewKind::Map));
+        let v = app.view.as_ref().unwrap();
+        assert_eq!(v.axes, geo);
+        assert!(v.on_geo_axes());
+        assert_eq!(v.slider_dims(), vec![0]);
+        assert_eq!(v.slider_pos[0], 0, "time left an axis: back at 0");
     }
 }

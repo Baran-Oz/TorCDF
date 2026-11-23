@@ -405,6 +405,73 @@ impl VarView {
         }
     }
 
+    /// The user may choose the plotted dimensions: a plain numeric variable
+    /// (no arrows) in the image or table view, with at least two dimensions
+    /// longer than 1. Maps keep lat/lon; vector views their pair's axes.
+    pub fn axes_choosable(&self) -> bool {
+        self.vector.is_none()
+            && self.var.dtype.is_numeric()
+            && matches!(self.kind, ViewKind::Image | ViewKind::Table)
+            && self.var.shape.iter().filter(|&&n| n > 1).count() >= 2
+    }
+
+    /// Puts `axes` on the plotted y and x and reads the slice for them.
+    /// Refused when the axes cannot be chosen, when y == x or when either is
+    /// not a dimension longer than 1. Sliders that stay keep their
+    /// positions; a dimension leaving an axis gets a slider at 0.
+    pub fn set_axes(&mut self, ctx: &egui::Context, service: &SliceService, axes: AxisChoice) {
+        let long = |d: usize| self.var.shape.get(d).is_some_and(|&n| n > 1);
+        if !self.axes_choosable() || axes.y == axes.x || !long(axes.y) || !long(axes.x) || self.axes == Some(axes) {
+            return;
+        }
+        self.move_axes(axes);
+        // Every dimension's coordinates are already loaded (see
+        // `dim_coord_paths`), so the new axes have theirs.
+        self.refresh(ctx, service);
+    }
+
+    /// Back on the map: the geographic dimensions become the axes again (the
+    /// caller refreshes).
+    pub fn restore_geo_axes(&mut self) {
+        let axes = match self.geo {
+            Geo::Regular { lat_dim, lon_dim, .. } => AxisChoice { y: lat_dim, x: lon_dim },
+            Geo::Curvilinear { y_dim, x_dim, .. } => AxisChoice { y: y_dim, x: x_dim },
+            Geo::None => return,
+        };
+        if self.axes.is_some() && self.axes != Some(axes) {
+            self.move_axes(axes);
+        }
+    }
+
+    /// The plotted axes are the grid's latitude and longitude (or its
+    /// curvilinear y and x), in that order.
+    pub fn on_geo_axes(&self) -> bool {
+        let Some(a) = self.axes else { return false };
+        match self.geo {
+            Geo::Regular { lat_dim, lon_dim, .. } => (a.y, a.x) == (lat_dim, lon_dim),
+            Geo::Curvilinear { y_dim, x_dim, .. } => (a.y, a.x) == (y_dim, x_dim),
+            Geo::None => false,
+        }
+    }
+
+    /// Sets the axes, moving sliders: a dimension leaving an axis gets a
+    /// slider at 0, one moving onto an axis loses its own. The slice and
+    /// image of the old axes are dropped (the image is fitted afresh).
+    fn move_axes(&mut self, axes: AxisChoice) {
+        let old = self.axes.map_or_else(Vec::new, |a| vec![a.y, a.x]);
+        for (d, pos) in self.slider_pos.iter_mut().enumerate() {
+            if old.contains(&d) || d == axes.y || d == axes.x {
+                *pos = 0;
+            }
+        }
+        self.axes = Some(axes);
+        self.shown = None;
+        self.stats_job = None;
+        self.hover = None;
+        self.pending_click.cancel();
+        self.image = ImageState::default();
+    }
+
     /// Shows `text` as a passing message for `for_how_long` from now.
     pub fn set_flash(&mut self, text: String, for_how_long: std::time::Duration) {
         self.flash = Some((text, Instant::now() + for_how_long));
@@ -725,7 +792,7 @@ impl VarView {
     /// (north up for both south-to-north and north-to-south grids).
     pub fn flip_y(&self) -> bool {
         let Some(a) = self.axes else { return true };
-        if let (Geo::Curvilinear { .. }, Some((lat, _))) = (&self.geo, &self.coords.curv) {
+        if let (Geo::Curvilinear { .. }, Some((lat, _)), true) = (&self.geo, &self.coords.curv, self.on_geo_axes()) {
             let (ny, nx) = (self.var.shape[a.y], self.var.shape[a.x]);
             let mid = nx / 2;
             return match (lat.get(mid), lat.get((ny - 1) * nx + mid)) {
@@ -744,11 +811,11 @@ impl VarView {
     }
 
     /// Screen width/height of one image cell: the stride ratio, times the
-    /// lon/lat spacing ratio on regular lat/lon grids.
+    /// lon/lat spacing ratio when a regular grid's lat/lon are the axes.
     pub fn cell_aspect(&self) -> f32 {
         let (Some(a), Some(s)) = (self.axes, &self.shown) else { return 1.0 };
         let spacing = |d: usize| -> f64 {
-            if !matches!(self.geo, Geo::Regular { .. }) {
+            if !matches!(self.geo, Geo::Regular { .. }) || !self.on_geo_axes() {
                 return 1.0;
             }
             match self.coords.dims.get(d).and_then(|c| c.as_ref()) {

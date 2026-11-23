@@ -14,7 +14,7 @@ use crate::app::{Action, hidden_note};
 use crate::render::colormap::Colormap;
 use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO};
 use crate::view::arrow_state::LENGTH_RANGE;
-use crate::view::defaults::ViewKind;
+use crate::view::defaults::{AxisChoice, ViewKind};
 use crate::view::var_view::{Display, VarView};
 
 /// Height of the Cursor area pinned at the bottom of the panel (its rows
@@ -75,6 +75,9 @@ pub fn show(
                 ui.strong(&v.var.name);
             }
             settings(ui, display, view.as_deref());
+            if let Some(v) = view.as_deref() {
+                axes_section(ui, v, actions);
+            }
             if let Some(v) = view.as_deref_mut() {
                 map_settings(ui, v);
             }
@@ -137,6 +140,41 @@ fn settings(ui: &mut egui::Ui, display: &mut Display, view: Option<&VarView>) {
             Ok(_) => {}
         }
     }
+}
+
+/// The Axes section: which dimensions (longer than 1) are on y and x.
+/// Picking the other axis's dimension swaps the two.
+fn axes_section(ui: &mut egui::Ui, v: &VarView, actions: &mut Vec<Action>) {
+    let Some(a) = v.axes.filter(|_| v.axes_choosable()) else { return };
+    ui.separator();
+    ui.heading("Axes");
+    let label = |d: usize| format!("{} ({})", v.var.dims[d], v.var.shape[d]);
+    let long: Vec<usize> = (0..v.var.shape.len()).filter(|&d| v.var.shape[d] > 1).collect();
+    egui::Grid::new("axes").num_columns(2).show(ui, |ui| {
+        for (name, on_y) in [("Y axis", true), ("X axis", false)] {
+            let current = if on_y { a.y } else { a.x };
+            ui.label(name);
+            egui::ComboBox::from_id_salt(("axis", name)).selected_text(label(current)).show_ui(ui, |ui| {
+                for &d in &long {
+                    if ui.selectable_label(d == current, label(d)).clicked() && d != current {
+                        let AxisChoice { y, x } = pick_axis(a, on_y, d);
+                        actions.push(Action::SetAxes { y, x });
+                    }
+                }
+            });
+            ui.end_row();
+        }
+    });
+}
+
+/// The axes after dimension `d` is picked for y (`on_y`) or x: the other
+/// axis's dimension swaps the two, any other replaces this axis's.
+fn pick_axis(a: AxisChoice, on_y: bool, d: usize) -> AxisChoice {
+    let (this, other) = if on_y { (a.y, a.x) } else { (a.x, a.y) };
+    // The picked axis gets `d`; the other keeps its own, or takes this
+    // axis's old one when `d` was its.
+    let other = if d == other { this } else { other };
+    if on_y { AxisChoice { y: d, x: other } } else { AxisChoice { y: other, x: d } }
 }
 
 /// The Arrows section: how the arrows are made (or Off), the two variables,
@@ -413,7 +451,9 @@ fn cursor(ui: &mut egui::Ui, view: Option<&VarView>) {
         ui.end_row();
         arrow_row(ui, v);
         let coord = |d: usize, i: usize| v.coords.dims.get(d)?.as_ref()?.get(i).copied();
-        match &v.geo {
+        // Other dimensions on the axes: their own coordinates, not lat/lon.
+        let geo = if v.on_geo_axes() { &v.geo } else { &Geo::None };
+        match geo {
             Geo::Regular { .. } => {
                 if let (Some(lat), Some(lon)) = (coord(a.y, h.iy), coord(a.x, h.ix)) {
                     ui.label("lat");
@@ -540,6 +580,20 @@ pub fn log_range(range: (f32, f32), min_positive: Option<f32>) -> Result<(f32, f
 mod tests {
     use super::*;
     use torcdf_core::{AngleSource, Frame};
+
+    #[test]
+    fn pick_axis_swaps_or_replaces() {
+        let a = AxisChoice { y: 1, x: 2 };
+        // The other axis's dimension: the two swap.
+        assert_eq!(pick_axis(a, true, 2), AxisChoice { y: 2, x: 1 });
+        assert_eq!(pick_axis(a, false, 1), AxisChoice { y: 2, x: 1 });
+        // A slider dimension replaces the picked axis's.
+        assert_eq!(pick_axis(a, true, 0), AxisChoice { y: 0, x: 2 });
+        assert_eq!(pick_axis(a, false, 0), AxisChoice { y: 1, x: 0 });
+        // Its own dimension: unchanged.
+        assert_eq!(pick_axis(a, true, 1), a);
+        assert_eq!(pick_axis(a, false, 2), a);
+    }
 
     #[test]
     fn setting_note_cases() {
