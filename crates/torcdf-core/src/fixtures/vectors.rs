@@ -250,7 +250,8 @@ fn write_noclue_as(dir: &Path, file: &str, theta: f64, names: [&str; 2]) -> Path
 }
 
 /// AROME-like `arome.nc`: `time` = 2, `height` = 1, `y` = 4, `x` = 5, 2-D
-/// `latitude`/`longitude` (about 58-60 N, 4-7 E). `wind_speed` and
+/// `latitude`/`longitude` (about 58-60 N, 4-7 E), CF `time` (hours since
+/// 2026-09-01 00:00:00: 0, 1). `wind_speed` and
 /// `wind_direction` are packed i16 on `(time, height, y, x)`: speed 10.0
 /// everywhere (scale 0.01, fill -32767; `[0,0,0,0]` is fill), direction 270.0
 /// at t = 0 and 0.0 at t = 1 (scale 0.1, `wind_from_direction`, meteorological
@@ -269,6 +270,8 @@ pub fn write_arome_like(dir: &Path) -> PathBuf {
     let lon = grid(1, ny, nx, 0.0, 0.0, |p, _| 4.0 + 3.0 * p / 4.0);
     put(&mut f, "latitude", &yx, DEG_LAT, None, &lat);
     put(&mut f, "longitude", &yx, DEG_LON, None, &lon);
+    let time_attrs = [("units", "hours since 2026-09-01 00:00:00"), ("standard_name", "time")];
+    put(&mut f, "time", &["time"], &time_attrs, None, &[0.0f64, 1.0]);
     let dims = ["time", "height", "y", "x"];
     const FILL: i16 = -32767;
     let mut speed = vec![1000i16; nt * ny * nx];

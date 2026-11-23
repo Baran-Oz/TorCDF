@@ -170,7 +170,9 @@ fn image(
         if let Some((r, c)) = cell_at(pos, rect, view, flip_y, ny, nx) {
             let i = if grid.transposed { c * ny + r } else { r * nx + c };
             if let Some(&value) = slice.data.get(i) {
-                v.hover = Some(Hover { value, iy: y0 + r * sy, ix: x0 + c * sx });
+                // The vector parts are laid out like the values.
+                let arrow = slice.vector.as_ref().and_then(|p| Some((*p.east.get(i)?, *p.north.get(i)?)));
+                v.hover = Some(Hover { value, iy: y0 + r * sy, ix: x0 + c * sx, arrow });
             }
         }
     }

@@ -137,7 +137,6 @@ fn picks_of(p: &Option<[String; 2]>) -> [Option<String>; 2] {
 /// non-coordinate variables of `x`'s group. x & y: the same rank, with
 /// `x`'s shape or one staggered by ±1 on the last two axes. Magnitude &
 /// direction: exactly `x`'s dimensions. Off: none.
-#[cfg_attr(not(test), expect(dead_code, reason = "the Plot tab's drop-downs list these"))]
 pub fn candidates(ds: &Dataset, x: &VarInfo, mode: ArrowMode) -> Vec<String> {
     let group = ds.group_of(&x.path);
     let named: Vec<&str> = group
@@ -163,7 +162,6 @@ pub fn candidates(ds: &Dataset, x: &VarInfo, mode: ArrowMode) -> Vec<String> {
 
 /// Same rank; equal on every axis except the last two, which may differ by
 /// one either way.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by `candidates`"))]
 fn staggered_or_same(a: &[usize], b: &[usize]) -> bool {
     let n = a.len();
     if n != b.len() || n < 2 {

@@ -26,7 +26,7 @@ use crate::render::lines::{project_polylines, upload_lines};
 use crate::render::map_curv::{set_curvilinear_mesh, upload_curvilinear};
 use crate::render::map_regular::{MapTile, upload_regular};
 use crate::view::defaults::AxisChoice;
-use crate::view::var_view::Coords;
+use crate::view::var_view::{Coords, Hover};
 
 /// The camera must rest this long before detail tiles are planned.
 pub const DETAIL_DELAY: Duration = Duration::from_millis(300);
@@ -42,17 +42,21 @@ const FIT_SAMPLES: usize = 32;
 /// Sample points per screen axis when finding the visible lat range.
 const WINDOW_SAMPLES: usize = 17;
 
-/// The value at full-resolution cell `(iy, ix)`. `tiles[0]` is the overview;
-/// every slice holds its tile's values row-major as `[ty, tx]`. The finest
-/// tile (smallest stride) whose extent holds the cell gives its nearest
-/// texel, as drawn (the overview is simply the coarsest tile); `None`
-/// outside every tile. Returns the value and the full-resolution cell
-/// that texel holds (`start + t * stride`), so a hover index names the
-/// cell whose value it shows.
-pub fn value_at(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
+/// What is drawn at full-resolution cell `(iy, ix)`. `tiles[0]` is the
+/// overview; every slice holds its tile's values (and vector parts)
+/// row-major as `[ty, tx]`. The finest tile (smallest stride) whose extent
+/// holds the cell gives its nearest texel, as drawn (the overview is simply
+/// the coarsest tile); `None` outside every tile. Gives the value, the
+/// full-resolution cell that texel holds (`start + t * stride`), so a hover
+/// index names the cell whose value it shows, and the east/north of the
+/// arrow there when the tile has vector parts (`NaN` where missing).
+fn sample_at(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<Hover> {
     let get = |spec: &TileSpec, s: &Slice, t: [usize; 2]| {
-        let v = s.data.get(t[0] * spec.shape()[1] + t[1]).copied()?;
-        Some((v, (spec.start[0] + t[0] * spec.stride[0], spec.start[1] + t[1] * spec.stride[1])))
+        let i = t[0] * spec.shape()[1] + t[1];
+        let value = s.data.get(i).copied()?;
+        let arrow = s.vector.as_ref().and_then(|p| Some((*p.east.get(i)?, *p.north.get(i)?)));
+        let (iy, ix) = (spec.start[0] + t[0] * spec.stride[0], spec.start[1] + t[1] * spec.stride[1]);
+        Some(Hover { value, iy, ix, arrow })
     };
     // Finest first; on a tie a detail tile beats the overview (`tiles[0]`).
     let mut finest: Vec<(usize, &(TileSpec, &Slice))> = tiles.iter().enumerate().collect();
@@ -63,10 +67,22 @@ pub fn value_at(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<(f
         .and_then(|(spec, s, t)| get(spec, s, t))
 }
 
-/// [`value_at`] for the hover readout: a missing value (NaN or ±inf) counts
-/// as no value, so it reads "—" like a point outside the data.
-pub fn hover_value(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
-    value_at(tiles, iy, ix).filter(|(v, _)| v.is_finite())
+/// The hover readout at a cell ([`sample_at`]): a missing value (NaN or
+/// ±inf) counts as no value, so it reads "—" like a point outside the data.
+pub fn hover_at(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<Hover> {
+    sample_at(tiles, iy, ix).filter(|h| h.value.is_finite())
+}
+
+/// [`sample_at`]'s value and cell.
+#[cfg(test)]
+fn value_at(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
+    sample_at(tiles, iy, ix).map(|h| (h.value, (h.iy, h.ix)))
+}
+
+/// [`hover_at`]'s value and cell.
+#[cfg(test)]
+fn hover_value(tiles: &[(TileSpec, &Slice)], iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
+    hover_at(tiles, iy, ix).map(|h| (h.value, (h.iy, h.ix)))
 }
 
 /// A lon/lat window in degrees. `lon` may run past ±180 (it follows the
@@ -918,13 +934,20 @@ impl MapState {
         self.grid_on_gpu.is_some_and(|k| k.proj == self.camera.proj)
     }
 
-    /// Hover value of full-resolution cell `(iy, ix)` from the tiles on
-    /// show, with the cell actually sampled; `None` for a missing value.
-    pub fn value(&self, iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
+    /// [`Self::hover`]'s value and cell.
+    #[cfg(test)]
+    fn value(&self, iy: usize, ix: usize) -> Option<(f32, (usize, usize))> {
+        self.hover(iy, ix).map(|h| (h.value, (h.iy, h.ix)))
+    }
+
+    /// Hover readout of full-resolution cell `(iy, ix)` from the tiles on
+    /// show: the value, the cell actually sampled and the arrow drawn
+    /// there; `None` for a missing value.
+    pub fn hover(&self, iy: usize, ix: usize) -> Option<Hover> {
         let t = self.overview.as_ref()?;
         let mut tiles = vec![(t.spec, &*t.data)];
         tiles.extend(self.detail.iter().map(|d| (d.tile.spec, &*d.tile.data)));
-        hover_value(&tiles, iy, ix)
+        hover_at(&tiles, iy, ix)
     }
 }
 
@@ -1209,6 +1232,31 @@ mod tests {
         assert_eq!(hover_value(&tiles, 0, 2), None);
         assert_eq!(hover_value(&tiles, 0, 3), Some((7.0, (0, 3))));
         assert_eq!(hover_value(&tiles, 5, 0), None);
+    }
+
+    #[test]
+    fn hover_carries_arrow() {
+        let spec = TileSpec { start: [0, 0], count: [1, 3], stride: [1, 1] };
+        let s = Slice {
+            shape: vec![1, 3],
+            data: vec![1.0, 2.0, 3.0],
+            valid_count: 3,
+            vector: Some(torcdf_core::VectorParts {
+                east: vec![0.5, f32::NAN, 1.5],
+                north: vec![-0.5, 0.0, -1.5],
+            }),
+        };
+        let tiles = [(spec, &s)];
+        let h = hover_at(&tiles, 0, 2).expect("a value");
+        assert_eq!((h.value, h.iy, h.ix, h.arrow), (3.0, 0, 2, Some((1.5, -1.5))));
+        // A missing component is carried as it is (the cursor shows "—").
+        let h = hover_at(&tiles, 0, 1).expect("a value");
+        assert!(h.arrow.is_some_and(|(e, n)| e.is_nan() && n == 0.0));
+        // No vector parts: no arrow.
+        let plain = Slice { shape: vec![1, 3], data: vec![1.0, 2.0, 3.0], valid_count: 3, vector: None };
+        let tiles = [(spec, &plain)];
+        assert_eq!(hover_at(&tiles, 0, 0).map(|h| h.arrow), Some(None));
+        assert_eq!(hover_value(&tiles, 0, 0), Some((1.0, (0, 0))));
     }
 
     #[test]

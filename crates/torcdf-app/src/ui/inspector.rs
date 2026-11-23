@@ -1,45 +1,88 @@
-//! Right panel: plot settings, value under the cursor, attributes.
+//! Right panel: a Plot | Attributes tab row, the tab's content, and the
+//! value under the cursor pinned at the bottom.
 
 use eframe::egui;
 use torcdf_core::cf::Geo;
-use torcdf_core::{Attr, RotateChoice, Storage};
+use torcdf_core::{
+    AngleRef, AngleUnit, Attr, DirConvention, Guessed, PairForm, RotateChoice, Storage, Towards, VectorPair,
+    en_to_magdir,
+};
 
 use super::{attr_text, dtype_name, fmt_value, slider_label};
 use crate::map::projection::Projection;
-use crate::app::Action;
+use crate::app::{Action, hidden_note};
 use crate::render::colormap::Colormap;
+use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO};
 use crate::view::arrow_state::LENGTH_RANGE;
 use crate::view::defaults::ViewKind;
 use crate::view::var_view::{Display, VarView};
 
+/// Height of the Cursor area pinned at the bottom of the panel (its rows
+/// scroll when they do not fit).
+const CURSOR_HEIGHT: f32 = 220.0;
+
+/// The right panel's tabs (one choice per window).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelTab {
+    #[default]
+    Plot,
+    Attributes,
+}
+
+/// What the panel shows besides the view and the colour settings.
+pub struct PanelInput<'a> {
+    pub tab: PanelTab,
+    pub var_selected: bool,
+    /// Title and attributes of the selected item.
+    pub attrs: Option<(String, &'a [Attr])>,
+    /// The arrow slot of the view's file and the variables its drop-downs
+    /// offer in its mode.
+    pub arrows: Option<(&'a ArrowLayer, &'a [String])>,
+}
+
 pub fn show(
     ui: &mut egui::Ui,
+    input: PanelInput<'_>,
     display: &mut Display,
     mut view: Option<&mut VarView>,
-    var_selected: bool,
-    attrs: Option<(String, &[Attr])>,
     actions: &mut Vec<Action>,
 ) {
-    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-        ui.heading("Plot");
-        settings(ui, display, view.as_deref());
-        if let Some(v) = view.as_deref_mut() {
-            map_settings(ui, v);
-        }
-        if let Some(v) = view.as_deref_mut() {
-            vector_section(ui, v, actions);
-        }
-        let view = view.as_deref();
-        ui.separator();
+    let edge = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 4));
+    egui::Panel::top("panel tabs").frame(edge).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for (tab, name) in [(PanelTab::Plot, "Plot"), (PanelTab::Attributes, "Attributes")] {
+                if ui.selectable_label(input.tab == tab, name).clicked() && input.tab != tab {
+                    actions.push(Action::SetPanelTab(tab));
+                }
+            }
+        });
+    });
+    egui::Panel::bottom("cursor area").resizable(false).exact_size(CURSOR_HEIGHT).frame(edge).show(ui, |ui| {
         ui.heading("Cursor");
-        if view.is_some_and(|v| v.kind == ViewKind::Map) {
-            map_cursor(ui, view);
-        } else {
-            cursor(ui, view);
+        egui::ScrollArea::vertical().id_salt("cursor rows").auto_shrink(false).show(ui, |ui| {
+            let view = view.as_deref();
+            if view.is_some_and(|v| v.kind == ViewKind::Map) {
+                map_cursor(ui, view);
+            } else {
+                cursor(ui, view);
+            }
+        });
+    });
+    egui::ScrollArea::vertical().id_salt("panel tab").auto_shrink(false).show(ui, |ui| match input.tab {
+        PanelTab::Plot => {
+            ui.heading("Colour");
+            if let Some(v) = view.as_deref() {
+                ui.strong(&v.var.name);
+            }
+            settings(ui, display, view.as_deref());
+            if let Some(v) = view.as_deref_mut() {
+                map_settings(ui, v);
+            }
+            if let (Some(v), Some((layer, candidates))) = (view.as_deref_mut(), input.arrows) {
+                arrows_section(ui, v, layer, candidates, actions);
+            }
         }
-        ui.separator();
-        ui.heading("Attributes");
-        attributes(ui, view, var_selected, attrs);
+        PanelTab::Attributes => attributes(ui, view.as_deref(), input.var_selected, input.attrs),
     });
 }
 
@@ -96,16 +139,65 @@ fn settings(ui: &mut egui::Ui, display: &mut Display, view: Option<&VarView>) {
     }
 }
 
-/// Components of a vector view, what is known about their direction, the
-/// arrow switches and the rotation switch.
-fn vector_section(ui: &mut egui::Ui, v: &mut VarView, actions: &mut Vec<Action>) {
-    let Some(pair) = &v.vector else { return };
+/// The Arrows section: how the arrows are made (or Off), the two variables,
+/// a magnitude/direction pair's convention, why nothing is drawn, then the
+/// arrow length, the grid notes and the rotation switch of the pair drawn.
+fn arrows_section(
+    ui: &mut egui::Ui,
+    v: &mut VarView,
+    layer: &ArrowLayer,
+    candidates: &[String],
+    actions: &mut Vec<Action>,
+) {
+    if v.axes.is_none() && v.vector.is_none() {
+        return;
+    }
     ui.separator();
-    ui.heading("Vector");
-    let leaf = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-    ui.label(format!("{} + {}", leaf(&pair.east), leaf(&pair.north)));
+    ui.heading("Arrows");
+    let mut mode = layer.mode;
+    ui.radio_value(&mut mode, ArrowMode::Off, "Off");
+    ui.radio_value(&mut mode, ArrowMode::EastNorth, "x & y components");
+    ui.radio_value(&mut mode, ArrowMode::MagDir, "Magnitude & direction");
+    if mode != layer.mode {
+        actions.push(Action::SetArrowMode(mode));
+    }
+    let labels = match layer.mode {
+        ArrowMode::Off => None,
+        ArrowMode::EastNorth => Some(["x (east)", "y (north)"]),
+        ArrowMode::MagDir => Some(["Magnitude", "Direction"]),
+    };
+    if let Some(labels) = labels {
+        egui::Grid::new("arrow picks").num_columns(2).show(ui, |ui| {
+            for (slot, label) in labels.into_iter().enumerate() {
+                ui.label(label);
+                let picked = layer.picks[slot].as_deref();
+                egui::ComboBox::from_id_salt(("arrow pick", slot))
+                    .selected_text(picked.map_or("—", leaf))
+                    .show_ui(ui, |ui| {
+                        for c in candidates {
+                            if ui.selectable_label(picked == Some(c.as_str()), leaf(c)).clicked() {
+                                actions.push(Action::PickArrowVar { slot, path: c.clone() });
+                            }
+                        }
+                    });
+                ui.end_row();
+            }
+        });
+        if let (ArrowMode::MagDir, Some(PairForm::MagDir(c))) = (layer.mode, layer.pair.as_ref().map(|p| p.form)) {
+            convention(ui, c, actions);
+        }
+        let problem = layer.problem.as_deref().or(layer.missing_picks().then_some(PICK_TWO));
+        if let Some(p) = problem {
+            ui.add(egui::Label::new(egui::RichText::new(p).color(ui.visuals().warn_fg_color)).wrap());
+        } else if layer.pair.is_some() && v.vector.is_none() {
+            // On, but this variable is not on the pair's grid.
+            ui.add(egui::Label::new(hidden_note(&v.var.name)).wrap());
+        }
+    }
+    if v.vector.is_none() {
+        return;
+    }
     if let Some(a) = &mut v.arrows {
-        ui.checkbox(&mut a.on, "Arrows");
         ui.add_enabled(
             a.on,
             egui::Slider::new(&mut a.length, LENGTH_RANGE).logarithmic(true).text("Arrow length"),
@@ -124,6 +216,103 @@ fn vector_section(ui: &mut egui::Ui, v: &mut VarView, actions: &mut Vec<Action>)
     }
 }
 
+/// A variable path's last component, as the drop-downs list it.
+fn leaf(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+/// Direction convention of a magnitude/direction pair: going from / to,
+/// the angle reference and unit, each marked as from the file or guessed.
+/// A change sends the new convention with that setting's guess cleared.
+fn convention(ui: &mut egui::Ui, c: DirConvention, actions: &mut Vec<Action>) {
+    let note = |ui: &mut egui::Ui, guessed: bool| ui.weak(if guessed { "guessed" } else { "from the file" });
+    let mut new = c;
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut new.towards, Towards::From, "Coming from");
+        ui.radio_value(&mut new.towards, Towards::To, "Going to");
+        note(ui, c.guessed.towards);
+    });
+    let reference_name = |r: AngleRef| match r {
+        AngleRef::ClockwiseFromNorth => "Clockwise from north",
+        AngleRef::CounterClockwiseFromEast => "Counter-clockwise from east",
+    };
+    let unit_name = |u: AngleUnit| match u {
+        AngleUnit::Degrees => "Degrees",
+        AngleUnit::Radians => "Radians",
+    };
+    egui::Grid::new("arrow convention").num_columns(3).show(ui, |ui| {
+        ui.label("Angle");
+        egui::ComboBox::from_id_salt("arrow angle").selected_text(reference_name(c.reference)).show_ui(ui, |ui| {
+            for r in [AngleRef::ClockwiseFromNorth, AngleRef::CounterClockwiseFromEast] {
+                ui.selectable_value(&mut new.reference, r, reference_name(r));
+            }
+        });
+        note(ui, c.guessed.reference);
+        ui.end_row();
+        ui.label("Units");
+        egui::ComboBox::from_id_salt("arrow units").selected_text(unit_name(c.unit)).show_ui(ui, |ui| {
+            for u in [AngleUnit::Degrees, AngleUnit::Radians] {
+                ui.selectable_value(&mut new.unit, u, unit_name(u));
+            }
+        });
+        note(ui, c.guessed.unit);
+        ui.end_row();
+    });
+    if new != c {
+        let g = c.guessed;
+        new.guessed = Guessed {
+            towards: g.towards && new.towards == c.towards,
+            reference: g.reference && new.reference == c.reference,
+            unit: g.unit && new.unit == c.unit,
+        };
+        actions.push(Action::SetConvention(new));
+    }
+}
+
+/// The cursor grid's "arrow" row when the view draws arrows: the arrow at
+/// the pointer in the pair's form, "—" where there is none.
+fn arrow_row(ui: &mut egui::Ui, v: &VarView) {
+    let Some(pair) = v.vector.as_ref().filter(|_| v.arrows.as_ref().is_some_and(|a| a.on)) else { return };
+    let units = pair.units.as_deref().unwrap_or("");
+    let line = match v.hover.and_then(|h| h.arrow) {
+        Some((east, north)) => arrow_line(pair, east, north, units),
+        None => "—".into(),
+    };
+    ui.label("arrow");
+    ui.label(line);
+    ui.end_row();
+}
+
+/// The cursor's arrow line for the east/north drawn at a cell, in `pair`'s
+/// form: "east 1.2, north -0.4 m/s", or "11.3 m/s from 247°" ("towards"
+/// for a going-to convention; radians as "rad"). A missing part gives "—".
+pub fn arrow_line(pair: &VectorPair, east: f32, north: f32, units: &str) -> String {
+    if east.is_nan() || north.is_nan() {
+        return "—".into();
+    }
+    let with_units = |s: String| if units.is_empty() { s } else { format!("{s} {units}") };
+    match pair.form {
+        PairForm::EastNorth => {
+            with_units(format!("east {}, north {}", fmt_value(east as f64), fmt_value(north as f64)))
+        }
+        PairForm::MagDir(c) => {
+            let (mag, dir) = en_to_magdir(east as f64, north as f64, &c);
+            let way = match c.towards {
+                Towards::From => "from",
+                Towards::To => "towards",
+            };
+            // `+ 0.0` turns a -0 angle into 0.
+            let dir = dir + 0.0;
+            let angle = match c.unit {
+                // Whole degrees; just under a full turn reads 0°, not 360°.
+                AngleUnit::Degrees => format!("{}°", dir.round().rem_euclid(360.0) + 0.0),
+                AngleUnit::Radians => format!("{dir:.2} rad"),
+            };
+            format!("{} {way} {angle}", with_units(fmt_value(mag)))
+        }
+    }
+}
+
 fn range_field(v: &mut f32, speed: f64) -> egui::DragValue<'_> {
     egui::DragValue::new(v).speed(speed).custom_formatter(|x, _| fmt_value(x))
 }
@@ -136,7 +325,8 @@ fn units(v: &VarView) -> &str {
 /// state; re-projection happens in background jobs.
 fn map_settings(ui: &mut egui::Ui, v: &mut VarView) {
     let (ViewKind::Map, Some(map)) = (v.kind, v.map.as_mut()) else { return };
-    ui.add_space(4.0);
+    ui.separator();
+    ui.heading("Map");
     let mut proj = map.camera.proj;
     egui::ComboBox::from_id_salt("projection").selected_text(proj.name()).show_ui(ui, |ui| {
         for p in Projection::all() {
@@ -165,6 +355,7 @@ fn map_cursor(ui: &mut egui::Ui, view: Option<&VarView>) {
             None => ui.label(NONE),
         };
         ui.end_row();
+        arrow_row(ui, v);
         let (lon, lat) = match map.pointer {
             Some((lo, la)) => (format!("{lo:.4}°"), format!("{la:.4}°")),
             None => (NONE.into(), NONE.into()),
@@ -202,6 +393,7 @@ fn cursor(ui: &mut egui::Ui, view: Option<&VarView>) {
         ui.label("value");
         ui.label(format!("{} {}", fmt_value(h.value as f64), units(v)));
         ui.end_row();
+        arrow_row(ui, v);
         let coord = |d: usize, i: usize| v.coords.dims.get(d)?.as_ref()?.get(i).copied();
         match &v.geo {
             Geo::Regular { .. } => {
@@ -329,6 +521,59 @@ pub fn log_range(range: (f32, f32), min_positive: Option<f32>) -> Result<(f32, f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use torcdf_core::{AngleSource, Frame};
+
+    fn pair(form: PairForm) -> VectorPair {
+        VectorPair {
+            path: "/p".into(),
+            name: "p".into(),
+            units: None,
+            east: "/a".into(),
+            north: "/b".into(),
+            centre_dims: vec!["y".into(), "x".into()],
+            centre_shape: vec![2, 2],
+            horiz: [0, 1],
+            centre_lat: None,
+            centre_lon: None,
+            frame: Frame::Geographic,
+            angle: AngleSource::FromLatLon,
+            rotate: RotateChoice::Auto,
+            by_hand: true,
+            form,
+        }
+    }
+
+    fn magdir(towards: Towards, unit: AngleUnit) -> PairForm {
+        PairForm::MagDir(DirConvention {
+            towards,
+            reference: AngleRef::ClockwiseFromNorth,
+            unit,
+            guessed: Guessed::default(),
+        })
+    }
+
+    #[test]
+    fn arrow_line_formats() {
+        let from = pair(magdir(Towards::From, AngleUnit::Degrees));
+        assert_eq!(arrow_line(&from, 10.0, 0.0, "m/s"), "10 m/s from 270°");
+        let to = pair(magdir(Towards::To, AngleUnit::Degrees));
+        assert_eq!(arrow_line(&to, 0.0, 10.0, "m/s"), "10 m/s towards 0°");
+        // Just under a whole turn rounds to 0°, never 360°.
+        assert_eq!(arrow_line(&to, -0.001, 10.0, "m/s"), "10 m/s towards 0°");
+        // A wind from the north: never "-0°".
+        assert_eq!(arrow_line(&from, 0.0, -10.0, "m/s"), "10 m/s from 0°");
+        assert_eq!(arrow_line(&to, -0.0, 10.0, "m/s"), "10 m/s towards 0°");
+        let rad = pair(magdir(Towards::To, AngleUnit::Radians));
+        assert_eq!(arrow_line(&rad, 10.0, 0.0, "m/s"), "10 m/s towards 1.57 rad");
+        let en = pair(PairForm::EastNorth);
+        assert_eq!(arrow_line(&en, 1.25, -0.5, "m/s"), "east 1.25, north -0.5 m/s");
+        assert_eq!(arrow_line(&en, 1.25, -0.5, ""), "east 1.25, north -0.5");
+        assert_eq!(arrow_line(&from, 11.3, 0.0, ""), "11.3 from 270°");
+        for p in [&from, &en] {
+            assert_eq!(arrow_line(p, f32::NAN, 1.0, "m/s"), "—");
+            assert_eq!(arrow_line(p, 1.0, f32::NAN, "m/s"), "—");
+        }
+    }
 
     #[test]
     fn centring() {

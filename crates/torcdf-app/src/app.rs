@@ -17,8 +17,9 @@ use torcdf_core::{
 };
 
 use crate::render::colormap::Colormap;
+use crate::ui::inspector::{PanelInput, PanelTab};
 use crate::ui::{self, inspector, plot_area, tree};
-use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO};
+use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO, candidates};
 use crate::view::defaults::ViewKind;
 use crate::view::playback::{FPS_RANGE, Playback, Tick, frame_bytes};
 use crate::view::popup::{Popup, PopupKind, PopupSet};
@@ -142,7 +143,6 @@ pub enum Selection {
 }
 
 /// What the panels asked for this frame; applied after drawing.
-#[cfg_attr(not(test), expect(dead_code, reason = "the Plot tab's Arrows section sends the arrow actions"))]
 pub enum Action {
     OpenDialog,
     Select(Selection),
@@ -159,6 +159,8 @@ pub enum Action {
     PickArrowVar { slot: usize, path: String },
     /// Direction convention of the arrows' magnitude/direction pair.
     SetConvention(DirConvention),
+    /// The right panel's tab.
+    SetPanelTab(PanelTab),
     FitView,
     /// A click on the map or image: pop up the series or profile there.
     OpenPopup { iy: usize, ix: usize, lonlat: Option<(f64, f64)> },
@@ -192,6 +194,8 @@ pub struct TorApp {
     pub popups: PopupSet,
     /// The window's arrow slot (the Plot tab's Arrows section).
     pub arrow_layer: Option<ArrowLayer>,
+    /// The right panel's tab.
+    pub panel_tab: PanelTab,
     /// Pop-up id and its CSV save: `None` when the dialog was cancelled.
     saves: Vec<(u64, Job<SaveOutcome>)>,
     service: SliceService,
@@ -233,6 +237,7 @@ impl TorApp {
             },
             popups: PopupSet::default(),
             arrow_layer: None,
+            panel_tab: PanelTab::Plot,
             saves: Vec::new(),
             service,
             cache_budget,
@@ -364,8 +369,13 @@ impl TorApp {
                 if !keep {
                     self.arrow_layer = Some(ArrowLayer::fresh(*id, &nc, &var));
                 }
+                // Picks refused over the previous variable may fit this one.
+                let retry = keep && self.arrow_layer.as_ref().is_some_and(|l| l.pair.is_none() && !l.missing_picks());
                 let v = self.x_view(*id, nc, var);
                 self.show_view(v);
+                if retry {
+                    self.pair_from_picks(true);
+                }
             }
         }
         self.selection = Some(sel);
@@ -404,6 +414,24 @@ impl TorApp {
         }
         let x = v.nc.meta.var(v.plain_path())?.clone();
         Some((v.file_id, v.nc.clone(), x))
+    }
+
+    /// The variables the Arrows section's drop-downs offer in the slot's
+    /// mode, over the coloured variable (a pair's own entry: its centre
+    /// grid). Only worked out while the Plot tab shows them.
+    fn arrow_candidates(&self) -> Vec<String> {
+        let (Some(v), Some(l)) = (&self.view, &self.arrow_layer) else { return Vec::new() };
+        if self.panel_tab != PanelTab::Plot || l.file != v.file_id || l.mode == ArrowMode::Off {
+            return Vec::new();
+        }
+        let x = match self.current_x() {
+            Some((_, _, x)) => x,
+            None => match &v.vector {
+                Some(p) => p.var_info(),
+                None => return Vec::new(),
+            },
+        };
+        candidates(&v.nc.meta, &x, l.mode)
     }
 
     /// Brings the current view in line with the arrow slot: a plain or
@@ -596,6 +624,10 @@ impl TorApp {
         if v.slider_pos.len() == old.slider_pos.len() {
             v.slider_pos = old.slider_pos.clone();
         }
+        // The view kind the user chose stays when it suits the new view.
+        if v.var.shape == old.var.shape && v.kinds().contains(&old.kind) {
+            v.kind = old.kind;
+        }
         v.image.view = old.image.view;
         v.image.fitted_to = old.image.fitted_to;
         v.image.user_moved = old.image.user_moved;
@@ -785,6 +817,7 @@ impl TorApp {
                 l.pair = Some(register(&nc, new));
                 self.show_slot();
             }
+            Action::SetPanelTab(tab) => self.panel_tab = tab,
             Action::FitView => {
                 if let Some(v) = &mut self.view {
                     v.image.view = None;
@@ -911,7 +944,7 @@ fn selected_attrs<'a>(files: &'a [OpenFile], sel: Option<&Selection>) -> Option<
 }
 
 /// The note on a plain view while the arrow layer cannot sit on `var`.
-fn hidden_note(var: &str) -> String {
+pub(crate) fn hidden_note(var: &str) -> String {
     format!("Arrows hidden: {var} is on a different grid")
 }
 
@@ -977,8 +1010,17 @@ impl eframe::App for TorApp {
             _ => selected_attrs(&self.files, self.selection.as_ref()),
         };
         let var_selected = matches!(self.selection, Some(Selection::Var(..)));
+        let offered = self.arrow_candidates();
+        let file = self.view.as_ref().map(|v| v.file_id);
+        let arrows = self.arrow_layer.as_ref().filter(|l| Some(l.file) == file);
+        let input = PanelInput {
+            tab: self.panel_tab,
+            var_selected,
+            attrs,
+            arrows: arrows.map(|l| (l, &offered[..])),
+        };
         egui::Panel::right("inspector").default_size(300.0).show(ui, |ui| {
-            inspector::show(ui, &mut self.display, self.view.as_mut(), var_selected, attrs, &mut actions)
+            inspector::show(ui, input, &mut self.display, self.view.as_mut(), &mut actions)
         });
         if let Some(v) = &mut self.view
             && !v.slider_dims().is_empty()
@@ -1080,6 +1122,7 @@ impl TorApp {
             },
             popups: PopupSet::default(),
             arrow_layer: None,
+            panel_tab: PanelTab::Plot,
             saves: Vec::new(),
             service,
             cache_budget,
@@ -1333,6 +1376,42 @@ mod tests {
         assert_eq!((v.var.path.as_str(), v.base.as_deref()), ("/wind_speed", None));
         assert!(v.vector.is_none());
         assert_eq!(app.selection, Some(Selection::Var(1, "/wind_speed".into())));
+    }
+
+    /// Toggling arrows keeps the view kind the user chose.
+    #[test]
+    fn arrow_toggle_keeps_view_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = arome_layer(dir.path());
+        assert_eq!(app.view.as_ref().unwrap().kind, ViewKind::Map);
+        app.apply(Action::SetKind(ViewKind::Image));
+        app.apply(Action::SetArrowMode(ArrowMode::Off));
+        let v = app.view.as_ref().unwrap();
+        assert_eq!((v.var.path.as_str(), v.kind), ("/wind_speed", ViewKind::Image));
+        app.apply(Action::SetArrowMode(ArrowMode::MagDir));
+        let v = app.view.as_ref().unwrap();
+        assert!(v.base.is_some(), "layered again");
+        assert_eq!(v.kind, ViewKind::Image);
+    }
+
+    /// Picks refused over one variable pair once a variable they fit is
+    /// selected: the stale "do not sit on" message goes.
+    #[test]
+    fn select_repairs_from_picks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, "/uo".into())));
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        app.apply(Action::PickArrowVar { slot: 0, path: "/uo".into() });
+        app.apply(Action::PickArrowVar { slot: 1, path: "/vo".into() });
+        assert!(app.arrow_layer.as_ref().unwrap().problem.is_some());
+        app.apply(Action::Select(Selection::Var(1, "/thetao".into())));
+        let slot = app.arrow_layer.as_ref().unwrap();
+        assert_eq!(slot.problem, None);
+        let pair = slot.pair.clone().expect("paired");
+        assert_eq!((pair.east.as_str(), pair.north.as_str()), ("/uo", "/vo"));
+        assert_eq!(app.view.as_ref().unwrap().var.path, layer_path("/thetao", &pair.path));
+        assert_eq!(app.selection, Some(Selection::Var(1, "/thetao".into())));
     }
 
     /// The AROME-like file has no time or vertical axis to pop up along, so

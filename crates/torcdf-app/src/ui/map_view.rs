@@ -24,7 +24,7 @@ use crate::app::Action;
 use crate::ui::popup::draw_markers;
 use crate::view::popup::{Popup, PopupSet};
 use crate::view::map_state::{BORDERS_ID, COAST_ID, GRID_ID, UploadFailure};
-use crate::view::var_view::{Display, Hover, VarView};
+use crate::view::var_view::{Display, VarView};
 
 const COAST_COLOUR: Color32 = Color32::from_gray(45);
 const BORDERS_COLOUR: Color32 = Color32::from_gray(128);
@@ -171,9 +171,9 @@ pub fn show(
         map.pointer = map.camera.screen_to_lonlat(pos, rect);
         if let (Some((lon, lat)), Some(loc)) = (map.pointer, &map.locator)
             && let Some((iy, ix)) = loc.nearest(lon, lat)
-            && let Some((value, (iy, ix))) = map.value(iy, ix)
+            && let Some(h) = map.hover(iy, ix)
         {
-            v.hover = Some(Hover { value, iy, ix });
+            v.hover = Some(h);
         }
     }
 

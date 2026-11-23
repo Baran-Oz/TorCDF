@@ -122,6 +122,9 @@ pub struct Hover {
     pub value: f32,
     pub iy: usize,
     pub ix: usize,
+    /// East and north of the arrow drawn at that cell (after rotation),
+    /// when the view has vector parts; `NaN` where one is missing.
+    pub arrow: Option<(f32, f32)>,
 }
 
 /// Text values of a string or char variable for the table.
