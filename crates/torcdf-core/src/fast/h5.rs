@@ -133,7 +133,9 @@ pub(crate) struct H5Var {
     pub filters: Vec<Filter>,
     pub order: ByteOrder,
     pub elem_size: usize,
-    shape: Vec<usize>,
+    /// The dataset's extent when opened. Along an unlimited dimension it can
+    /// be shorter than the netCDF length: records past it were never written.
+    pub shape: Vec<usize>,
     index: Index,
     base: u64,
     // Fields drop in declaration order: the dataset closes before the file.
@@ -143,10 +145,45 @@ pub(crate) struct H5Var {
 
 /// Chunk origin (in elements) to location.
 enum Index {
-    /// Every written chunk; absent means never written.
-    Full(HashMap<Vec<usize>, ChunkLoc>),
+    /// Every written chunk, keyed by its row-major linear chunk number;
+    /// absent means never written. Holds the chunk-grid strides.
+    Full {
+        strides: Vec<u64>,
+        map: HashMap<u64, ChunkLoc>,
+    },
     /// Filled one lookup at a time (too many chunks to list up front).
     ByCoord(Mutex<HashMap<Vec<usize>, Option<ChunkLoc>>>),
+}
+
+/// Row-major strides, in chunks, of the chunk grid over `shape`; None if
+/// the grid has more than `u64::MAX` chunks.
+fn grid_strides(shape: &[usize], chunk: &[usize]) -> Option<Vec<u64>> {
+    let mut strides = vec![1u64; shape.len()];
+    for d in (0..shape.len().saturating_sub(1)).rev() {
+        let n = u64::try_from(shape[d + 1].div_ceil(chunk[d + 1])).ok()?;
+        strides[d] = strides[d + 1].checked_mul(n)?;
+    }
+    // The outermost axis must fit too.
+    let n0 = u64::try_from(shape.first()?.div_ceil(*chunk.first()?)).ok()?;
+    strides.first()?.checked_mul(n0)?;
+    Some(strides)
+}
+
+/// Linear chunk number of the chunk at element origin `coord`; None if
+/// `coord` is not a chunk origin inside `shape`.
+fn linear(coord: &[usize], chunk: &[usize], shape: &[usize], strides: &[u64]) -> Option<u64> {
+    if coord.len() != chunk.len() || coord.len() != shape.len() {
+        return None;
+    }
+    let mut lin = 0u64;
+    for d in 0..coord.len() {
+        if !coord[d].is_multiple_of(chunk[d]) || coord[d] >= shape[d] {
+            return None;
+        }
+        let k = u64::try_from(coord[d] / chunk[d]).ok()?;
+        lin = lin.checked_add(k.checked_mul(strides[d])?)?;
+    }
+    Some(lin)
 }
 
 impl H5Var {
@@ -227,32 +264,48 @@ impl H5Var {
         if unsafe { H5Pget_chunk(dcpl.id, rank, cdims.as_mut_ptr()) } != rank {
             return Err("HDF5 could not read the chunk shape".into());
         }
+        if cdims.contains(&0) {
+            return Err("HDF5 reported an empty chunk shape".into());
+        }
+        let shape: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
+        let chunk: Vec<usize> = cdims.iter().map(|&d| d as usize).collect();
 
         let mut nchunks: hsize_t = 0;
         if unsafe { H5Dget_num_chunks(dset.id, space.id, &mut nchunks) } < 0 {
             return Err("HDF5 could not count the chunks".into());
         }
-        let index = if nchunks <= iter_limit {
-            let mut ctx = IterCtx {
-                rank: rank as usize,
-                base: f.base,
-                map: HashMap::new(),
-            };
-            let op_data = (&raw mut ctx).cast::<c_void>();
-            if unsafe { H5Dchunk_iter(dset.id, H5P_DEFAULT, Some(collect_chunk), op_data) } < 0 {
-                return Err("HDF5 could not list the chunks".into());
+        let strides = grid_strides(&shape, &chunk);
+        let index = match strides {
+            Some(strides) if nchunks <= iter_limit => {
+                let mut ctx = IterCtx {
+                    chunk: &chunk,
+                    shape: &shape,
+                    strides: &strides,
+                    base: f.base,
+                    map: HashMap::new(),
+                    err: None,
+                };
+                let op_data = (&raw mut ctx).cast::<c_void>();
+                let rc =
+                    unsafe { H5Dchunk_iter(dset.id, H5P_DEFAULT, Some(collect_chunk), op_data) };
+                if let Some(e) = ctx.err {
+                    return Err(e);
+                }
+                if rc < 0 {
+                    return Err("HDF5 could not list the chunks".into());
+                }
+                let map = ctx.map;
+                Index::Full { strides, map }
             }
-            Index::Full(ctx.map)
-        } else {
-            Index::ByCoord(Mutex::new(HashMap::new()))
+            _ => Index::ByCoord(Mutex::new(HashMap::new())),
         };
 
         Ok(Some(H5Var {
-            chunk: cdims.iter().map(|&d| d as usize).collect(),
+            chunk,
             filters,
             order,
             elem_size,
-            shape: dims.iter().map(|&d| d as usize).collect(),
+            shape,
             index,
             base: f.base,
             dset,
@@ -263,18 +316,23 @@ impl H5Var {
     /// `coord` is the chunk's element origin (multiples of `chunk`).
     /// Ok(None): the chunk was never written.
     pub(crate) fn chunk_loc(&self, coord: &[usize]) -> Result<Option<ChunkLoc>, String> {
-        let valid = coord.len() == self.chunk.len()
-            && coord
-                .iter()
-                .zip(&self.chunk)
-                .zip(&self.shape)
-                .all(|((&c, &k), &n)| c % k == 0 && c < n);
-        if !valid {
-            return Err(format!("{coord:?} is not a chunk origin of this variable"));
-        }
+        let not_origin = || format!("{coord:?} is not a chunk origin of this variable");
         match &self.index {
-            Index::Full(map) => Ok(map.get(coord).copied()),
+            Index::Full { strides, map } => {
+                let lin =
+                    linear(coord, &self.chunk, &self.shape, strides).ok_or_else(not_origin)?;
+                Ok(map.get(&lin).copied())
+            }
             Index::ByCoord(cache) => {
+                let valid = coord.len() == self.chunk.len()
+                    && coord
+                        .iter()
+                        .zip(&self.chunk)
+                        .zip(&self.shape)
+                        .all(|((&c, &k), &n)| c % k == 0 && c < n);
+                if !valid {
+                    return Err(not_origin());
+                }
                 if let Some(&hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(coord) {
                     return Ok(hit);
                 }
@@ -307,17 +365,29 @@ impl H5Var {
         if rc < 0 {
             return Err(format!("HDF5 could not locate chunk {coord:?}"));
         }
-        Ok(chunk_loc(self.base, mask, addr, size))
+        chunk_loc(self.base, mask, addr, size)
     }
 }
 
-/// None when the chunk has no storage (never written).
-fn chunk_loc(base: u64, filter_mask: c_uint, addr: haddr_t, size: hsize_t) -> Option<ChunkLoc> {
-    (addr != HADDR_UNDEF && size > 0).then(|| ChunkLoc {
-        offset: base + addr,
+/// Ok(None) when the chunk has no storage (never written); Err if the
+/// absolute offset does not fit in 64 bits.
+fn chunk_loc(
+    base: u64,
+    filter_mask: c_uint,
+    addr: haddr_t,
+    size: hsize_t,
+) -> Result<Option<ChunkLoc>, String> {
+    if addr == HADDR_UNDEF || size == 0 {
+        return Ok(None);
+    }
+    let offset = base
+        .checked_add(addr)
+        .ok_or("chunk address is past the end of any file")?;
+    Ok(Some(ChunkLoc {
+        offset,
         size,
         filter_mask,
-    })
+    }))
 }
 
 /// The filter pipeline, or None if it holds a filter the fast reader cannot
@@ -353,10 +423,14 @@ fn filters(dcpl: &Id) -> Result<Option<Vec<Filter>>, String> {
     Ok(Some(out))
 }
 
-struct IterCtx {
-    rank: usize,
+struct IterCtx<'a> {
+    chunk: &'a [usize],
+    shape: &'a [usize],
+    strides: &'a [u64],
     base: u64,
-    map: HashMap<Vec<usize>, ChunkLoc>,
+    map: HashMap<u64, ChunkLoc>,
+    /// Set when a chunk cannot be recorded; iteration then stops.
+    err: Option<String>,
 }
 
 /// `H5Dchunk_iter` callback: records one chunk in the `IterCtx` behind
@@ -369,10 +443,25 @@ unsafe extern "C" fn collect_chunk(
     op_data: *mut c_void,
 ) -> c_int {
     let ctx = unsafe { &mut *op_data.cast::<IterCtx>() };
-    let origin = unsafe { std::slice::from_raw_parts(offset, ctx.rank) };
-    if let Some(loc) = chunk_loc(ctx.base, filter_mask, addr, size) {
-        ctx.map
-            .insert(origin.iter().map(|&o| o as usize).collect(), loc);
+    let origin: Vec<usize> = unsafe { std::slice::from_raw_parts(offset, ctx.chunk.len()) }
+        .iter()
+        .map(|&o| o as usize)
+        .collect();
+    let Some(lin) = linear(&origin, ctx.chunk, ctx.shape, ctx.strides) else {
+        ctx.err = Some(format!(
+            "HDF5 listed a chunk at {origin:?}, outside the variable"
+        ));
+        return -1; // stop: H5Dchunk_iter returns failure
+    };
+    match chunk_loc(ctx.base, filter_mask, addr, size) {
+        Ok(Some(loc)) => {
+            ctx.map.insert(lin, loc);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            ctx.err = Some(e);
+            return -1;
+        }
     }
     0 // H5_ITER_CONT
 }
@@ -496,7 +585,7 @@ mod tests {
         let f = H5File::open(&nc.c_path).unwrap();
         let full = H5Var::open_with_limit(&f, "/z", u64::MAX).unwrap().unwrap();
         let lazy = H5Var::open_with_limit(&f, "/z", 0).unwrap().unwrap();
-        assert!(matches!(full.index, Index::Full(_)));
+        assert!(matches!(full.index, Index::Full { .. }));
         assert!(matches!(lazy.index, Index::ByCoord(_)));
         assert_eq!(full.filters, vec![Filter::Shuffle, Filter::Deflate]);
         assert_eq!(full.elem_size, 2);
@@ -514,5 +603,29 @@ mod tests {
         }
         assert!(full.chunk_loc(&[1, 0]).is_err());
         assert!(full.chunk_loc(&[6, 0]).is_err());
+    }
+
+    #[test]
+    fn chunk_address_overflow_is_an_error() {
+        assert!(chunk_loc(u64::MAX, 0, 1, 10).is_err());
+        assert_eq!(chunk_loc(0, 0, HADDR_UNDEF, 10), Ok(None));
+        let loc = ChunkLoc {
+            offset: 612,
+            size: 10,
+            filter_mask: 2,
+        };
+        assert_eq!(chunk_loc(512, 2, 100, 10), Ok(Some(loc)));
+    }
+
+    #[test]
+    fn linear_chunk_numbers_are_row_major() {
+        let (shape, chunk) = ([7, 13, 17], [2, 5, 6]); // a 4 x 3 x 3 grid
+        let s = grid_strides(&shape, &chunk).unwrap();
+        assert_eq!(s, vec![9, 3, 1]);
+        assert_eq!(linear(&[0, 0, 0], &chunk, &shape, &s), Some(0));
+        assert_eq!(linear(&[6, 10, 12], &chunk, &shape, &s), Some(35));
+        assert_eq!(linear(&[1, 0, 0], &chunk, &shape, &s), None);
+        assert_eq!(linear(&[8, 0, 0], &chunk, &shape, &s), None);
+        assert!(grid_strides(&[usize::MAX, usize::MAX, 2], &[1, 1, 1]).is_none());
     }
 }

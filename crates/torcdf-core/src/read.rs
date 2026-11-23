@@ -40,12 +40,46 @@ impl Slice {
 
 impl NcFile {
     /// Reads the requested hyperslab, unpacking every value.
+    ///
+    /// Variables the fast reader can decode are read by it; if it fails for
+    /// any reason, the read is silently repeated through netCDF-C, so a
+    /// fast-reader bug cannot cost the user data.
     pub fn read_slice(&self, r: &SliceRequest) -> Result<Slice, CoreError> {
+        if self.fast_eligible(&r.var)
+            && let Ok(s) = self.read_fast(r)
+        {
+            return Ok(s);
+        }
+        self.read_slice_via_library(r)
+    }
+
+    /// `read_slice` always through netCDF-C (diagnostics and benchmarks).
+    pub fn read_slice_via_library(&self, r: &SliceRequest) -> Result<Slice, CoreError> {
         self.read_slice_batched(r, BATCH_ELEMS)
     }
 
-    /// `read_slice` with the per-read element limit given (testable).
+    /// `read_slice_via_library` with the per-read element limit given (testable).
     fn read_slice_batched(&self, r: &SliceRequest, batch: usize) -> Result<Slice, CoreError> {
+        let (info, shape, total) = self.check_request(r)?;
+        let n = shape.len();
+        let unpack = Unpack::for_var(info);
+        let mut data = vec![f32::NAN; total];
+        if n == 0 {
+            let raw = self.read_raw(&r.var, &[], &[])?;
+            data[0] = unpack.apply(raw[0]);
+        } else {
+            self.read_blocks(r, &shape, &unpack, batch, &mut data)?;
+        }
+        let valid_count = data.iter().filter(|v| !v.is_nan()).count();
+        Ok(Slice { shape, data, valid_count })
+    }
+
+    /// Validates `r` against its variable. Returns the variable, the output
+    /// shape (`ceil(count / stride)` per dimension) and its element count.
+    pub(crate) fn check_request(
+        &self,
+        r: &SliceRequest,
+    ) -> Result<(&VarInfo, Vec<usize>, usize), CoreError> {
         let err = |msg: &str| CoreError::Read { var: r.var.clone(), msg: msg.into() };
         let info = self.numeric_var(&r.var)?;
         let n = info.shape.len();
@@ -71,17 +105,7 @@ impl NcFile {
             .try_fold(1usize, |a, &b| a.checked_mul(b))
             .filter(|t| t.checked_mul(4).is_some())
             .ok_or_else(|| err("slice is too large"))?;
-
-        let unpack = Unpack::for_var(info);
-        let mut data = vec![f32::NAN; total];
-        if n == 0 {
-            let raw = self.read_raw(&r.var, &[], &[])?;
-            data[0] = unpack.apply(raw[0]);
-        } else {
-            self.read_blocks(r, &shape, &unpack, batch, &mut data)?;
-        }
-        let valid_count = data.iter().filter(|v| !v.is_nan()).count();
-        Ok(Slice { shape, data, valid_count })
+        Ok((info, shape, total))
     }
 
     /// Fills `out` (row-major over `shape`) from contiguous hyperslabs.

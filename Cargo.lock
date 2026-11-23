@@ -3683,6 +3683,7 @@ dependencies = [
  "lru",
  "netcdf",
  "netcdf-sys",
+ "rayon",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.21",

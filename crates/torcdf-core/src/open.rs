@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 /// An open file: its structure plus the netCDF handle used for later reads.
 pub struct NcFile {
     pub meta: Dataset,
+    /// The fast chunk reader's handles and caches; dropped (closed) before
+    /// the netCDF handle.
+    pub(crate) fast: crate::fast::FastState,
     pub(crate) file: netcdf::File,
     /// The exact path given to netCDF-C (the 8.3 form on Windows when
     /// needed), so a second HDF5 open names the same file.
-    #[cfg_attr(not(test), allow(dead_code))] // read by the fast reader (stage 1c)
     pub(crate) c_path: PathBuf,
     open_id: u64,
 }
@@ -48,7 +50,7 @@ impl NcFile {
         }
         let meta = Dataset { path: path.to_path_buf(), file_size, format, root };
         let open_id = NEXT_OPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(NcFile { meta, file, c_path: cpath, open_id })
+        Ok(NcFile { meta, fast: Default::default(), file, c_path: cpath, open_id })
     }
 }
 
