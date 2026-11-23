@@ -168,6 +168,25 @@ pub fn write_long_series(dir: &Path) -> PathBuf {
     path
 }
 
+/// `profile.nc`: `depth` = 5 (`positive = "down"`, units `m`) and
+/// `t(depth, y, x)` f32 with `y` = 3, `x` = 4; `t[k, j, i] = k * 100 + j * 10 + i`.
+pub fn write_profile(dir: &Path) -> PathBuf {
+    let path = dir.join("profile.nc");
+    let mut f = netcdf::create(&path).unwrap();
+    f.add_dimension("depth", 5).unwrap();
+    f.add_dimension("y", 3).unwrap();
+    f.add_dimension("x", 4).unwrap();
+    let mut d = f.add_variable::<f64>("depth", &["depth"]).unwrap();
+    d.put_attribute("units", "m").unwrap();
+    d.put_attribute("positive", "down").unwrap();
+    d.put_values(&[0.5f64, 1.5, 3.0, 5.0, 10.0], ..).unwrap();
+    let mut t = f.add_variable::<f32>("t", &["depth", "y", "x"]).unwrap();
+    let vals: Vec<f32> =
+        (0..60).map(|n| ((n / 12) * 100 + (n / 4 % 3) * 10 + n % 4) as f32).collect();
+    t.put_values(&vals, ..).unwrap();
+    path
+}
+
 /// Records, rows and columns of [`write_fast_matrix`]'s variables.
 const FAST_DIMS: [usize; 3] = [7, 13, 17];
 

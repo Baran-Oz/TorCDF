@@ -148,6 +148,22 @@ impl fmt::Display for CfDateTime {
     }
 }
 
+impl CfDateTime {
+    /// `YYYY-MM-DDTHH:MM:SS`, with `.mmm` only when the seconds are
+    /// fractional (for files; `Display` is the label form).
+    pub fn iso(&self) -> String {
+        let head = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:",
+            self.year, self.month, self.day, self.hour, self.minute
+        );
+        if self.second.fract() == 0.0 {
+            format!("{head}{:02}", self.second as u32)
+        } else {
+            format!("{head}{:06.3}", self.second)
+        }
+    }
+}
+
 /// A parsed CF time-units string: unit length, epoch and calendar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeUnits {
@@ -275,4 +291,17 @@ fn parse_epoch(s: &str) -> Option<(i64, i64, i64, f64)> {
         sod = h * 3600.0 + mi * 60.0 + se;
     }
     Some((y, m, d, sod - offset_secs))
+}
+
+#[cfg(test)]
+mod iso_tests {
+    use super::*;
+
+    #[test]
+    fn iso_format() {
+        let mut t = CfDateTime { year: 2000, month: 1, day: 1, hour: 0, minute: 0, second: 0.0 };
+        assert_eq!(t.iso(), "2000-01-01T00:00:00");
+        t.second = 1.5;
+        assert_eq!(t.iso(), "2000-01-01T00:00:01.500");
+    }
 }
