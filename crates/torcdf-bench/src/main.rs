@@ -2,10 +2,13 @@
 //!
 //! Subcommands:
 //!   inspect <file>
-//!   gen <out.nc> --like <file> --var uo --target-gb N
+//!   gen <out.nc> --like <file> --var uo (--target-gb N | --steps N)
 //!   bench <file> --var V
+//!   series <file> --var V   (torcdf-core: library vs fast point series)
+//!   step <file> --var V     (torcdf-core: time to the next full slice)
 //!
-//! Deliberately independent of torcdf-core: uses `netcdf` / `netcdf-sys` directly.
+//! `inspect`, `gen` and `bench` are independent of torcdf-core and use `netcdf` /
+//! `netcdf-sys` directly; `series` and `step` measure torcdf-core itself.
 
 use std::error::Error;
 use std::ffi::{CStr, CString};
@@ -36,6 +39,18 @@ fn scale_grid(
     let lat = ((lat0 as f64 * s).round() as usize).max(1);
     let lon = ((lon0 as f64 * s).round() as usize).max(1);
     (lat, lon)
+}
+
+/// `[time, lat, lon]` of a generated file. `steps` keeps the source grid and
+/// sets the time length; otherwise the grid is scaled to `target_gb` over 8760 steps.
+fn gen_shape(src_shape: &[usize], steps: Option<usize>, target_gb: Option<u64>) -> [usize; 3] {
+    if let Some(t) = steps {
+        return [t, src_shape[1], src_shape[2]];
+    }
+    let time = 8760;
+    let gb = target_gb.expect("gen needs --steps or --target-gb");
+    let (lat, lon) = scale_grid(src_shape[1], src_shape[2], time, 2, 4, gb * 1_000_000_000);
+    [time, lat, lon]
 }
 
 /// Pick at most `max_out` evenly strided columns (stride = ceil(len / max_out)).
@@ -203,7 +218,10 @@ fn cmd_inspect(path: &str) -> Res<()> {
 // gen
 // ---------------------------------------------------------------------------
 
-fn cmd_gen(out: &str, like: &str, var: &str, target_gb: u64) -> Res<()> {
+fn cmd_gen(out: &str, like: &str, var: &str, steps: Option<usize>, target_gb: Option<u64>) -> Res<()> {
+    if steps.is_none() && target_gb.is_none() {
+        return Err("gen needs --steps N or --target-gb N".into());
+    }
     let vars = raw_all_vars(like)?;
     let sibling = if var == "uo" { "vo".to_string() } else { return Err("only --var uo (with sibling vo) supported".into()) };
     let src = vars.iter().find(|v| v.name == var).ok_or("var not found in --like")?;
@@ -211,11 +229,10 @@ fn cmd_gen(out: &str, like: &str, var: &str, target_gb: u64) -> Res<()> {
         return Err(format!("expected 3-D f32 variable, got {} {:?}", type_name(src.xtype), src.shape).into());
     }
     let chunks = src.chunks.clone().ok_or("source variable is not chunked")?;
-    let time_len = 8760usize;
-    let (lat, lon) = scale_grid(src.shape[1], src.shape[2], time_len, 2, 4, target_gb * 1_000_000_000);
+    let [time_len, lat, lon] = gen_shape(&src.shape, steps, target_gb);
     println!(
-        "source {:?} chunks {:?} deflate {:?} shuffle {}; target {} GB -> time={} lat={} lon={} ({:.1} GB uncompressed)",
-        src.shape, chunks, src.deflate, src.shuffle, target_gb, time_len, lat, lon,
+        "source {:?} chunks {:?} deflate {:?} shuffle {}; -> time={} lat={} lon={} ({:.1} GB uncompressed)",
+        src.shape, chunks, src.deflate, src.shuffle, time_len, lat, lon,
         (2 * time_len * lat * lon * 4) as f64 / 1e9
     );
 
@@ -507,6 +524,121 @@ fn cmd_bench(path: &str, var: &str) -> Res<()> {
 }
 
 // ---------------------------------------------------------------------------
+// series / step (torcdf-core)
+// ---------------------------------------------------------------------------
+
+use std::path::Path;
+use std::sync::Arc;
+use torcdf_core::{NcFile, SeriesRequest, SliceRequest, SliceService};
+
+/// Opens `path`; returns the file, the variable's full path and its shape.
+fn open_core(path: &str, var: &str) -> Res<(Arc<NcFile>, String, Vec<usize>)> {
+    let f = NcFile::open(Path::new(path))?;
+    let v = f.meta.var(&format!("/{var}")).ok_or("var not found")?;
+    let (vp, shape) = (v.path.clone(), v.shape.clone());
+    if shape.len() != 3 {
+        return Err(format!("expected a 3-D variable, got {shape:?}").into());
+    }
+    Ok((Arc::new(f), vp, shape))
+}
+
+fn quiet_service() -> SliceService {
+    SliceService::new(1 << 30, 2, Arc::new(|| {}))
+}
+
+fn full_slice(var: &str, shape: &[usize], t: usize) -> SliceRequest {
+    SliceRequest { var: var.into(), start: vec![t, 0, 0], count: vec![1, shape[1], shape[2]], stride: vec![1; 3] }
+}
+
+/// One pass, each part on a fresh file and service:
+/// (library ms for the first 200 steps, fast first block ms, fast total ms, fast_reads).
+fn series_pass(path: &str, var: &str) -> Res<(f64, f64, f64, usize)> {
+    let (f, vp, shape) = open_core(path, var)?;
+    let req = SeriesRequest { var: vp, point: vec![0, shape[1] / 2, shape[2] / 2], along: 0, centre: shape[0] / 2 };
+    let t = Instant::now();
+    let s = f.read_slice_via_library(&req.full_request(shape[0].min(200)))?;
+    let lib = ms(t.elapsed());
+    std::hint::black_box(&s);
+    drop(f);
+
+    let (f, _, _) = open_core(path, var)?;
+    let svc = quiet_service();
+    let t = Instant::now();
+    let mut h = svc.request_series(&f, req);
+    let (mut first, mut got) = (None, 0);
+    while h.finished().is_none() {
+        let b = h.take_blocks();
+        if !b.is_empty() && first.is_none() {
+            first = Some(ms(t.elapsed()));
+        }
+        got += b.iter().map(|b| b.values.len()).sum::<usize>();
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let total = ms(t.elapsed());
+    got += h.take_blocks().iter().map(|b| b.values.len()).sum::<usize>();
+    if got != shape[0] {
+        return Err(format!("series delivered {got} of {} steps", shape[0]).into());
+    }
+    Ok((lib, first.unwrap_or(total), total, f.fast_reads()))
+}
+
+fn cmd_series(path: &str, var: &str) -> Res<()> {
+    let (f, vp, shape) = open_core(path, var)?;
+    println!("series {path} var={var} shape={shape:?} fast_eligible={}", f.fast_eligible(&vp));
+    drop(f);
+    let n = shape[0];
+    let m = n.min(200);
+    for pass in ["first touch", "warm"] {
+        let (lib, first, total, reads) = series_pass(path, var)?;
+        println!(
+            "{pass}: library {lib:.1} ms for {m} steps (projected {:.0} ms for {n}) | fast first block {first:.1} ms, total {total:.1} ms for {n} steps (projected {:.0} ms for 8760), fast_reads {reads}",
+            lib * n as f64 / m as f64,
+            total * 8760.0 / n as f64
+        );
+    }
+    Ok(())
+}
+
+fn cmd_step(path: &str, var: &str) -> Res<()> {
+    let (f, vp, shape) = open_core(path, var)?;
+    let nt = shape[0];
+    if nt < 12 {
+        return Err("need at least 12 time steps".into());
+    }
+    println!("step {path} var={var} shape={shape:?}");
+    // Ten different steps spread over the series; each read is of t+1.
+    let steps: Vec<usize> = (0..10).map(|i| i * (nt - 2) / 10 + 1).collect();
+    let mut fresh = vec![];
+    for &t in &steps {
+        let s = Instant::now();
+        let out = f.read_slice(&full_slice(&vp, &shape, t))?;
+        fresh.push(s.elapsed());
+        std::hint::black_box(&out);
+    }
+    println!("fresh full-slice read_slice (fast path), median of 10: {:.1} ms (fast_reads {})", ms(median(fresh)), f.fast_reads());
+    let svc = quiet_service();
+    let mut cached = vec![];
+    for &t in &steps {
+        let r = full_slice(&vp, &shape, t);
+        let mut warm = svc.request(&f, r.clone());
+        while warm.try_take().is_none() {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        let s = Instant::now();
+        let mut h = svc.request(&f, r);
+        loop {
+            if let Some(out) = h.try_take() {
+                std::hint::black_box(out?);
+                break;
+            }
+        }
+        cached.push(s.elapsed());
+    }
+    println!("cached adjacent slice, request to try_take, median of 10: {:.3} ms", ms(median(cached)));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 
 fn arg(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
@@ -517,10 +649,19 @@ fn main() -> Res<()> {
     match args.first().map(String::as_str) {
         Some("inspect") => cmd_inspect(args.get(1).ok_or("usage: inspect <file>")?),
         Some("gen") => cmd_gen(
-            args.get(1).ok_or("usage: gen <out.nc> --like <file> --var uo --target-gb N")?,
+            args.get(1).ok_or("usage: gen <out.nc> --like <file> --var uo (--steps N | --target-gb N)")?,
             &arg(&args, "--like").ok_or("--like required")?,
             &arg(&args, "--var").unwrap_or_else(|| "uo".into()),
-            arg(&args, "--target-gb").ok_or("--target-gb required")?.parse()?,
+            arg(&args, "--steps").map(|v| v.parse()).transpose()?,
+            arg(&args, "--target-gb").map(|v| v.parse()).transpose()?,
+        ),
+        Some("series") => cmd_series(
+            args.get(1).ok_or("usage: series <file> --var V")?,
+            &arg(&args, "--var").unwrap_or_else(|| "uo".into()),
+        ),
+        Some("step") => cmd_step(
+            args.get(1).ok_or("usage: step <file> --var V")?,
+            &arg(&args, "--var").unwrap_or_else(|| "uo".into()),
         ),
         Some("gen-curv") => cmd_gen_curv(args.get(1).ok_or("usage: gen-curv <out.nc>")?),
         Some("bench") => cmd_bench(
@@ -531,7 +672,7 @@ fn main() -> Res<()> {
             args.get(1).ok_or("usage: ne-convert <in.geojson> <out.bin>")?,
             args.get(2).ok_or("usage: ne-convert <in.geojson> <out.bin>")?,
         ),
-        _ => Err("usage: torcdf-bench inspect|gen|gen-curv|bench|ne-convert ...".into()),
+        _ => Err("usage: torcdf-bench inspect|gen|gen-curv|bench|series|step|ne-convert ...".into()),
     }
 }
 
@@ -592,6 +733,11 @@ mod tests {
         assert!((ratio - ratio0).abs() / ratio0 < 0.01);
         let bytes = (2 * 8760 * lat * lon * 4) as f64;
         assert!((bytes - 1e11).abs() / 1e11 < 0.01, "{bytes}");
+    }
+
+    #[test]
+    fn steps_override_keeps_grid() {
+        assert_eq!(gen_shape(&[24, 380, 1016], Some(2000), None), [2000, 380, 1016]);
     }
 
     #[test]
