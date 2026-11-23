@@ -89,21 +89,18 @@ fn group_body(
         if v.dtype.is_numeric() {
             r.context_menu(|ui| {
                 let others = partners(&file.nc.meta, &v.path);
-                ui.add_enabled_ui(!others.is_empty(), |ui| {
-                    ui.menu_button("Pair with", |ui| {
-                        for p in &others {
-                            let name = p.rsplit('/').next().unwrap_or(p);
-                            if ui.button(name).clicked() {
-                                actions.push(Action::PairWith {
-                                    file: file_id,
-                                    east: v.path.clone(),
-                                    north: p.clone(),
-                                });
-                                ui.close();
+                for (title, items) in pair_menus(file_id, &v.path, &others) {
+                    ui.add_enabled_ui(!items.is_empty(), |ui| {
+                        ui.menu_button(title, |ui| {
+                            for (label, action) in items {
+                                if ui.button(label).clicked() {
+                                    actions.push(action);
+                                    ui.close();
+                                }
                             }
-                        }
+                        });
                     });
-                });
+                }
             });
         }
     }
@@ -129,6 +126,27 @@ fn group_body(
             }
         });
     }
+}
+
+/// The two "Pair …" submenus of variable `var_path`: (title, [(item label,
+/// action)]). Each names the role of both variables, so which one becomes
+/// east is never left implicit (spec §4).
+fn pair_menus(file: u64, var_path: &str, others: &[String]) -> [(String, Vec<(String, Action)>); 2] {
+    let leaf = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let me = leaf(var_path);
+    let menu = |me_east: bool| {
+        let (role, other_role) = if me_east { ("east", "north") } else { ("north", "east") };
+        let items = others
+            .iter()
+            .map(|p| {
+                let (east, north) =
+                    if me_east { (var_path.to_string(), p.clone()) } else { (p.clone(), var_path.to_string()) };
+                (format!("{} (as {other_role})", leaf(p)), Action::PairWith { file, east, north })
+            })
+            .collect();
+        (format!("Pair {me} as {role} with"), items)
+    };
+    [menu(true), menu(false)]
 }
 
 /// Variables of the same group that `can_pair` accepts with `var_path`,
@@ -176,5 +194,29 @@ mod tests {
         // Coordinates and the variable itself never appear.
         let of_h = partners(&noclue.meta, "/h");
         assert!(!of_h.iter().any(|p| p == "/lat" || p == "/lon" || p == "/h"), "{of_h:?}");
+    }
+
+    /// The menu says which variable becomes east and which north, and the
+    /// action carries exactly that choice.
+    #[test]
+    fn pair_menu_names_the_roles() {
+        let menus = pair_menus(7, "/v", &["/u".to_string()]);
+        let got: Vec<(String, String, String, String)> = menus
+            .into_iter()
+            .flat_map(|(title, items)| {
+                items.into_iter().map(move |(label, action)| match action {
+                    Action::PairWith { file: 7, east, north } => (title.clone(), label, east, north),
+                    _ => panic!("not a pairing"),
+                })
+            })
+            .collect();
+        let row = |t: &str, l: &str, e: &str, n: &str| (t.into(), l.into(), e.into(), n.into());
+        assert_eq!(
+            got,
+            vec![
+                row("Pair v as east with", "u (as north)", "/v", "/u"),
+                row("Pair v as north with", "u (as east)", "/u", "/v"),
+            ]
+        );
     }
 }
