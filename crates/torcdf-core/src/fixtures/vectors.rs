@@ -4,9 +4,12 @@
 //! points) the field is east `E = known_east(p)` and north
 //! `N = known_north(q)`, in m s-1. Files store the grid components
 //! `u = E cos α + N sin α` and `v = −E sin α + N cos α`, each at its own
-//! point. Turned grids put position (p, q) at
-//! `lat = 40 + 0.1 (p sin θ + q cos θ)` and
-//! `lon = 5 + 0.1 (p cos θ − q sin θ) / cos(lat)`, with α = θ.
+//! point. Turned grids are straight in Mercator coordinates (conformal, so
+//! the local grid angle on the sphere is θ everywhere, α = θ): with
+//! `k = 0.1° / cos 40°` (in radians), position (p, q) sits at
+//! `lon = 5° + k (p cos θ − q sin θ)` and
+//! `merc(lat) = merc(40°) + k (p sin θ + q cos θ)`, where
+//! `merc(φ) = ln tan(π/4 + φ/2)`: about 0.1° per cell around (40°N, 5°E).
 
 use netcdf::{FileMut, NcTypeDescriptor};
 use std::path::{Path, PathBuf};
@@ -21,11 +24,15 @@ pub fn known_north(q: f64) -> f64 {
     0.5 + 0.05 * q
 }
 
-/// Latitude and longitude of position (p, q) on a grid turned by `theta`.
+/// Latitude and longitude of position (p, q) on a grid turned by `theta`
+/// (straight in Mercator coordinates; see the module docs).
 fn lat_lon(theta: f64, p: f64, q: f64) -> (f64, f64) {
     let (s, c) = theta.sin_cos();
-    let lat = 40.0 + 0.1 * (p * s + q * c);
-    let lon = 5.0 + 0.1 * (p * c - q * s) / lat.to_radians().cos();
+    let k = 0.1f64.to_radians() / 40f64.to_radians().cos();
+    let merc = |lat: f64| (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln();
+    let y = merc(40f64.to_radians()) + k * (p * s + q * c);
+    let lat = (2.0 * y.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
+    let lon = 5.0 + (k * (p * c - q * s)).to_degrees();
     (lat, lon)
 }
 
