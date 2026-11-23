@@ -57,12 +57,27 @@ impl NcFile {
         {
             return self.read_pair(&pair, r);
         }
+        if self.meta.var(&r.var).is_none()
+            && let Some((var, pair)) = crate::vector::split_layer(&r.var)
+        {
+            return self.read_layer(var, pair, r);
+        }
         if self.fast_eligible(&r.var)
             && let Ok(s) = self.read_fast(r)
         {
             return Ok(s);
         }
         self.read_slice_via_library(r)
+    }
+
+    /// An arrow layer: `var`'s values with the registered pair's arrows,
+    /// both over the request's indices.
+    fn read_layer(&self, var: &str, pair: &str, r: &SliceRequest) -> Result<Slice, CoreError> {
+        let misfit = || CoreError::Read { var: r.var.clone(), msg: format!("arrows {pair} do not fit {var}") };
+        let p = self.pair(pair).filter(|p| self.layer_fits(var, p)).ok_or_else(misfit)?;
+        let x = self.read_slice(&SliceRequest { var: var.into(), ..r.clone() })?;
+        let v = self.read_pair(&p, &SliceRequest { var: p.path.clone(), ..r.clone() })?;
+        Ok(Slice { shape: x.shape, data: x.data, valid_count: x.valid_count, vector: v.vector })
     }
 
     /// `read_slice` always through netCDF-C (diagnostics and benchmarks).
@@ -104,6 +119,12 @@ impl NcFile {
             && let Some(pair) = self.pair(&r.var)
         {
             return check_shape(r, &pair.centre_shape).map(|(shape, _)| shape);
+        }
+        if self.meta.var(&r.var).is_none()
+            && let Some((var, _)) = crate::vector::split_layer(&r.var)
+        {
+            let x = SliceRequest { var: var.into(), ..r.clone() };
+            return self.check_request(&x).map(|(_, shape, _)| shape);
         }
         self.check_request(r).map(|(_, shape, _)| shape)
     }

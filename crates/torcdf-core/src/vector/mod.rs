@@ -168,7 +168,22 @@ fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// The virtual path of an arrow layer: `var`'s values with `pair`'s arrows.
+pub fn layer_path(var: &str, pair: &str) -> String {
+    format!("{var}|{pair}")
+}
+
+/// Splits an arrow layer path into `(var, pair)` at the first `|`.
+pub fn split_layer(path: &str) -> Option<(&str, &str)> {
+    path.split_once('|')
+}
+
 impl crate::NcFile {
+    /// Whether `var` is a numeric variable on exactly `pair`'s centre grid.
+    pub fn layer_fits(&self, var: &str, pair: &VectorPair) -> bool {
+        self.numeric_var(var).is_ok_and(|v| v.dims == pair.centre_dims && v.shape == pair.centre_shape)
+    }
+
     fn pairs_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<VectorPair>>> {
         self.pairs.read().unwrap_or_else(|e| e.into_inner())
     }

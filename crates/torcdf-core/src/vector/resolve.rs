@@ -974,4 +974,58 @@ mod tests {
         assert_eq!(v.east.len(), 2);
         assert_eq!(v.north.len(), 2);
     }
+
+    fn arome_layer(t: usize) -> (tempfile::TempDir, NcFile, String, SliceRequest) {
+        let d = tempfile::tempdir().unwrap();
+        let f = NcFile::open(&vectors::write_arome_like(d.path())).unwrap();
+        let p = f.pairs().into_iter().find(|p| p.magnitude() == "/wind_speed").expect("magdir pair");
+        let l = crate::vector::layer_path("/wind_speed", &p.path);
+        let req = SliceRequest {
+            var: l.clone(),
+            start: vec![t, 0, 0, 0],
+            count: vec![1, 1, 4, 5],
+            stride: vec![1; 4],
+        };
+        (d, f, p.path.clone(), req)
+    }
+
+    #[test]
+    fn layer_reads_x_values_and_pair_arrows() {
+        let (_d, f, pair, req) = arome_layer(0);
+        let s = f.read_slice(&req).unwrap();
+        let x = f.read_slice(&SliceRequest { var: "/wind_speed".into(), ..req.clone() }).unwrap();
+        let p = f.read_slice(&SliceRequest { var: pair, ..req.clone() }).unwrap();
+        assert_eq!(s.shape, x.shape);
+        assert_eq!(s.valid_count, x.valid_count);
+        assert!(s.data.iter().zip(&x.data).all(|(a, b)| nan_eq(*a, *b)));
+        let (sv, pv) = (s.vector.unwrap(), p.vector.unwrap());
+        assert!(sv.east.iter().zip(&pv.east).all(|(a, b)| nan_eq(*a, *b)));
+        assert!(sv.north.iter().zip(&pv.north).all(|(a, b)| nan_eq(*a, *b)));
+        assert_eq!(f.check_any_request(&req).unwrap(), x.shape);
+    }
+
+    #[test]
+    fn layer_follows_time() {
+        let (_d, f, _pair, req) = arome_layer(1);
+        let s = f.read_slice(&req).unwrap();
+        let north = s.vector.unwrap().north[2 * 5 + 2];
+        assert!((north + 10.0).abs() < 0.01, "north {north}");
+    }
+
+    #[test]
+    fn layer_rejects_misfit() {
+        let d = tempfile::tempdir().unwrap();
+        let f = NcFile::open(&vectors::write_roms_like(d.path())).unwrap();
+        let l = crate::vector::layer_path("/u", "/u+v");
+        let req = SliceRequest { var: l, start: vec![0, 0, 0], count: vec![1, 12, 15], stride: vec![1; 3] };
+        let e = f.read_slice(&req).err().expect("misfit").to_string();
+        assert!(e.contains("do not fit"), "{e}");
+    }
+
+    #[test]
+    fn layer_unknown_pair_errors() {
+        let (_d, f, _pair, req) = arome_layer(0);
+        let req = SliceRequest { var: crate::vector::layer_path("/wind_speed", "/nope"), ..req };
+        assert!(f.read_slice(&req).is_err());
+    }
 }

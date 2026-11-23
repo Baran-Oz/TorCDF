@@ -19,5 +19,5 @@ pub use vector::{
     AngleRef, AngleSource, AngleUnit, Basis, DirConvention, Frame, Guessed, PairForm, Resolved, RotateChoice,
     Side, Towards, VectorPair, VectorParts, angle_from_latlon,
     can_pair, can_pair_magdir, convention_of, detect_pairs, en_to_magdir, magdir_to_en, pair_by_hand,
-    pair_magdir_by_hand, stagger_side,
+    pair_magdir_by_hand, stagger_side, layer_path, split_layer,
 };
