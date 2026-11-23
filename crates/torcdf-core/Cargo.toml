@@ -9,6 +9,7 @@ fixtures = []
 
 [dependencies]
 crossbeam-channel = "0.5.17"
+hdf5-metno-sys = "0.12"
 lru = "0.19.1"
 netcdf = { version = "0.12", features = ["static"] }
 netcdf-sys = "0.9"
@@ -19,3 +20,4 @@ thiserror = "2"
 torcdf-core = { path = ".", features = ["fixtures"] }
 tempfile = "3"
 approx = "0.5"
+libdeflater = "1"

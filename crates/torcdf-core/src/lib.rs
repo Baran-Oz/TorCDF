@@ -2,6 +2,7 @@
 pub mod fixtures;
 pub mod basemap;
 pub mod cf;
+mod fast;
 mod model;
 mod open;
 mod read;
