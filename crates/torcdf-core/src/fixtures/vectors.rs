@@ -98,7 +98,8 @@ const STD_LON: &[(&str, &str)] = &[("standard_name", "longitude")];
 const DEG_LAT: &[(&str, &str)] = &[("units", "degree_north")];
 const DEG_LON: &[(&str, &str)] = &[("units", "degree_east")];
 
-/// NEMO-like `nemo.nc` (θ = 30°): `time_counter` = 2, `y` = 20, `x` = 30.
+/// NEMO-like `nemo.nc` (θ = 30°): `time_counter` = 2 (its variable in
+/// "seconds since 1900-01-01 00:00:00"), `y` = 20, `x` = 30.
 /// T points `nav_lat`/`nav_lon`, U points `nav_lat_u`/`nav_lon_u` at
 /// (j, i+½), V points `nav_lat_v`/`nav_lon_v` at (j+½, i), all with
 /// latitude/longitude standard names. `thetao`, `uo`, `vo` (units `m/s`, no
@@ -112,6 +113,8 @@ pub fn write_nemo_like(dir: &Path) -> PathBuf {
     f.add_dimension("time_counter", nt).unwrap();
     f.add_dimension("y", ny).unwrap();
     f.add_dimension("x", nx).unwrap();
+    let tc = [("units", "seconds since 1900-01-01 00:00:00"), ("axis", "T")];
+    put(&mut f, "time_counter", &["time_counter"], &tc, None, &[0f64, 86_400.0]);
     let yx = ["y", "x"];
     let shape = [1, ny, nx];
     put_lat_lon(&mut f, ["nav_lat", "nav_lon"], &yx, shape, theta, (0.0, 0.0), [STD_LAT, STD_LON]);
@@ -169,7 +172,8 @@ pub fn write_roms_like(dir: &Path) -> PathBuf {
     path
 }
 
-/// WRF-like `wrf.nc` (θ = −0.2 rad): `Time` = 2, mass points
+/// WRF-like `wrf.nc` (θ = −0.2 rad): `Time` = 2 with no `Time` variable but
+/// `XTIME(Time)` = [0, 60] ("minutes since 2000-01-01 00:00:00"), mass points
 /// `(south_north, west_east)` = 10 × 14, `west_east_stag` = 15,
 /// `south_north_stag` = 11. `XLAT`/`XLONG` (mass), `XLAT_U`/`XLONG_U` at
 /// (j, i−½) and `XLAT_V`/`XLONG_V` at (j−½, i), all `(Time, ..)` with
@@ -189,6 +193,8 @@ pub fn write_wrf_like(dir: &Path) -> PathBuf {
     let mass = ["Time", "south_north", "west_east"];
     let u_dims = ["Time", "south_north", "west_east_stag"];
     let v_dims = ["Time", "south_north_stag", "west_east"];
+    let xtime = [("units", "minutes since 2000-01-01 00:00:00"), ("description", "minutes since simulation start")];
+    put(&mut f, "XTIME", &["Time"], &xtime, None, &[0f32, 60.0]);
     let ll = [DEG_LAT, DEG_LON];
     put_lat_lon(&mut f, ["XLAT", "XLONG"], &mass, [nt, ny, nx], theta, (0.0, 0.0), ll);
     put_lat_lon(&mut f, ["XLAT_U", "XLONG_U"], &u_dims, [nt, ny, nx + 1], theta, (-0.5, 0.0), ll);

@@ -159,7 +159,37 @@ fn time_axis_found() {
     let file = NcFile::open(&fixtures::write_classic(d.path())).unwrap();
     let t = file.meta.var("/t").unwrap();
     assert_eq!(detect_axes(&file.meta, t).time, Some(0));
+    assert_eq!(detect_axes(&file.meta, t).time_var.as_deref(), Some("/time"));
     assert_eq!(detect_axes(&file.meta, t).vertical, None);
+}
+
+/// WRF: no `Time` variable, but `XTIME(Time)` has "since" units.
+#[test]
+fn time_axis_from_since_variable() {
+    let d = tempfile::tempdir().unwrap();
+    let file = NcFile::open(&fixtures::vectors::write_wrf_like(d.path())).unwrap();
+    for name in ["/U", "/V", "/T2", "/XLAT"] {
+        let ax = detect_axes(&file.meta, file.meta.var(name).unwrap());
+        assert_eq!(ax.time, Some(0), "{name}");
+        assert_eq!(ax.time_var.as_deref(), Some("/XTIME"), "{name}");
+        assert_eq!(ax.vertical, None, "{name}");
+    }
+    // The time variable itself is over its own time dimension.
+    assert_eq!(detect_axes(&file.meta, file.meta.var("/XTIME").unwrap()).time, Some(0));
+}
+
+/// An unlimited dimension with no time-like variable is time, uncoordinated.
+#[test]
+fn unlimited_dimension_is_time() {
+    let d = tempfile::tempdir().unwrap();
+    let file = NcFile::open(&fixtures::write_fast_matrix(d.path())).unwrap();
+    let ax = detect_axes(&file.meta, file.meta.var("/sd_f32").unwrap());
+    assert_eq!((ax.time, ax.time_var, ax.vertical), (Some(0), None, None));
+    // Not over the unlimited dimension: no time.
+    assert_eq!(detect_axes(&file.meta, file.meta.var("/contig_f32").unwrap()).time, None);
+    // A fixed-length dimension without a coordinate stays plain.
+    let file = NcFile::open(&fixtures::write_bare(d.path())).unwrap();
+    assert_eq!(detect_axes(&file.meta, file.meta.var("/data").unwrap()).time, None);
 }
 
 #[test]

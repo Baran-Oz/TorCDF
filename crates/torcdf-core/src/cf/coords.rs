@@ -10,10 +10,13 @@ pub enum Geo {
 }
 
 /// Indices into the variable's `dims`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Axes {
     pub time: Option<usize>,
     pub vertical: Option<usize>,
+    /// Path of the 1-D variable giving the time dimension's values, when
+    /// there is one (`/time`, or WRF's `/XTIME` over `Time`).
+    pub time_var: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +147,9 @@ pub fn detect_geo(ds: &Dataset, v: &VarInfo) -> Geo {
     }
 }
 
+/// The time and vertical dimensions of `v`: from dimension coordinates
+/// first; time also from a "since"-units variable over a dimension, else the
+/// unlimited dimension.
 pub fn detect_axes(ds: &Dataset, v: &VarInfo) -> Axes {
     let group = ds.group_of(&v.path);
     let mut axes = Axes::default();
@@ -158,17 +164,47 @@ pub fn detect_axes(ds: &Dataset, v: &VarInfo) -> Axes {
         };
         if axes.time.is_none() && is_time(c) {
             axes.time = Some(i);
+            axes.time_var = Some(c.path.clone());
         } else if axes.vertical.is_none() && is_vertical(c) {
             axes.vertical = Some(i);
         }
     }
+    if axes.time.is_some() {
+        return axes;
+    }
+    // No dimension coordinate is time. A dimension is still time when a 1-D
+    // variable over it has "<unit> since <date>" units (WRF's `XTIME(Time)`);
+    // that variable gives its values. Failing that, the unlimited dimension
+    // (the record axis) is time, without values.
+    let free = |i: &usize| axes.vertical != Some(*i);
+    let since = v.dims.iter().enumerate().filter(|(i, _)| free(i)).find_map(|(i, dim)| {
+        group
+            .vars
+            .iter()
+            .chain(ds.root.vars.iter())
+            .find(|c| c.dims.len() == 1 && c.dims[0] == *dim && has_since_units(c))
+            .map(|c| (i, c.path.clone()))
+    });
+    if let Some((i, path)) = since {
+        axes.time = Some(i);
+        axes.time_var = Some(path);
+    } else {
+        axes.time = v.dims.iter().enumerate().filter(|(i, _)| free(i)).find_map(|(i, dim)| {
+            let unlimited = group.dims.iter().chain(ds.root.dims.iter()).find(|d| d.name == *dim)?.unlimited;
+            unlimited.then_some(i)
+        });
+    }
     axes
+}
+
+fn has_since_units(c: &VarInfo) -> bool {
+    attr_str(c, "units").is_some_and(|u| u.to_ascii_lowercase().contains(" since "))
 }
 
 fn is_time(c: &VarInfo) -> bool {
     attr_str(c, "axis").is_some_and(|a| a.eq_ignore_ascii_case("T"))
         || attr_str(c, "standard_name").is_some_and(|s| s.eq_ignore_ascii_case("time"))
-        || attr_str(c, "units").is_some_and(|u| u.to_ascii_lowercase().contains(" since "))
+        || has_since_units(c)
 }
 
 fn is_vertical(c: &VarInfo) -> bool {

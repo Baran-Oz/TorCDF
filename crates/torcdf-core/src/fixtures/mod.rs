@@ -155,16 +155,17 @@ pub fn write_bare(dir: &Path) -> PathBuf {
     path
 }
 
-/// netCDF-3 classic `long_series.nc`: `v(time)` f32 with `time` = 4096 and
-/// `v[i] = i`. Long enough for a library-path series of 16 blocks.
+/// netCDF-3 classic `long_series.nc`: `v(time)` f32 with `time` unlimited
+/// (4096 records, no `time` variable) and `v[i] = i`. Long enough for a
+/// library-path series of 16 blocks.
 pub fn write_long_series(dir: &Path) -> PathBuf {
     let path = dir.join("long_series.nc");
     let mut f = netcdf::create_with(&path, netcdf::Options::default()).unwrap();
-    f.add_dimension("time", 4096).unwrap();
+    f.add_unlimited_dimension("time").unwrap();
     f.add_variable::<f32>("v", &["time"]).unwrap();
     f.enddef().unwrap();
     let vals: Vec<f32> = (0..4096u16).map(f32::from).collect();
-    f.variable_mut("v").unwrap().put_values(&vals, ..).unwrap();
+    f.variable_mut("v").unwrap().put_values(&vals, 0..4096).unwrap();
     path
 }
 

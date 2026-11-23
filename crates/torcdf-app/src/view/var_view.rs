@@ -172,18 +172,8 @@ impl VarView {
         let ds = &nc.meta;
         let kind = choose_view(ds, &var);
         let geo = detect_geo(ds, &var);
-        let time_dim = detect_axes(ds, &var).time;
-        let coord_paths = dim_coord_paths(&nc, &var, &geo);
-        // Unknown units or calendar: no decoding, raw values are shown.
-        let time_units = time_dim
-            .and_then(|d| coord_paths[d].as_deref())
-            .and_then(|p| ds.var(p))
-            .and_then(|c| {
-                let attr = |n: &str| {
-                    c.attrs.iter().find(|a| a.name == n).and_then(|a| a.value.as_str())
-                };
-                TimeUnits::parse(attr("units")?, attr("calendar"))
-            });
+        let mut coord_paths = dim_coord_paths(&nc, &var, &geo);
+        let (time_dim, time_units) = time_axis(ds, &var, &mut coord_paths);
         let curv = match &geo {
             Geo::Curvilinear { y_dim, x_dim, lat_var, lon_var }
                 if var.shape[*y_dim].saturating_mul(var.shape[*x_dim]) <= CURV_MAX_CELLS =>
@@ -254,19 +244,10 @@ impl VarView {
         let regular =
             pair.centre_lat.as_deref().and_then(|p| ds.var(p)).is_some_and(|v| v.shape.len() == 1);
         let geo = geo_of_pair(&pair, regular);
-        let time_dim = detect_axes(ds, &var).time;
         let mut coord_paths = dim_coord_paths(&nc, &var, &Geo::None);
         coord_paths[hy] = None;
         coord_paths[hx] = None;
-        let time_units = time_dim
-            .and_then(|d| coord_paths[d].as_deref())
-            .and_then(|p| ds.var(p))
-            .and_then(|c| {
-                let attr = |n: &str| {
-                    c.attrs.iter().find(|a| a.name == n).and_then(|a| a.value.as_str())
-                };
-                TimeUnits::parse(attr("units")?, attr("calendar"))
-            });
+        let (time_dim, time_units) = time_axis(ds, &var, &mut coord_paths);
         let mut kind = ViewKind::Map;
         let mut notice = None;
         if !regular && var.shape[hy].saturating_mul(var.shape[hx]) > CURV_MAX_CELLS {
@@ -758,6 +739,28 @@ fn load_vector_coords(nc: &NcFile, paths: &[Option<String>], pair: &VectorPair) 
 /// The slice read for `req` among `ready`, if there.
 fn held(ready: &[(SliceRequest, Arc<Slice>)], req: &SliceRequest) -> Option<Arc<Slice>> {
     ready.iter().find(|(r, _)| r == req).map(|(_, s)| s.clone())
+}
+
+/// The time dimension of `var` and its decoded units. The variable giving
+/// time values (`/time`, or WRF's `/XTIME` over `Time`) becomes that
+/// dimension's coordinate in `coord_paths`. Unknown units or calendar: no
+/// decoding, raw values are shown.
+fn time_axis(
+    ds: &torcdf_core::Dataset,
+    var: &VarInfo,
+    coord_paths: &mut [Option<String>],
+) -> (Option<usize>, Option<TimeUnits>) {
+    let axes = detect_axes(ds, var);
+    let Some(d) = axes.time else { return (None, None) };
+    let Some(c) = axes.time_var.as_deref().and_then(|p| ds.var(p)).filter(|c| c.dtype.is_numeric())
+    else {
+        return (Some(d), None);
+    };
+    if let Some(slot) = coord_paths.get_mut(d) {
+        *slot = Some(c.path.clone());
+    }
+    let attr = |n: &str| c.attrs.iter().find(|a| a.name == n).and_then(|a| a.value.as_str());
+    (Some(d), attr("units").and_then(|u| TimeUnits::parse(u, attr("calendar"))))
 }
 
 /// "Map unavailable" notice for `why` (a clause about the variable).

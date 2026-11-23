@@ -329,8 +329,12 @@ fn kind_info(
     let coord = |dim: usize| {
         view.coords.dims.get(dim).and_then(|c| c.as_ref()).filter(|c| c.len() == var.shape[dim])
     };
-    let axis = coord(d).cloned().unwrap_or_else(|| (0..len).map(|i| i as f64).collect());
-    let time = if view.time_dim == Some(d) { view.time_units.clone() } else { None };
+    // Indices when the coordinate is not loaded (yet) or failed; they are
+    // not times, so dates come only with the coordinate.
+    let (axis, time) = match coord(d) {
+        Some(c) => (c.clone(), view.time_units.clone().filter(|_| view.time_dim == Some(d))),
+        None => ((0..len).map(|i| i as f64).collect(), None),
+    };
     let down = kind == PopupKind::Profile && runs_down(coord_var(&view.nc, var, &var.dims[d]));
 
     let plotted = view.plotted_dims();
@@ -485,6 +489,55 @@ mod tests {
         assert!(p.time.is_some());
     }
 
+    /// WRF: `Time` has no same-named variable; `XTIME(Time)` makes it time
+    /// and gives the dates, for scalars and for the vector pair alike.
+    #[test]
+    fn wrf_popup_series() {
+        let d = tempfile::tempdir().unwrap();
+        let path = fixtures::vectors::write_wrf_like(d.path());
+        let svc = SliceService::new(1 << 20, 2, noop());
+        let check = |v: &VarView, p: &mut Popup| {
+            assert_eq!(v.time_dim, Some(0));
+            assert_eq!(p.kinds, vec![PopupKind::Series]);
+            assert_eq!(p.axis, vec![0.0, 60.0]);
+            assert!(p.time.is_some());
+            fill(p);
+            assert!(p.error.is_none(), "{:?}", p.error);
+            assert!(p.values.iter().all(Option::is_some));
+            let csv = p.csv();
+            let rows: Vec<&str> = csv.lines().skip(1).collect();
+            assert!(rows[0].starts_with("2000-01-01T00:00:00,"), "{csv}");
+            assert!(rows[1].starts_with("2000-01-01T01:00:00,"), "{csv}");
+        };
+        for var in ["/T2", "/U"] {
+            let v = view_of(path.clone(), var);
+            let mut p = Popup::open(&v, 3, 4, None, 1, &svc).unwrap();
+            check(&v, &mut p);
+        }
+        let nc = Arc::new(NcFile::open(&path).unwrap());
+        let pair = nc.pair("/U+V").expect("pair");
+        let mut v = VarView::new_vector(&egui::Context::default(), 1, nc, pair);
+        wait_coords(&mut v);
+        let mut p = Popup::open(&v, 3, 4, None, 1, &svc).unwrap();
+        check(&v, &mut p);
+        assert!(p.east.iter().chain(&p.north).all(Option::is_some));
+    }
+
+    /// Before (or without) the coordinates the axis is indices, and indices
+    /// are not dates.
+    #[test]
+    fn popup_without_time_coordinates_has_no_dates() {
+        let d = tempfile::tempdir().unwrap();
+        let mut v = view_of(fixtures::write_nc4(d.path()), "/ocean/uo");
+        assert!(v.time_units.is_some());
+        v.coords.dims[0] = None;
+        let svc = SliceService::new(1 << 20, 1, noop());
+        let p = Popup::open(&v, 4, 7, None, 1, &svc).unwrap();
+        assert_eq!(p.axis, (0..24).map(f64::from).collect::<Vec<_>>());
+        assert!(p.time.is_none());
+        assert_eq!(p.csv().lines().nth(2).map(|l| l.split(',').next()), Some(Some("1")));
+    }
+
     #[test]
     fn popup_needs_series_dimension() {
         let d = tempfile::tempdir().unwrap();
@@ -560,7 +613,8 @@ mod tests {
         let info = nc.meta.var("/v").unwrap().clone();
         let mut v = VarView::new(&egui::Context::default(), 1, nc.clone(), info);
         wait_coords(&mut v);
-        v.time_dim = Some(0);
+        // `time` is unlimited with no variable: still the time dimension.
+        assert_eq!(v.time_dim, Some(0));
         v.slider_pos = vec![2048];
         let mut set = PopupSet::default();
         let id = set.next_id();
@@ -615,8 +669,7 @@ mod tests {
         let pair = nc.pairs().into_iter().next().expect("pair");
         let mut v = VarView::new_vector(&egui::Context::default(), 1, nc, pair);
         wait_coords(&mut v);
-        // The fixture has no time coordinate variable; treat dim 0 as time.
-        v.time_dim = Some(0);
+        assert_eq!(v.time_dim, Some(0));
         let svc = SliceService::new(1 << 20, 2, noop());
         let mut p = Popup::open(&v, 3, 4, None, 1, &svc).unwrap();
         fill(&mut p);
