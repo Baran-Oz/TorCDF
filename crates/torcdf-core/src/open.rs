@@ -21,6 +21,9 @@ pub struct NcFile {
     /// Vector pairs: detected at open, then added or removed by hand. They
     /// last for the session only.
     pub(crate) pairs: std::sync::RwLock<Vec<std::sync::Arc<crate::vector::VectorPair>>>,
+    /// Resolved staggering and rotation per pair path, with the pair they
+    /// were resolved for (a pair replaced at the same path resolves again).
+    pub(crate) resolved: std::sync::Mutex<crate::vector::ResolvedCache>,
 }
 
 /// Source of [`NcFile::open_id`] values.
@@ -62,6 +65,7 @@ impl NcFile {
             c_path: cpath,
             open_id,
             pairs: std::sync::RwLock::new(pairs),
+            resolved: Default::default(),
         })
     }
 }

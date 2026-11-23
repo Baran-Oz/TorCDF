@@ -5,8 +5,11 @@
 //! ([`pair_by_hand`]). Pairings last for the session; nothing is written.
 
 mod detect;
+mod resolve;
 
 pub use detect::{can_pair, detect_pairs, pair_by_hand};
+pub use resolve::{Basis, Resolved, Side, angle_from_latlon, stagger_side};
+pub(crate) use resolve::ResolvedCache;
 
 use crate::{Attr, AttrValue, DType, Storage, VarInfo};
 use std::sync::Arc;
@@ -148,11 +151,14 @@ impl crate::NcFile {
             Some(q) => *q = p.clone(),
             None => pairs.push(p.clone()),
         }
+        drop(pairs);
+        self.forget_resolved(&p.path);
         p
     }
 
     /// Unregisters the pair at `path` (no effect if there is none).
     pub fn remove_pair(&self, path: &str) {
         self.pairs.write().unwrap_or_else(|e| e.into_inner()).retain(|p| p.path != path);
+        self.forget_resolved(path);
     }
 }

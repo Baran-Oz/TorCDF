@@ -48,7 +48,15 @@ impl NcFile {
     /// Variables the fast reader can decode are read by it; if it fails for
     /// any reason, the read is silently repeated through netCDF-C, so a
     /// fast-reader bug cannot cost the user data.
+    ///
+    /// A registered vector pair path is read on its centre grid: `data` is
+    /// the magnitude and `vector` holds east/north.
     pub fn read_slice(&self, r: &SliceRequest) -> Result<Slice, CoreError> {
+        if self.meta.var(&r.var).is_none()
+            && let Some(pair) = self.pair(&r.var)
+        {
+            return self.read_pair(&pair, r);
+        }
         if self.fast_eligible(&r.var)
             && let Ok(s) = self.read_fast(r)
         {
@@ -84,32 +92,20 @@ impl NcFile {
         &self,
         r: &SliceRequest,
     ) -> Result<(&VarInfo, Vec<usize>, usize), CoreError> {
-        let err = |msg: &str| CoreError::Read { var: r.var.clone(), msg: msg.into() };
         let info = self.numeric_var(&r.var)?;
-        let n = info.shape.len();
-        if r.start.len() != n || r.count.len() != n || r.stride.len() != n {
-            return Err(err(&format!("request has the wrong rank (variable has {n} dimensions)")));
-        }
-        let mut shape = Vec::with_capacity(n);
-        for d in 0..n {
-            let (start, count, stride) = (r.start[d], r.count[d], r.stride[d]);
-            if count == 0 || stride == 0 {
-                return Err(err("count and stride must be at least 1"));
-            }
-            if start.checked_add(count).is_none_or(|end| end > info.shape[d]) {
-                return Err(err(&format!(
-                    "dimension {d}: start {start} + count {count} exceeds length {}",
-                    info.shape[d]
-                )));
-            }
-            shape.push(count.div_ceil(stride));
-        }
-        let total = shape
-            .iter()
-            .try_fold(1usize, |a, &b| a.checked_mul(b))
-            .filter(|t| t.checked_mul(4).is_some())
-            .ok_or_else(|| err("slice is too large"))?;
+        let (shape, total) = check_shape(r, &info.shape)?;
         Ok((info, shape, total))
+    }
+
+    /// Validates `r` against a variable or a registered vector pair (its
+    /// centre grid). Returns the output shape.
+    pub(crate) fn check_any_request(&self, r: &SliceRequest) -> Result<Vec<usize>, CoreError> {
+        if self.meta.var(&r.var).is_none()
+            && let Some(pair) = self.pair(&r.var)
+        {
+            return check_shape(r, &pair.centre_shape).map(|(shape, _)| shape);
+        }
+        self.check_request(r).map(|(_, shape, _)| shape)
     }
 
     /// Fills `out` (row-major over `shape`) from contiguous hyperslabs.
@@ -341,7 +337,7 @@ impl NcFile {
         }
     }
 
-    fn numeric_var(&self, path: &str) -> Result<&VarInfo, CoreError> {
+    pub(crate) fn numeric_var(&self, path: &str) -> Result<&VarInfo, CoreError> {
         let info = self.meta.var(path).ok_or_else(|| CoreError::Read {
             var: path.into(),
             msg: "no such variable".into(),
@@ -395,6 +391,35 @@ impl NcFile {
             Err(_) => Err(err("netCDF read failed unexpectedly".into())),
         }
     }
+}
+
+/// Validates `r` against a variable of shape `dims`. Returns the output shape
+/// (`ceil(count / stride)` per dimension) and its element count.
+pub(crate) fn check_shape(r: &SliceRequest, dims: &[usize]) -> Result<(Vec<usize>, usize), CoreError> {
+    let err = |msg: &str| CoreError::Read { var: r.var.clone(), msg: msg.into() };
+    let n = dims.len();
+    if r.start.len() != n || r.count.len() != n || r.stride.len() != n {
+        return Err(err(&format!("request has the wrong rank (variable has {n} dimensions)")));
+    }
+    let mut shape = Vec::with_capacity(n);
+    for (d, &len) in dims.iter().enumerate() {
+        let (start, count, stride) = (r.start[d], r.count[d], r.stride[d]);
+        if count == 0 || stride == 0 {
+            return Err(err("count and stride must be at least 1"));
+        }
+        if start.checked_add(count).is_none_or(|end| end > len) {
+            return Err(err(&format!(
+                "dimension {d}: start {start} + count {count} exceeds length {len}"
+            )));
+        }
+        shape.push(count.div_ceil(stride));
+    }
+    let total = shape
+        .iter()
+        .try_fold(1usize, |a, &b| a.checked_mul(b))
+        .filter(|t| t.checked_mul(4).is_some())
+        .ok_or_else(|| err("slice is too large"))?;
+    Ok((shape, total))
 }
 
 /// Converts a buffer of netCDF-allocated `char*` (native-endian pointer

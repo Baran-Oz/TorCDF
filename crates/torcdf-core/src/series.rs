@@ -193,12 +193,19 @@ pub(crate) fn start(
 /// metadata (no file access).
 fn full_request_for(file: &NcFile, req: &SeriesRequest) -> Result<SliceRequest, CoreError> {
     let err = |msg: String| CoreError::Read { var: req.var.clone(), msg };
-    let info = file.meta.var(&req.var).ok_or_else(|| err("no such variable".into()))?;
-    let len = info.shape.get(req.along).copied().ok_or_else(|| {
-        err(format!("no dimension {} (the variable has {})", req.along, info.shape.len()))
+    // A variable, or a vector pair on its centre grid.
+    let shape = match file.meta.var(&req.var) {
+        Some(info) => info.shape.clone(),
+        None => file
+            .pair(&req.var)
+            .map(|p| p.centre_shape.clone())
+            .ok_or_else(|| err("no such variable".into()))?,
+    };
+    let len = shape.get(req.along).copied().ok_or_else(|| {
+        err(format!("no dimension {} (the variable has {})", req.along, shape.len()))
     })?;
     let full = req.full_request(len);
-    file.check_request(&full)?;
+    file.check_any_request(&full)?;
     Ok(full)
 }
 
@@ -210,6 +217,13 @@ struct Run {
     along: usize,
     cancelled: Arc<AtomicBool>,
     state: State,
+}
+
+/// The whole series assembled from delivered blocks (cached when complete).
+struct Joined {
+    values: Vec<f32>,
+    /// Components, once a block carried them (vector pairs).
+    vector: Option<VectorParts>,
 }
 
 /// A block's read: `None` when it was skipped because the series stopped.
@@ -247,7 +261,7 @@ impl Run {
         // Finished reads waiting for an earlier block, by position in `blocks`.
         let mut ready: Vec<Option<Result<Slice, CoreError>>> =
             blocks.iter().map(|_| None).collect();
-        let mut series = vec![f32::NAN; len];
+        let mut series = Joined { values: vec![f32::NAN; len], vector: None };
         let (mut queued, mut delivered, mut in_flight) = (0, 0, 0);
         let mut error = None;
         loop {
@@ -302,23 +316,39 @@ impl Run {
         &self,
         (start, count): (usize, usize),
         slice: Slice,
-        series: &mut [f32],
+        series: &mut Joined,
         last: bool,
     ) -> Result<(), CoreError> {
+        let wrong = || CoreError::Read {
+            var: self.full.var.clone(),
+            msg: "a series block has the wrong length".into(),
+        };
+        let range = start..start + count;
         let dst = series
-            .get_mut(start..start + count)
+            .values
+            .get_mut(range.clone())
             .filter(|d| d.len() == slice.data.len())
-            .ok_or_else(|| CoreError::Read {
-                var: self.full.var.clone(),
-                msg: "a series block has the wrong length".into(),
-            })?;
+            .ok_or_else(wrong)?;
         dst.copy_from_slice(&slice.data);
+        if let Some(parts) = &slice.vector {
+            let len = series.values.len();
+            let whole = series.vector.get_or_insert_with(|| VectorParts {
+                east: vec![f32::NAN; len],
+                north: vec![f32::NAN; len],
+            });
+            for (dst, src) in [(&mut whole.east, &parts.east), (&mut whole.north, &parts.north)] {
+                dst.get_mut(range.clone())
+                    .filter(|d| d.len() == src.len())
+                    .ok_or_else(wrong)?
+                    .copy_from_slice(src);
+            }
+        }
         if last {
             let whole = Slice {
                 shape: self.full.count.clone(),
-                valid_count: series.iter().filter(|v| !v.is_nan()).count(),
-                data: series.to_vec(),
-                vector: None,
+                valid_count: series.values.iter().filter(|v| !v.is_nan()).count(),
+                data: series.values.clone(),
+                vector: series.vector.clone(),
             };
             let key = (self.file.open_id(), self.full.clone());
             self.shared.lock().insert(key, Arc::new(whole));
