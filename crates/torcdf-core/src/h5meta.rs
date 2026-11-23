@@ -60,7 +60,9 @@ pub(crate) mod ffi {
             visitor: H5DSIterate,
             visitor_data: *mut c_void,
         ) -> herr_t;
+        #[cfg(any(test, feature = "fixtures"))]
         pub(crate) fn H5DSset_scale(dsid: hid_t, dimname: *const c_char) -> herr_t;
+        #[cfg(any(test, feature = "fixtures"))]
         pub(crate) fn H5DSattach_scale(did: hid_t, dsid: hid_t, idx: c_uint) -> herr_t;
     }
 }

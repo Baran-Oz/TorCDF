@@ -396,7 +396,7 @@ pub mod vectors;
 /// netCDF-4 `unsigned.nc` (chunked + deflate, so the fast reader applies):
 /// `ub(y=2, x=3)` i8 `_Unsigned="true"` with `_FillValue` -1; `us` i16
 /// `_Unsigned="true"`, `scale_factor` 0.5, no fill; `plain` i8 with `ub`'s
-/// raw values and no `_Unsigned`.
+/// raw values and no `_Unsigned`; `ubnf` i8 `_Unsigned="true"`, no fill.
 pub fn write_unsigned(dir: &Path) -> PathBuf {
     let path = dir.join("unsigned.nc");
     let mut f = netcdf::create(&path).unwrap();
@@ -423,6 +423,13 @@ pub fn write_unsigned(dir: &Path) -> PathBuf {
         let mut v = f.add_variable::<i8>("plain", &["y", "x"]).unwrap();
         v.set_chunking(&[2, 3]).unwrap();
         v.set_compression(2, false).unwrap();
+        v.put_values(&ub, (0..2, 0..3)).unwrap();
+    }
+    {
+        let mut v = f.add_variable::<i8>("ubnf", &["y", "x"]).unwrap();
+        v.set_chunking(&[2, 3]).unwrap();
+        v.set_compression(2, false).unwrap();
+        v.put_attribute("_Unsigned", "true").unwrap();
         v.put_values(&ub, (0..2, 0..3)).unwrap();
     }
     path

@@ -424,9 +424,6 @@ fn chunk_loc(
     }))
 }
 
-/// The dataset's user-defined fill value converted by HDF5 to `f64`, as
-/// netCDF-C converts what it reads; None when no user value is set (HDF5's
-/// default). Caller holds the lock.
 /// Whether every bit of an element of type `t` is its value in the
 /// standard layout the decoder assumes: integers without padding, IEEE
 /// single or double floats. (netCDF types always are; a plain HDF5 file
@@ -441,6 +438,9 @@ fn standard_layout(t: hid_t, class: H5T_class_t, size: usize) -> bool {
     }
 }
 
+/// The dataset's user-defined fill value converted by HDF5 to `f64`, as
+/// netCDF-C converts what it reads; None when no user value is set (HDF5's
+/// default). Caller holds the lock.
 fn user_fill(dcpl: &Id) -> Result<Option<f64>, String> {
     let mut status = H5D_fill_value_t::H5D_FILL_VALUE_ERROR;
     if unsafe { H5Pfill_value_defined(dcpl.id, &mut status) } < 0 {

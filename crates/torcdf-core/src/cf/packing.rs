@@ -71,7 +71,9 @@ impl Unpack {
         match nums("_FillValue").first() {
             Some(&x) => missing.push(fix(x)),
             None => match wrap {
-                // The unsigned type's default fill: 2^bits - 1, or 2^64 - 2.
+                // The unsigned type's default fill: 2^bits - 1, or 2^64 - 2. A
+                // byte has none (as real `ubyte`).
+                Some(m) if m < 300.0 => {}
                 Some(m) => missing.push(if m > 1e19 { m - 2.0 } else { m - 1.0 }),
                 None => missing.extend(default_fill(&v.dtype)),
             },
@@ -146,6 +148,15 @@ mod tests {
         let (_d, nc) = open();
         let got = whole(&nc, "/ub", false);
         assert!(same(&got, &[0.0, 1.0, 127.0, 128.0, 254.0, f32::NAN]), "{got:?}");
+    }
+
+    #[test]
+    fn unsigned_byte_without_fill_has_no_default_fill() {
+        let (_d, nc) = open();
+        for lib in [false, true] {
+            let got = whole(&nc, "/ubnf", lib);
+            assert!(same(&got, &[0.0, 1.0, 127.0, 128.0, 254.0, 255.0]), "lib={lib} {got:?}");
+        }
     }
 
     #[test]

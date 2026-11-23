@@ -223,7 +223,7 @@ pub struct TorApp {
     /// Screenshots requested, waiting to arrive.
     shots: Vec<Shot>,
     /// PNG encodes and saves in progress.
-    png_saves: Vec<Job<PngOutcome>>,
+    png_saves: Vec<(Option<u64>, Job<PngOutcome>)>,
     service: SliceService,
     /// The service's cache budget (read-ahead holds at most an eighth).
     cache_budget: usize,
@@ -1007,8 +1007,14 @@ fn selected_attrs<'a>(files: &'a [OpenFile], sel: Option<&Selection>) -> Option<
 impl TorApp {
     /// Asks for a screenshot; `rect` is cut out of it when it arrives.
     fn request_shot(&mut self, rect: egui::Rect, name: String, popup: Option<u64>) {
-        if self.shots.iter().any(|s| s.popup == popup) {
+        if png_pending(self.shots.iter().map(|s| s.popup).chain(self.png_saves.iter().map(|(t, _)| *t)), popup) {
             return;
+        }
+        // The previous "Saved x.png" message and the hover readout must not
+        // end up in the picture.
+        if let Some(v) = &mut self.view {
+            v.flash = None;
+            v.hover = None;
         }
         let (tx, rx) = channel();
         let wake = self.ctx.clone();
@@ -1032,6 +1038,7 @@ impl TorApp {
                 }
                 Ok(image) => {
                     let s = self.shots.remove(i);
+                    let target = s.popup;
                     let job = Job::spawn(&self.ctx, move || {
                         let cut = png_export::crop(&image, s.rect, s.ppp);
                         let png = match png_export::encode_png(&cut) {
@@ -1048,13 +1055,13 @@ impl TorApp {
                             Err(e) => Err(format!("Cannot save {}: {e}", path.display())),
                         })
                     });
-                    self.png_saves.push(job);
+                    self.png_saves.push((target, job));
                 }
             }
         }
         let mut i = 0;
         while i < self.png_saves.len() {
-            let Some(r) = self.png_saves[i].poll() else {
+            let Some(r) = self.png_saves[i].1.poll() else {
                 i += 1;
                 continue;
             };
@@ -1071,6 +1078,12 @@ impl TorApp {
             }
         }
     }
+}
+
+/// Whether a PNG save for `target` (the plot, or a pop-up id) is already
+/// pending, among the targets of the screenshots and dialogs in progress.
+fn png_pending(pending: impl IntoIterator<Item = Option<u64>>, target: Option<u64>) -> bool {
+    pending.into_iter().any(|t| t == target)
 }
 
 /// A new map view of the same file keeps the projection, overlay switches
@@ -1283,6 +1296,16 @@ impl TorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn png_save_is_skipped_only_for_the_same_pending_target() {
+        assert!(!png_pending([], None));
+        assert!(png_pending([None], None));
+        assert!(png_pending([Some(3), None], None));
+        assert!(!png_pending([Some(3)], None));
+        assert!(png_pending([Some(3)], Some(3)));
+        assert!(!png_pending([None, Some(4)], Some(3)));
+    }
     use crate::view::arrow_layer::ArrowMode;
     use std::time::Duration;
     use torcdf_core::fixtures::vectors::{write_arome_like, write_nemo_like};
