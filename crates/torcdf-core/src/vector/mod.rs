@@ -179,9 +179,22 @@ pub fn split_layer(path: &str) -> Option<(&str, &str)> {
 }
 
 impl crate::NcFile {
-    /// Whether `var` is a numeric variable on exactly `pair`'s centre grid.
+    /// Whether `var` is a numeric variable on exactly `pair`'s centre grid:
+    /// the same dims and shape, and the same horizontal coordinates (so a
+    /// u- or v-grid variable of identical shape does not fit).
     pub fn layer_fits(&self, var: &str, pair: &VectorPair) -> bool {
-        self.numeric_var(var).is_ok_and(|v| v.dims == pair.centre_dims && v.shape == pair.centre_shape)
+        let Ok(v) = self.numeric_var(var) else { return false };
+        if v.dims != pair.centre_dims || v.shape != pair.centre_shape {
+            return false;
+        }
+        match (&pair.centre_lat, &pair.centre_lon) {
+            (Some(lat), Some(lon)) => match crate::cf::detect_geo(&self.meta, v) {
+                crate::cf::Geo::Regular { lat_var, lon_var, .. }
+                | crate::cf::Geo::Curvilinear { lat_var, lon_var, .. } => lat_var == *lat && lon_var == *lon,
+                crate::cf::Geo::None => false,
+            },
+            _ => !(matches!(pair.form, PairForm::EastNorth) && (var == pair.east || var == pair.north)),
+        }
     }
 
     fn pairs_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<VectorPair>>> {

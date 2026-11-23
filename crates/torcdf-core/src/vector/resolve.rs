@@ -1028,4 +1028,21 @@ mod tests {
         let req = SliceRequest { var: crate::vector::layer_path("/wind_speed", "/nope"), ..req };
         assert!(f.read_slice(&req).is_err());
     }
+
+    #[test]
+    fn layer_rejects_nemo_u_grid() {
+        let d = tempfile::tempdir().unwrap();
+        let f = NcFile::open(&vectors::write_nemo_like(d.path())).unwrap();
+        let mk = |x: &str| SliceRequest {
+            var: crate::vector::layer_path(x, "/uo+vo"),
+            start: vec![0, 0, 0],
+            count: vec![1, 20, 30],
+            stride: vec![1; 3],
+        };
+        for x in ["/uo", "/vo"] {
+            let e = f.read_slice(&mk(x)).err().expect("u/v grid misfit").to_string();
+            assert!(e.contains("do not fit"), "{e}");
+        }
+        assert!(f.read_slice(&mk("/thetao")).is_ok());
+    }
 }
