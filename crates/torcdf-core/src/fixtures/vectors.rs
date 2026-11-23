@@ -242,3 +242,25 @@ fn write_noclue_as(dir: &Path, file: &str, theta: f64, names: [&str; 2]) -> Path
     put(&mut f, names[1], &yx, coords, None, &v);
     path
 }
+
+#[cfg(test)]
+mod tests {
+    /// Writes the vector fixtures to `C:/t/fixtures` for checking by hand:
+    /// `cargo test -p torcdf-core write_vector_fixtures_to -- --ignored`.
+    #[test]
+    #[ignore = "writes files for the manual checklist"]
+    fn write_vector_fixtures_to() {
+        let dir = std::path::Path::new("C:/t/fixtures");
+        std::fs::create_dir_all(dir).unwrap();
+        for path in [
+            super::write_nemo_like(dir),
+            super::write_roms_like(dir),
+            super::write_wrf_like(dir),
+            super::write_noclue(dir, false),
+            super::write_noclue(dir, true),
+        ] {
+            assert!(path.is_file(), "{} not written", path.display());
+            println!("wrote {}", path.display());
+        }
+    }
+}

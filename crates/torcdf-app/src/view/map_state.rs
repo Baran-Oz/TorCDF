@@ -367,6 +367,11 @@ impl MapState {
         self.wanted.take()
     }
 
+    /// The current detail plan (the tiles asked for, arrived or not).
+    pub fn plan(&self) -> &[TileSpec] {
+        &self.plan
+    }
+
     /// Makes `plan` current: reads for the old one are dropped. The tiles on
     /// show stay until the new ones arrive; an empty plan clears them.
     pub fn set_plan(&mut self, mut plan: Vec<TileSpec>) {

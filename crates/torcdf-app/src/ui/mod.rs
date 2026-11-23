@@ -13,6 +13,7 @@ use torcdf_core::{AttrValue, DType};
 
 use crate::app::Action;
 use crate::view::defaults::ViewKind;
+use crate::view::playback::{FPS_RANGE, Playback};
 use crate::view::var_view::VarView;
 
 /// Menu bar: File and View (Process and Edit come in later stages).
@@ -70,8 +71,14 @@ pub fn error_banners(ui: &mut egui::Ui, errors: &[String], actions: &mut Vec<Act
     }
 }
 
-/// One slider with step buttons per non-plotted dimension longer than 1.
-pub fn slider_strip(ui: &mut egui::Ui, v: &mut VarView, actions: &mut Vec<Action>) {
+/// One slider with step buttons per non-plotted dimension longer than 1,
+/// and a row of play controls.
+pub fn slider_strip(
+    ui: &mut egui::Ui,
+    v: &mut VarView,
+    playback: Option<&Playback>,
+    actions: &mut Vec<Action>,
+) {
     ui.add_space(4.0);
     for d in v.slider_dims() {
         let len = v.var.shape[d];
@@ -96,7 +103,47 @@ pub fn slider_strip(ui: &mut egui::Ui, v: &mut VarView, actions: &mut Vec<Action
             actions.push(Action::SliderMoved);
         }
     }
+    if let Some(pb) = playback {
+        play_controls(ui, v, pb, actions);
+    }
     ui.add_space(2.0);
+}
+
+/// Play/Pause, the dimension played (when there is a choice), speed, loop,
+/// and "loading…" while the next frame is still being read.
+fn play_controls(ui: &mut egui::Ui, v: &VarView, pb: &Playback, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        let (label, action) = if pb.playing { ("Pause", Action::Pause) } else { ("Play", Action::Play) };
+        if ui.add_sized([60.0, 18.0], egui::Button::new(label)).clicked() {
+            actions.push(action);
+        }
+        let dims = v.slider_dims();
+        if dims.len() > 1 {
+            let name = |d: usize| v.var.dims.get(d).cloned().unwrap_or_default();
+            egui::ComboBox::from_id_salt("play_dim").selected_text(name(pb.dim)).show_ui(ui, |ui| {
+                for d in dims {
+                    if ui.selectable_label(pb.dim == d, name(d)).clicked() && pb.dim != d {
+                        actions.push(Action::SetPlayDim(d));
+                    }
+                }
+            });
+        }
+        let mut fps = pb.fps;
+        let speed = egui::Slider::new(&mut fps, FPS_RANGE).step_by(1.0).suffix(" fps");
+        if ui.add(speed).changed() {
+            actions.push(Action::SetFps(fps));
+        }
+        let mut looping = pb.looping;
+        if ui.checkbox(&mut looping, "Loop").changed() {
+            actions.push(Action::SetLoop(looping));
+        }
+        if pb.playing && pb.waiting {
+            ui.weak(match pb.effective_fps {
+                Some(f) => format!("loading\u{2026} {f:.1} fps"),
+                None => "loading\u{2026}".to_string(),
+            });
+        }
+    });
 }
 
 /// "Drop to open" over the whole window while files are dragged over it.

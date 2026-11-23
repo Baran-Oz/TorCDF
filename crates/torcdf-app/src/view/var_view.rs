@@ -370,19 +370,39 @@ impl VarView {
 
     /// The hyperslab the current view needs.
     fn request(&self) -> SliceRequest {
+        self.request_at(&self.slider_pos)
+    }
+
+    /// Reads the view needs to show slider positions `pos` (the playback
+    /// hook): the main slice, plus the map's current detail plan. Empty when
+    /// the view reads nothing through the slice service.
+    pub fn requests_at(&self, pos: &[usize]) -> Vec<SliceRequest> {
+        let unreadable = matches!(self.var.dtype, DType::Other(_)) || self.var.shape.contains(&0);
+        if unreadable || self.is_text() || pos.len() != self.var.shape.len() {
+            return Vec::new();
+        }
+        let mut reqs = vec![self.request_at(pos)];
+        if let (ViewKind::Map, Some(map), Some(a)) = (self.kind, &self.map, &self.axes) {
+            reqs.extend(map.plan().iter().map(|s| tile_request(&self.var, a, pos, s)));
+        }
+        reqs
+    }
+
+    /// The hyperslab the current view needs at slider positions `pos`.
+    fn request_at(&self, pos: &[usize]) -> SliceRequest {
         let v = &self.var;
         match (self.kind, &self.axes, self.is_text()) {
-            (ViewKind::Image, Some(a), false) => return build_request(v, a, &self.slider_pos),
+            (ViewKind::Image, Some(a), false) => return build_request(v, a, pos),
             (ViewKind::Map, Some(a), false) => {
                 let spec = TileSpec::overview(v.shape[a.y], v.shape[a.x]);
-                return tile_request(v, a, &self.slider_pos, &spec);
+                return tile_request(v, a, pos, &spec);
             }
             _ => {}
         }
         let n = v.shape.len();
         let mut r = SliceRequest {
             var: v.path.clone(),
-            start: self.slider_pos.clone(),
+            start: pos.to_vec(),
             count: vec![1; n],
             stride: vec![1; n],
         };
@@ -412,6 +432,18 @@ impl VarView {
     /// Asks for the data of the current view. The superseded request is
     /// dropped first, which cancels it if no worker has started it.
     pub fn refresh(&mut self, ctx: &egui::Context, service: &SliceService) {
+        self.refresh_with(ctx, service, &[]);
+    }
+
+    /// [`Self::refresh`], taking any read in `ready` (a played frame, held
+    /// by the playback) instead of asking the service for it, so a frame
+    /// read ahead is shown even if the cache has evicted it since.
+    pub fn refresh_with(
+        &mut self,
+        ctx: &egui::Context,
+        service: &SliceService,
+        ready: &[(SliceRequest, Arc<Slice>)],
+    ) {
         self.pending = None;
         self.stats_job = None;
         self.text_job = None;
@@ -436,18 +468,22 @@ impl VarView {
             }));
             return;
         }
-        let mut handle = service.request(&self.nc, r);
-        // A cache hit is ready at once and will not call on_ready.
-        match handle.try_take() {
-            Some(result) => {
-                let req = handle.req().clone();
-                self.on_slice(ctx, req, result);
+        if let Some(s) = held(ready, &r) {
+            self.on_slice(ctx, r, Ok(s));
+        } else {
+            let mut handle = service.request(&self.nc, r);
+            // A cache hit is ready at once and will not call on_ready.
+            match handle.try_take() {
+                Some(result) => {
+                    let req = handle.req().clone();
+                    self.on_slice(ctx, req, result);
+                }
+                // Keeping the handle keeps the request alive.
+                None => self.pending = Some(handle),
             }
-            // Keeping the handle keeps the request alive.
-            None => self.pending = Some(handle),
         }
         // A slider move re-reads the detail tiles for the new position.
-        self.request_detail(service);
+        self.request_detail(service, ready);
     }
 
     /// Requests the detail plan the map just made, if any (the map is shown
@@ -456,12 +492,13 @@ impl VarView {
         let Some(map) = self.map.as_mut() else { return };
         let Some(plan) = map.take_wanted() else { return };
         map.set_plan(plan);
-        self.request_detail(service);
+        self.request_detail(service, &[]);
     }
 
     /// (Re)requests every tile of the map's current detail plan at the
-    /// current slider position. Tiles on show stay until the new ones arrive.
-    fn request_detail(&mut self, service: &SliceService) {
+    /// current slider position (taking those in `ready` as read). Tiles on
+    /// show stay until the new ones arrive.
+    fn request_detail(&mut self, service: &SliceService, ready: &[(SliceRequest, Arc<Slice>)]) {
         let (Some(map), Some(axes)) = (self.map.as_mut(), self.axes) else { return };
         if self.kind != ViewKind::Map {
             return;
@@ -470,7 +507,12 @@ impl VarView {
         map.detail_requested_now();
         for spec in plan {
             let req = tile_request(&self.var, &axes, &self.slider_pos, &spec);
-            map.track_detail(spec, service.request(&self.nc, req));
+            match held(ready, &req) {
+                Some(s) => {
+                    map.accept_detail(spec, s);
+                }
+                None => map.track_detail(spec, service.request(&self.nc, req)),
+            }
         }
     }
 
@@ -705,6 +747,11 @@ fn load_vector_coords(nc: &NcFile, paths: &[Option<String>], pair: &VectorPair) 
     }
     coords.vector = Some(r);
     coords
+}
+
+/// The slice read for `req` among `ready`, if there.
+fn held(ready: &[(SliceRequest, Arc<Slice>)], req: &SliceRequest) -> Option<Arc<Slice>> {
+    ready.iter().find(|(r, _)| r == req).map(|(_, s)| s.clone())
 }
 
 /// "Map unavailable" notice for `why` (a clause about the variable).

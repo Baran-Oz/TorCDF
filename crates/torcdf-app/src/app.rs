@@ -19,6 +19,7 @@ use torcdf_core::{
 use crate::render::colormap::Colormap;
 use crate::ui::{self, inspector, plot_area, tree};
 use crate::view::defaults::ViewKind;
+use crate::view::playback::{FPS_RANGE, Playback, Tick, frame_bytes};
 use crate::view::popup::{Popup, PopupKind, PopupSet};
 use crate::view::var_view::{Display, ImageState, VarView};
 
@@ -30,6 +31,20 @@ const NOTICE_TIME: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Frames slower than this are logged (UI-thread stalls).
 const SLOW_FRAME_MS: f64 = 20.0;
+
+/// While playback waits for a frame, the UI looks again this often (reads
+/// finishing wake it sooner).
+const WAIT_RECHECK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The dimension to animate by default: the time axis when it has a slider,
+/// else the first slider (0 when there is none).
+fn default_play_dim(v: &VarView) -> usize {
+    let dims = v.slider_dims();
+    match v.time_dim {
+        Some(t) if dims.contains(&t) => t,
+        _ => dims.first().copied().unwrap_or(0),
+    }
+}
 
 /// A result produced on a helper thread.
 pub struct Job<T> {
@@ -146,6 +161,12 @@ pub enum Action {
     /// A click in a pop-up: move the slider of that dimension (plan P7).
     JumpTo { file: u64, dim_name: String, index: usize },
     SavePopupCsv(u64),
+    /// Animate the playback dimension (locks the colour range as shown).
+    Play,
+    Pause,
+    SetFps(f32),
+    SetLoop(bool),
+    SetPlayDim(usize),
     Exit,
 }
 
@@ -166,6 +187,12 @@ pub struct TorApp {
     /// Pop-up id and its CSV save: `None` when the dialog was cancelled.
     saves: Vec<(u64, Job<SaveOutcome>)>,
     service: SliceService,
+    /// The service's cache budget (read-ahead holds at most an eighth).
+    cache_budget: usize,
+    /// Animation of the current view; dropped with the view.
+    pub playback: Option<Playback>,
+    /// When a slider last moved, until the next upload (for the step log).
+    slider_changed_at: Option<Instant>,
     log: DebugLog,
     first_image_logged: bool,
     ctx: egui::Context,
@@ -175,8 +202,9 @@ impl TorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> TorApp {
         let ctx = cc.egui_ctx.clone();
         let wake = ctx.clone();
+        let cache_budget = default_cache_budget_bytes();
         let service = SliceService::new(
-            default_cache_budget_bytes(),
+            cache_budget,
             DEFAULT_WORKERS,
             Arc::new(move || wake.request_repaint()),
         );
@@ -197,6 +225,9 @@ impl TorApp {
             popups: PopupSet::default(),
             saves: Vec::new(),
             service,
+            cache_budget,
+            playback: None,
+            slider_changed_at: None,
             log: DebugLog::from_env(),
             first_image_logged: false,
             ctx,
@@ -307,6 +338,8 @@ impl TorApp {
             let var = found.and_then(|f| f.nc.meta.var(path).map(|v| (f.nc.clone(), v.clone())));
             // Dropping the old view drops its pending request (cancelling it).
             self.view = None;
+            // Its playback (and so its read-ahead) goes with it.
+            self.playback = None;
             if let Some((nc, pair)) = pair {
                 self.log.log(format_args!("select {}", pair.path));
                 let v = VarView::new_vector(&self.ctx, *id, nc, pair);
@@ -326,9 +359,59 @@ impl TorApp {
             m.events = Some(Vec::new());
         }
         v.refresh(&self.ctx, &self.service);
+        // A new view starts paused; the old view's read-ahead is dropped.
+        self.playback = Some(Playback::new(default_play_dim(&v)));
         self.view = Some(v);
         self.display.lock = false;
         self.first_image_logged = false;
+        self.slider_changed_at = None;
+    }
+
+    /// Advances the animation: keeps its read-ahead going and, when a frame
+    /// is due and read, moves the slider to it. While the view is still
+    /// taking in the frame on show, the next one waits.
+    fn tick_playback(&mut self) {
+        let (Some(pb), Some(v)) = (&mut self.playback, &mut self.view) else { return };
+        let dims = v.slider_dims();
+        if !dims.contains(&pb.dim) {
+            // The view kind changed which dimensions have sliders.
+            pb.stop();
+            pb.dim = default_play_dim(v);
+        }
+        if !pb.playing {
+            return;
+        }
+        let now = Instant::now();
+        if v.loading() {
+            pb.waiting = true;
+            return;
+        }
+        let dim = pb.dim;
+        let (len, current) = (v.var.shape[dim], v.slider_pos[dim]);
+        let components = if v.vector.is_some() { 3 } else { 1 };
+        let bytes = frame_bytes(&v.requests_at(&v.slider_pos), components);
+        let base = v.slider_pos.clone();
+        let requests = |i: usize| {
+            let mut pos = base.clone();
+            pos[dim] = i;
+            v.requests_at(&pos)
+        };
+        let tick = pb.tick(now, current, len, bytes, self.cache_budget, &self.service, &v.nc, &requests);
+        match tick {
+            Tick::Show(i) => {
+                v.slider_pos[dim] = i;
+                let ready = pb.take_ready();
+                v.refresh_with(&self.ctx, &self.service, &ready);
+                self.slider_changed_at = Some(now);
+            }
+            Tick::Stop => pb.stop(),
+            Tick::Idle | Tick::Wait => {}
+        }
+        if pb.playing {
+            // While waiting, finished reads wake the UI; this is a fallback.
+            let after = if pb.waiting { WAIT_RECHECK } else { pb.due_in(Instant::now()) };
+            self.ctx.request_repaint_after(after);
+        }
     }
 
     /// Shows `pair` again in place of the current view of the same pair
@@ -350,9 +433,14 @@ impl TorApp {
         }
         // The slider range and colours stay as the user left them.
         let lock = self.display.lock;
+        let settings = self.playback.as_ref().map(|p| (p.dim, p.fps, p.looping));
         self.selection = Some(Selection::Var(old.file_id, pair.path.clone()));
         self.show_view(v);
         self.display.lock = lock;
+        // The new view starts paused, with the same playback settings.
+        if let (Some(p), Some((dim, fps, looping))) = (&mut self.playback, settings) {
+            (p.dim, p.fps, p.looping) = (dim, fps, looping);
+        }
     }
 
     fn apply(&mut self, action: Action) {
@@ -376,6 +464,10 @@ impl TorApp {
                     std::mem::take(&mut self.files).into_iter().partition(|f| f.id == id);
                 self.files = kept;
                 let view = self.view.take_if(|v| v.file_id == id);
+                if view.is_some() {
+                    // Its read-ahead stops with it.
+                    self.playback = None;
+                }
                 let gone: Vec<u64> =
                     self.popups.list.iter().filter(|p| p.file_id == id).map(|p| p.id).collect();
                 for p in gone {
@@ -402,6 +494,7 @@ impl TorApp {
             Action::SliderMoved => {
                 if let Some(v) = &mut self.view {
                     v.refresh(&self.ctx, &self.service);
+                    self.slider_changed_at = Some(Instant::now());
                 }
             }
             Action::SetKind(kind) => {
@@ -437,6 +530,7 @@ impl TorApp {
                     if *id == file && p.strip_prefix(&path).is_some_and(|t| t.is_empty() || t.starts_with('#')));
                 if shown {
                     self.view = None;
+                    self.playback = None;
                     self.selection = None;
                 }
             }
@@ -486,6 +580,7 @@ impl TorApp {
                 }
                 v.slider_pos[d] = index;
                 v.refresh(&self.ctx, &self.service);
+                self.slider_changed_at = Some(Instant::now());
             }
             Action::SavePopupCsv(id) => {
                 let Some(p) = self.popups.list.iter().find(|p| p.id == id) else { return };
@@ -503,6 +598,56 @@ impl TorApp {
                     Some(std::fs::write(&path, csv).map_err(|e| format!("Cannot save {}: {e}", path.display())))
                 });
                 self.saves.push((id, job));
+            }
+            Action::Play => {
+                let (Some(pb), Some(v)) = (&mut self.playback, &mut self.view) else { return };
+                if !v.slider_dims().contains(&pb.dim) {
+                    return;
+                }
+                // At the end without looping, play starts over from the first step.
+                let d = pb.dim;
+                if !pb.looping && v.slider_pos[d] + 1 >= v.var.shape[d] {
+                    v.slider_pos[d] = 0;
+                    v.refresh(&self.ctx, &self.service);
+                    self.slider_changed_at = Some(Instant::now());
+                }
+                // Frames keep the colours they start with (unlocking stays possible).
+                if let Some(range) = self.display.effective(v.shown.as_ref().map(|s| &s.stats)) {
+                    self.display.range = range;
+                    self.display.lock = true;
+                }
+                pb.start(Instant::now());
+                self.ctx.request_repaint();
+            }
+            Action::Pause => {
+                if let Some(pb) = &mut self.playback {
+                    pb.stop();
+                }
+            }
+            Action::SetFps(fps) => {
+                if let Some(pb) = &mut self.playback
+                    && fps.is_finite()
+                {
+                    pb.fps = fps.clamp(*FPS_RANGE.start(), *FPS_RANGE.end());
+                }
+            }
+            Action::SetLoop(looping) => {
+                if let Some(pb) = &mut self.playback {
+                    pb.looping = looping;
+                }
+            }
+            Action::SetPlayDim(d) => {
+                let (Some(pb), Some(v)) = (&mut self.playback, &self.view) else { return };
+                if pb.dim == d || !v.slider_dims().contains(&d) {
+                    return;
+                }
+                // Read-ahead along the old dimension is dropped.
+                let playing = pb.playing;
+                pb.stop();
+                pb.dim = d;
+                if playing {
+                    pb.start(Instant::now());
+                }
             }
             Action::Exit => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -540,6 +685,7 @@ impl eframe::App for TorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
         self.poll();
+        self.tick_playback();
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
         });
@@ -568,7 +714,8 @@ impl eframe::App for TorApp {
         if let Some(v) = &mut self.view
             && !v.slider_dims().is_empty()
         {
-            egui::Panel::bottom("sliders").show(ui, |ui| ui::slider_strip(ui, v, &mut actions));
+            let pb = self.playback.as_ref();
+            egui::Panel::bottom("sliders").show(ui, |ui| ui::slider_strip(ui, v, pb, &mut actions));
         }
         let uploaded = egui::CentralPanel::default()
             .show(ui, |ui| {
@@ -590,6 +737,9 @@ impl eframe::App for TorApp {
             v.start_detail(&self.service);
         }
 
+        if uploaded && let Some(t) = self.slider_changed_at.take() {
+            self.log.log(format_args!("step shown {:.1} ms after slider change", ms(t)));
+        }
         if uploaded && !self.first_image_logged {
             self.first_image_logged = true;
             if let Some(v) = &self.view {
@@ -638,8 +788,9 @@ impl TorApp {
     /// on the calling thread). Panics if the file cannot be opened.
     pub fn headless(path: &Path) -> TorApp {
         let ctx = egui::Context::default();
+        let cache_budget = default_cache_budget_bytes();
         let service = SliceService::new(
-            default_cache_budget_bytes(),
+            cache_budget,
             DEFAULT_WORKERS,
             Arc::new(|| {}),
         );
@@ -661,6 +812,9 @@ impl TorApp {
             popups: PopupSet::default(),
             saves: Vec::new(),
             service,
+            cache_budget,
+            playback: None,
+            slider_changed_at: None,
             log: DebugLog { tx: None, t0: Instant::now(), select: None },
             first_image_logged: false,
             ctx,
@@ -730,6 +884,31 @@ mod tests {
         // Past the end: ignored.
         app.apply(Action::JumpTo { file: 1, dim_name: "time".into(), index: 999 });
         assert_eq!(app.view.as_ref().unwrap().slider_pos[0], 9);
+    }
+
+    #[test]
+    fn play_locks_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        let t0 = Instant::now();
+        while app.view.as_ref().unwrap().shown.is_none() {
+            assert!(t0.elapsed().as_secs() < 20, "the first slice never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.poll();
+        }
+        let stats = app.view.as_ref().unwrap().shown.as_ref().map(|s| s.stats);
+        let range = app.display.effective(stats.as_ref()).expect("a range");
+        assert!(!app.display.lock);
+        app.apply(Action::Play);
+        assert!(app.display.lock);
+        assert_eq!(app.display.range, range);
+        assert!(app.playback.as_ref().is_some_and(|p| p.playing));
+        app.apply(Action::Pause);
+        assert!(!app.playback.as_ref().unwrap().playing);
+        // Another variable drops the playback.
+        app.apply(Action::Play);
+        app.apply(Action::Select(Selection::Var(1, "/ocean/vo".into())));
+        assert!(app.playback.as_ref().is_none_or(|p| !p.playing));
     }
 
     #[test]
