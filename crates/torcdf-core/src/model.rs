@@ -121,12 +121,30 @@ impl AttrValue {
         }
     }
 
-    /// The string of a single text attribute.
+    /// The string of a single text attribute: a classic text attribute, or a
+    /// netCDF-4 string attribute holding one string.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             AttrValue::Text(s) => Some(s),
+            AttrValue::Texts(v) if v.len() == 1 => Some(&v[0]),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod attr_tests {
+    use super::AttrValue;
+
+    #[test]
+    fn single_string_attribute_reads_as_text() {
+        // netCDF-4 "string" attributes (CMEMS files) arrive as a list of one.
+        let units = AttrValue::Texts(vec!["seconds since 1970-01-01 00:00:00".into()]);
+        assert_eq!(units.as_str(), Some("seconds since 1970-01-01 00:00:00"));
+        assert_eq!(AttrValue::Text("m s-1".into()).as_str(), Some("m s-1"));
+        // Several strings are not one text value.
+        assert_eq!(AttrValue::Texts(vec!["a".into(), "b".into()]).as_str(), None);
+        assert_eq!(AttrValue::Ints(vec![1]).as_str(), None);
     }
 }
 
