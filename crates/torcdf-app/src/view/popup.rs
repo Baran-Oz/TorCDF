@@ -134,8 +134,12 @@ impl Popup {
     ) -> Result<Popup, String> {
         // A layered view pops up its coloured variable's own series; only a
         // pair's own entry adds its components.
+        let base_info;
         let var = match &view.base {
-            Some(p) => view.nc.meta.var(p).ok_or_else(|| NOTHING.to_string())?,
+            Some(p) => {
+                base_info = view.nc.var_info_any(p).ok_or_else(|| NOTHING.to_string())?;
+                &base_info
+            }
             None => &view.var,
         };
         let pair = view.vector.as_ref().filter(|_| view.base.is_none());

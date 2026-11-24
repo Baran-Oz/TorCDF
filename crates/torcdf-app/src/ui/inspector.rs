@@ -223,8 +223,8 @@ fn arrows_section(
         });
         if let (ArrowMode::MagDir, Some(PairForm::MagDir(c))) = (layer.mode, layer.pair.as_ref().map(|p| p.form)) {
             let pair = layer.pair.as_ref().expect("a magnitude/direction form has a pair");
-            let file = match (v.nc.meta.var(pair.magnitude()), v.nc.meta.var(pair.direction())) {
-                (Some(m), Some(d)) => convention_of(m, d),
+            let file = match (v.nc.var_info_any(pair.magnitude()), v.nc.var_info_any(pair.direction())) {
+                (Some(m), Some(d)) => convention_of(&m, &d),
                 _ => c,
             };
             convention(ui, c, file, actions);

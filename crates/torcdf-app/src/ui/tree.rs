@@ -28,6 +28,10 @@ pub fn show(
                         actions.push(Action::Select(Selection::File(f.id)));
                     }
                     r.context_menu(|ui| {
+                        if ui.button("Calculate new variable…").clicked() {
+                            actions.push(Action::OpenCalculate { file: f.id, edit: None });
+                            ui.close();
+                        }
                         if ui.button("Close file").clicked() {
                             actions.push(Action::CloseFile(f.id));
                             ui.close();
@@ -90,6 +94,26 @@ fn group_body(
             actions.push(Action::Select(s));
         }
     }
+    // Calculated variables of this group.
+    for d in file.nc.derived_vars().iter().filter(|d| parent(&d.path) == g.path) {
+        let s = Selection::Var(file_id, d.path.clone());
+        let text = format!("ƒ {}  ({})", d.name, d.info.dims.join(", "));
+        let r = ui.selectable_label(sel == Some(&s), text).on_hover_text(format!("= {}", d.formula));
+        accent_edge(ui, &r, sel == Some(&s), scroll_to);
+        if r.clicked() {
+            actions.push(Action::Select(s));
+        }
+        r.context_menu(|ui| {
+            if ui.button("Edit…").clicked() {
+                actions.push(Action::OpenCalculate { file: file_id, edit: Some(d.path.clone()) });
+                ui.close();
+            }
+            if ui.button("Delete").clicked() {
+                actions.push(Action::DeleteDerived { file: file_id, path: d.path.clone() });
+                ui.close();
+            }
+        });
+    }
     // Registered pairs of this group. A rotation variant (tagged path) is
     // the same row as its pair.
     for p in file.nc.pairs().iter().filter(|p| p.rotate == RotateChoice::Auto) {
@@ -115,6 +139,14 @@ fn group_body(
     }
 }
 
+/// The group path of a variable path (`"/"` for the root).
+fn parent(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    }
+}
+
 /// The 2 px accent bar on the left of a selected row; scrolls it into
 /// view when the selection just moved by keyboard.
 fn accent_edge(ui: &egui::Ui, r: &egui::Response, selected: bool, scroll_to: bool) {
@@ -135,6 +167,9 @@ pub fn var_order(files: &[OpenFile]) -> Vec<Selection> {
             walk(file, sub, out);
         }
         out.extend(g.vars.iter().map(|v| Selection::Var(file.id, v.path.clone())));
+        for d in file.nc.derived_vars().iter().filter(|d| parent(&d.path) == g.path) {
+            out.push(Selection::Var(file.id, d.path.clone()));
+        }
         for p in file.nc.pairs().iter().filter(|p| p.rotate == RotateChoice::Auto) {
             if file.nc.meta.group_of(&p.east).path == g.path {
                 out.push(Selection::Var(file.id, p.path.clone()));

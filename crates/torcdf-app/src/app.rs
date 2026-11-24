@@ -208,6 +208,10 @@ pub enum Action {
     SetReopenLast(bool),
     /// Settings back to defaults (recent files and window geometry stay).
     ResetSettings,
+    /// Open the Calculate window for `file`; `edit`: a calculated variable to change.
+    OpenCalculate { file: u64, edit: Option<String> },
+    /// Remove a calculated variable (refused while something uses it).
+    DeleteDerived { file: u64, path: String },
 }
 
 fn file_name(p: &Path) -> String {
@@ -509,7 +513,7 @@ impl TorApp {
         if let Selection::Var(id, path) = &sel {
             let found = self.files.iter().find(|f| f.id == *id);
             let pair = found.and_then(|f| Some((f.nc.clone(), f.nc.pair(path)?)));
-            let var = found.and_then(|f| f.nc.meta.var(path).map(|v| (f.nc.clone(), v.clone())));
+            let var = found.and_then(|f| Some((f.nc.clone(), f.nc.var_info_any(path).filter(|_| f.nc.pair(path).is_none())?)));
             // Dropping the old view drops its pending request (cancelling it);
             // its map settings may carry over to a map of the same file.
             let old_map = self.view.take().filter(|v| v.file_id == *id).and_then(|v| v.map);
@@ -574,7 +578,7 @@ impl TorApp {
         if v.base.is_none() && v.vector.is_some() {
             return None;
         }
-        let x = v.nc.meta.var(v.plain_path())?.clone();
+        let x = v.nc.var_info_any(v.plain_path())?;
         Some((v.file_id, v.nc.clone(), x))
     }
 
@@ -593,7 +597,7 @@ impl TorApp {
                 None => return Vec::new(),
             },
         };
-        candidates(&v.nc.meta, &x, l.mode)
+        candidates(&v.nc.meta_with_derived(), &x, l.mode)
     }
 
     /// Brings the current view in line with the arrow slot: a plain or
@@ -664,8 +668,8 @@ impl TorApp {
             Some(p) => (p, true),
             None => {
                 let made = match mode {
-                    ArrowMode::EastNorth => pair_by_hand(&nc.meta, &a, &b),
-                    ArrowMode::MagDir => pair_magdir_by_hand(&nc.meta, &a, &b),
+                    ArrowMode::EastNorth => pair_by_hand(&nc.meta_with_derived(), &a, &b),
+                    ArrowMode::MagDir => pair_magdir_by_hand(&nc.meta_with_derived(), &a, &b),
                     ArrowMode::Off => return,
                 };
                 match made {
@@ -1131,6 +1135,28 @@ impl TorApp {
                 self.settings.recent.truncate(self.settings.recent_max);
                 self.apply_look_and_save();
             }
+            Action::OpenCalculate { .. } => {}
+            Action::DeleteDerived { file, path } => self.delete_derived(file, &path),
+        }
+    }
+
+    /// Removes a calculated variable; refused (with a banner) while
+    /// another calculated variable or an arrow pair uses it.
+    fn delete_derived(&mut self, file: u64, path: &str) {
+        let Some(f) = self.files.iter().find(|f| f.id == file) else { return };
+        if let Err(e) = f.nc.remove_derived(path) {
+            self.errors.push(e);
+            return;
+        }
+        let gone: Vec<u64> =
+            self.popups.list.iter().filter(|p| p.file_id == file && p.var_path == path).map(|p| p.id).collect();
+        for id in gone {
+            self.popups.close(id);
+        }
+        if matches!(&self.selection, Some(Selection::Var(id, p)) if *id == file && p == path) {
+            self.view = None;
+            self.playback = None;
+            self.selection = None;
         }
     }
 
@@ -1214,20 +1240,20 @@ impl TorApp {
 }
 
 /// Title and attributes of the selected item.
-fn selected_attrs<'a>(files: &'a [OpenFile], sel: Option<&Selection>) -> Option<(String, &'a [Attr])> {
+fn selected_attrs(files: &[OpenFile], sel: Option<&Selection>) -> Option<(String, Vec<Attr>)> {
     let file = |id: &u64| files.iter().find(|f| f.id == *id);
     match sel? {
         Selection::File(id) => {
             let f = file(id)?;
-            Some((format!("{} (global)", f.name), &f.nc.meta.root.attrs[..]))
+            Some((format!("{} (global)", f.name), f.nc.meta.root.attrs.clone()))
         }
         Selection::Group(id, path) => {
             let g = find_group(&file(id)?.nc.meta.root, path)?;
-            Some((format!("group {}", g.path), &g.attrs[..]))
+            Some((format!("group {}", g.path), g.attrs.clone()))
         }
         Selection::Var(id, path) => {
-            let v = file(id)?.nc.meta.var(path)?;
-            Some((v.path.clone(), &v.attrs[..]))
+            let v = file(id)?.nc.var_info_any(path)?;
+            Some((v.path, v.attrs))
         }
     }
 }
@@ -1404,10 +1430,11 @@ impl eframe::App for TorApp {
         // A vector pair is no variable of the file: its attributes come from the view.
         let pair_attrs =
             self.view.as_ref().filter(|v| v.vector.is_some() && v.base.is_none()).map(|v| v.var.attrs.clone());
-        let attrs = match (&self.selection, &pair_attrs) {
-            (Some(Selection::Var(_, path)), Some(a)) => Some((path.clone(), &a[..])),
+        let attrs_owned = match (&self.selection, pair_attrs) {
+            (Some(Selection::Var(_, path)), Some(a)) => Some((path.clone(), a)),
             _ => selected_attrs(&self.files, self.selection.as_ref()),
         };
+        let attrs = attrs_owned.as_ref().map(|(t, a)| (t.clone(), &a[..]));
         let var_selected = matches!(self.selection, Some(Selection::Var(..)));
         let offered = self.arrow_candidates();
         let file = self.view.as_ref().map(|v| v.file_id);
@@ -1874,6 +1901,55 @@ mod tests {
     /// The AROME-like file has a time axis but no vertical one, and its pair
     /// is magnitude/direction; this test wants plain `uo`/`vo` arrows, so it
     /// uses the NEMO-like `thetao`.
+    fn derive(app: &TorApp, name: &str, formula: &str) -> String {
+        let nc = &app.files[0].nc;
+        nc.add_derived(nc.check_formula(name, formula, None, None).unwrap()).path.clone()
+    }
+
+    #[test]
+    fn derived_is_listed_and_selectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        let p = derive(&app, "speed", "sqrt(uo^2 + vo^2)");
+        assert!(crate::ui::tree::var_order(&app.files).contains(&Selection::Var(1, p.clone())));
+        app.apply(Action::Select(Selection::Var(1, p.clone())));
+        let v = app.view.as_ref().expect("view");
+        assert_eq!(v.var.path, p);
+        assert_eq!(v.kind, ViewKind::Map);
+        let (title, attrs) = selected_attrs(&app.files, app.selection.as_ref()).expect("attrs");
+        assert_eq!(title, p);
+        assert!(attrs.iter().any(|a| a.name == "formula"));
+    }
+
+    #[test]
+    fn derived_arrow_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        let u2 = derive(&app, "u2", "uo*2");
+        let v2 = derive(&app, "v2", "vo*2");
+        app.apply(Action::Select(Selection::Var(1, "/thetao".into())));
+        app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
+        app.apply(Action::PickArrowVar { slot: 0, path: u2.clone() });
+        app.apply(Action::PickArrowVar { slot: 1, path: v2 });
+        let slot = app.arrow_layer.as_ref().expect("slot");
+        assert_eq!(slot.pair.as_ref().map(|p| p.east.clone()), Some(u2), "{:?}", slot.problem);
+    }
+
+    #[test]
+    fn delete_refused_while_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        let a = derive(&app, "a", "uo*2");
+        let b = derive(&app, "b", "a+1");
+        app.apply(Action::DeleteDerived { file: 1, path: a.clone() });
+        assert_eq!(app.errors, ["a is used by b"]);
+        assert!(app.files[0].nc.derived(&a).is_some());
+        app.apply(Action::Select(Selection::Var(1, b.clone())));
+        app.apply(Action::DeleteDerived { file: 1, path: b.clone() });
+        assert!(app.files[0].nc.derived(&b).is_none());
+        assert!(app.view.is_none() && app.selection.is_none());
+    }
+
     #[test]
     fn nothing_is_paired_until_the_user_pairs() {
         let dir = tempfile::tempdir().unwrap();
