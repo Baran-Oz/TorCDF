@@ -424,8 +424,14 @@ impl SelectionForm {
                 }
             }
         }
-        let sel = rows.and_then(|_| self.selection());
-        self.last = sel.as_ref().ok().cloned();
+        let sel = rows.clone().and_then(|_| self.selection());
+        // A region the index form cannot hold (Statistics accepts boxes Save
+        // refuses) still leaves the rows for the overlays and the summary.
+        self.last = match (&sel, rows) {
+            (Ok(s), _) => Some(s.clone()),
+            (Err(_), Ok(ranges)) => Some(XSelection { vars: self.ticked.iter().cloned().collect(), ranges }),
+            (Err(_), Err(_)) => None,
+        };
         sel
     }
 
@@ -466,7 +472,7 @@ impl SelectionForm {
         let is_time = |r: &DimRow| self.coord(&r.key).is_some_and(|d| d.is_time);
         let mut parts: Vec<String> = self.dims.iter().filter(|r| is_time(r) && cropped(&r.key)).map(row).collect();
         if let (Some(r), Some(axes)) = (&self.region, self.coords.as_ref().and_then(|c| c.region.as_ref()))
-            && axes.keys().iter().any(|k| cropped(k))
+            && axes.keys().iter().any(|k| cropped(k) || !sel.ranges.contains_key(*k))
         {
             parts.push(format!("lat {}..{}, lon {}..{}", r.south.trim(), r.north.trim(), r.west.trim(), r.east.trim()));
         }

@@ -1806,7 +1806,7 @@ impl TorApp {
         match form.stats_request(form.weighted) {
             Ok(req) => {
                 form.status = None;
-                form.running = Some(req.clone());
+                form.running = Some((req.clone(), format!("{}: {}", form.file_name, form.summary())));
                 form.job = Some(torcdf_core::stats::StatsJob::start(f.nc.clone(), req));
                 self.ctx.request_repaint();
             }
@@ -1831,11 +1831,12 @@ impl TorApp {
         let Some(job) = &form.job else { return };
         match job.finished() {
             Some(Ok(outcome)) => {
-                let req = form.running.take().unwrap_or_else(|| form.sel.stats_request(form.weighted).unwrap_or_else(|_| {
-                    torcdf_core::stats::StatsRequest { vars: Vec::new(), ranges: Default::default(), region: None, weighted: false }
-                }));
+                let (req, title) = form.running.take().unwrap_or_else(|| {
+                    let empty = torcdf_core::stats::StatsRequest { vars: Vec::new(), ranges: Default::default(), region: None, weighted: false };
+                    (empty, String::new())
+                });
                 if let Some(f) = self.files.iter().find(|f| f.id == form.file) {
-                    let table = build_table(&f.nc, &form.sel, &req, &outcome);
+                    let table = build_table(&f.nc, &form.sel, &req, &outcome, title);
                     form.results = Some((req, table, outcome));
                 }
                 form.job = None;
@@ -3819,5 +3820,51 @@ mod tests {
         assert!(app.calc.as_ref().is_some_and(|f| f.check.is_err()));
         assert_eq!(app.files[0].nc.derived(&b).unwrap().formula, "uo*2");
         wait_stats(&mut app);
+    }
+
+    fn stats_region(app: &mut TorApp, s: &str, n: &str, w: &str, e: &str) {
+        let r = app.stats.as_mut().unwrap().region.as_mut().expect("region rows");
+        (r.south, r.north, r.west, r.east) = (s.into(), n.into(), w.into(), e.into());
+        app.apply(Action::SelectionEdited(SelWin::Stats));
+    }
+
+    #[test]
+    fn seam_box_named_and_drawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_stats(dir.path());
+        stats_region(&mut app, "-3", "3", "15", "2");
+        let s = app.stats.as_ref().unwrap();
+        assert!(s.summary().contains("lat -3..3, lon 15..2"), "{}", s.summary());
+        assert!(s.overlay().is_some_and(|o| o.region == Some([-3.0, 3.0, 15.0, 2.0])));
+        app.apply(Action::ComputeStats);
+        wait_stats(&mut app);
+        let text = app.stats.as_ref().unwrap().table("\t").unwrap();
+        assert!(text.lines().next().unwrap().contains("lat -3..3, lon 15..2"), "{text}");
+    }
+
+    #[test]
+    fn title_is_the_computed_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_stats(dir.path());
+        stats_region(&mut app, "-3", "3", "4", "6");
+        app.apply(Action::ComputeStats);
+        app.apply(Action::RegionDrawn { south: -5.0, north: 5.0, west: 2.0, east: 8.0 });
+        wait_stats(&mut app);
+        let s = app.stats.as_ref().unwrap();
+        assert!(s.table("\t").unwrap().lines().next().unwrap().contains("lat -3..3, lon 4..6"));
+        assert!(s.out_of_date());
+    }
+
+    #[test]
+    fn where_names_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = profile_app(dir.path());
+        app.apply(Action::OpenStats { file: 1, var: Some("/t".into()) });
+        wait_stats(&mut app);
+        app.apply(Action::ComputeStats);
+        wait_stats(&mut app);
+        let text = app.stats.as_ref().unwrap().table("\t").unwrap();
+        let at = text.lines().find(|l| l.starts_with("Min at\t")).unwrap();
+        assert!(at.starts_with("Min at\tdepth ") && at.contains(" m, ") && at.ends_with("y 0, x 0"), "{at}");
     }
 }

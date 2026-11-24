@@ -64,18 +64,60 @@ const NONE: &str = "no valid values in the selection";
 /// Largest piece read at once (bytes of f32 values).
 const BATCH_BYTES: usize = 64 * 1024 * 1024;
 
-/// The region dimensions of one variable over its window: per cell, its
-/// weight (`None`: outside the box) and its lon/lat.
-struct Geom {
-    y: usize,
-    x: usize,
-    nx: usize,
-    cell: Vec<Option<f64>>,
-    lonlat: Vec<(f64, f64)>,
+/// The region dimensions `y`, `x` of one variable over its window: which
+/// cells count, their weights and their lon/lat. Kept small: regular grids
+/// hold one weight per row and one flag per column; curvilinear ones 12
+/// bytes per cell of the window.
+enum Geom {
+    Regular {
+        y: usize,
+        x: usize,
+        /// Per window row: its weight.
+        row_w: Vec<f32>,
+        /// Per window column: inside the box (only across the seam can a
+        /// column of the window lie outside it).
+        col_in: Vec<bool>,
+        lats: Vec<f64>,
+        lons: Vec<f64>,
+    },
+    Curvilinear {
+        y: usize,
+        x: usize,
+        nx: usize,
+        /// Per window cell: its weight, NaN when outside the box.
+        cell: Vec<f32>,
+        lonlat: Vec<(f32, f32)>,
+    },
 }
 
-/// (y dim, x dim, latitudes, longitudes, regular grid?).
-type GeoAxes = (usize, usize, Vec<f64>, Vec<f64>, bool);
+impl Geom {
+    fn dims(&self) -> (usize, usize) {
+        match self {
+            Geom::Regular { y, x, .. } | Geom::Curvilinear { y, x, .. } => (*y, *x),
+        }
+    }
+
+    /// The weight of window cell (iy, ix); `None` outside the box.
+    fn weight(&self, iy: usize, ix: usize) -> Option<f64> {
+        match self {
+            Geom::Regular { row_w, col_in, .. } => col_in[ix].then(|| f64::from(row_w[iy])),
+            Geom::Curvilinear { nx, cell, .. } => {
+                let w = cell[iy * nx + ix];
+                (!w.is_nan()).then_some(f64::from(w))
+            }
+        }
+    }
+
+    fn lonlat(&self, iy: usize, ix: usize) -> (f64, f64) {
+        match self {
+            Geom::Regular { lats, lons, .. } => (lons[ix], lats[iy]),
+            Geom::Curvilinear { nx, lonlat, .. } => {
+                let (lo, la) = lonlat[iy * nx + ix];
+                (f64::from(lo), f64::from(la))
+            }
+        }
+    }
+}
 
 /// What one variable reads.
 struct Prepared {
@@ -86,16 +128,32 @@ struct Prepared {
     weighted: bool,
 }
 
-/// Whether (lat, lon) is inside the box (s, n, w, e), across the seam too.
-fn in_box(lat: f64, lon: f64, b: [f64; 4]) -> bool {
-    let (s, n) = (b[0].min(b[1]), b[0].max(b[1]));
-    let e = 1e-6 * s.abs().max(n.abs()).max(1.0);
-    if !(lat >= s - e && lat <= n + e) || !lon.is_finite() {
+/// Comparison slack for coordinates against typed degrees, as the range
+/// helpers use for float32 coordinates.
+fn slack(a: f64, b: f64) -> f64 {
+    1e-6 * a.abs().max(b.abs()).max(1.0)
+}
+
+/// Whether `lon` is inside [w, e], across the seam too.
+fn lon_in(lon: f64, w: f64, e: f64) -> bool {
+    if !lon.is_finite() {
         return false;
     }
-    let width = if b[3] - b[2] >= 360.0 { 360.0 } else { (b[3] - b[2]).rem_euclid(360.0) };
-    let off = (lon - b[2]).rem_euclid(360.0);
-    off <= width + 1e-6 || off >= 360.0 - 1e-6
+    let width = if e - w >= 360.0 { 360.0 } else { (e - w).rem_euclid(360.0) };
+    let off = (lon - w).rem_euclid(360.0);
+    let tol = slack(w, e);
+    off <= width + tol || off >= 360.0 - tol
+}
+
+/// Whether (lat, lon) is inside the box (s, n, w, e).
+fn in_box(lat: f64, lon: f64, b: [f64; 4]) -> bool {
+    let (s, n) = (b[0].min(b[1]), b[0].max(b[1]));
+    let tol = slack(s, n);
+    lat >= s - tol && lat <= n + tol && lon_in(lon, b[2], b[3])
+}
+
+fn cos_weight(lat: f64, weighted: bool) -> f32 {
+    if weighted { lat.to_radians().cos().max(0.0) as f32 } else { 1.0 }
 }
 
 /// The window, mask and weights of `path` for `req`.
@@ -118,77 +176,71 @@ fn prepare(file: &NcFile, path: &str, req: &StatsRequest) -> Result<Prepared, St
     }
     let ds = file.meta_with_derived();
     let read = |p: &str| file.read_coord(p).map_err(|e| e.to_string());
-    // (y dim, x dim, latitudes, longitudes, regular?): regular grids hold 1-D
-    // axes, curvilinear ones the full (y, x) planes.
-    let geo: Option<GeoAxes> = match detect_geo(&ds, &info) {
-        Geo::Regular { lat_dim, lon_dim, lat_var, lon_var } => Some((lat_dim, lon_dim, read(&lat_var)?, read(&lon_var)?, true)),
-        Geo::Curvilinear { y_dim, x_dim, lat_var, lon_var } => {
-            let (yn, xn) = (&info.dims[y_dim], &info.dims[x_dim]);
+    let geom = match detect_geo(&ds, &info) {
+        Geo::Regular { lat_dim: y, lon_dim: x, lat_var, lon_var } => {
+            let (lat, lon) = (read(&lat_var)?, read(&lon_var)?);
+            // The index window matches the box exactly, except across the
+            // seam, where the whole longitude axis is read and masked.
+            let mut seam = None;
+            if let Some(b) = req.region {
+                (start[y], count[y]) = value_range(&lat, b[0], b[1]).ok_or(NONE)?;
+                (start[x], count[x]) = match lon_range(&lon, b[2], b[3]) {
+                    Ok(r) => r,
+                    Err(e) if e == SEAM => {
+                        seam = Some((b[2], b[3]));
+                        (0, lon.len())
+                    }
+                    Err(_) => return Err(NONE.into()),
+                };
+            }
+            let lats = lat[start[y]..start[y] + count[y]].to_vec();
+            let lons = lon[start[x]..start[x] + count[x]].to_vec();
+            let row_w = lats.iter().map(|&la| cos_weight(la, req.weighted)).collect();
+            let col_in = lons.iter().map(|&lo| seam.is_none_or(|(w, e)| lon_in(lo, w, e))).collect();
+            Some(Geom::Regular { y, x, row_w, col_in, lats, lons })
+        }
+        Geo::Curvilinear { y_dim: y, x_dim: x, lat_var, lon_var } => {
+            let (yn, xn) = (&info.dims[y], &info.dims[x]);
             let h = |p: &str| file.read_horizontal(p, yn, xn).map_err(|e| e.to_string());
-            Some((y_dim, x_dim, h(&lat_var)?, h(&lon_var)?, false))
+            let (lat, lon) = (h(&lat_var)?, h(&lon_var)?);
+            let full_nx = info.shape[x];
+            if let Some(b) = req.region {
+                let [ry, rx] = curv_box(&lat, &lon, info.shape[y], full_nx, b[0], b[1], b[2], b[3]).ok_or(NONE)?;
+                ((start[y], count[y]), (start[x], count[x])) = (ry, rx);
+            }
+            let mut cell = Vec::with_capacity(count[y] * count[x]);
+            let mut lonlat = Vec::with_capacity(count[y] * count[x]);
+            for j in start[y]..start[y] + count[y] {
+                for i in start[x]..start[x] + count[x] {
+                    let (la, lo) = (lat[j * full_nx + i], lon[j * full_nx + i]);
+                    let inside = req.region.is_none_or(|b| in_box(la, lo, b));
+                    cell.push(if inside { cos_weight(la, req.weighted) } else { f32::NAN });
+                    lonlat.push((lo as f32, la as f32));
+                }
+            }
+            Some(Geom::Curvilinear { y, x, nx: count[x], cell, lonlat })
         }
         Geo::None => None,
     };
-    let Some((y, x, lat, lon, regular)) = geo else {
-        if count.contains(&0) {
-            return Err(NONE.into());
-        }
-        return Ok(Prepared { path: path.into(), start, count, geom: None, weighted: false });
-    };
-    let full_nx = info.shape[x];
-    if let Some(b) = req.region {
-        let window = if regular {
-            let ys = value_range(&lat, b[0], b[1]).ok_or(NONE)?;
-            let xs = match lon_range(&lon, b[2], b[3]) {
-                Ok(r) => r,
-                Err(e) if e == SEAM => (0, lon.len()),
-                Err(_) => return Err(NONE.into()),
-            };
-            [ys, xs]
-        } else {
-            curv_box(&lat, &lon, info.shape[y], full_nx, b[0], b[1], b[2], b[3]).ok_or(NONE)?
-        };
-        (start[y], count[y]) = window[0];
-        (start[x], count[x]) = window[1];
-    }
     if count.contains(&0) {
         return Err(NONE.into());
     }
-    let (ny, nx) = (count[y], count[x]);
-    let mut cell = Vec::with_capacity(ny * nx);
-    let mut lonlat = Vec::with_capacity(ny * nx);
-    for j in start[y]..start[y] + ny {
-        for i in start[x]..start[x] + nx {
-            let (la, lo) = if regular { (lat[j], lon[i]) } else { (lat[j * full_nx + i], lon[j * full_nx + i]) };
-            let inside = req.region.is_none_or(|b| in_box(la, lo, b));
-            let w = if req.weighted { la.to_radians().cos().max(0.0) } else { 1.0 };
-            cell.push(inside.then_some(w));
-            lonlat.push((lo, la));
-        }
-    }
-    let geom = Geom { y, x, nx, cell, lonlat };
-    Ok(Prepared { path: path.into(), start, count, geom: Some(geom), weighted: req.weighted })
+    let weighted = req.weighted && geom.is_some();
+    Ok(Prepared { path: path.into(), start, count, geom, weighted })
 }
 
-/// Cells of a variable's window.
-fn cells(p: &Prepared) -> u64 {
-    p.count.iter().map(|&n| n as u64).product()
-}
-
-/// Reads `p` piece by piece and calls `f(value, weight, flat position)` for
-/// every cell inside the box (`value` NaN = missing). `step(n)` after each
-/// piece of `n` cells; false cancels.
+/// Reads `p` piece by piece and calls `f(value, weight, window index)` for
+/// every cell inside the box (`value` not finite = missing). `step(done)`
+/// after each piece with the share of `p` read; false cancels.
 fn pass(
     file: &NcFile,
     p: &Prepared,
-    f: &mut dyn FnMut(f32, f64, u64),
-    step: &mut dyn FnMut(u64) -> bool,
+    f: &mut dyn FnMut(f32, f64, &[usize]),
+    step: &mut dyn FnMut(f64) -> bool,
 ) -> Result<(), String> {
     let nd = p.count.len();
-    let mut wstride = vec![1u64; nd];
-    for d in (0..nd.saturating_sub(1)).rev() {
-        wstride[d] = wstride[d + 1] * p.count[d + 1] as u64;
-    }
+    let total: f64 = p.count.iter().map(|&n| n as f64).product::<f64>().max(1.0);
+    let mut done = 0.0;
     for (off, cnt) in crate::extract::write::slabs(&p.count, 4, BATCH_BYTES) {
         let n: usize = cnt.iter().product();
         if n == 0 {
@@ -205,12 +257,14 @@ fn pass(
         let mut idx = off.clone();
         for &v in &data {
             let weight = match &p.geom {
-                Some(g) => g.cell[(idx[g.y] * g.nx) + idx[g.x]],
+                Some(g) => {
+                    let (y, x) = g.dims();
+                    g.weight(idx[y], idx[x])
+                }
                 None => Some(1.0),
             };
             if let Some(w) = weight {
-                let pos = idx.iter().zip(&wstride).map(|(&i, &s)| i as u64 * s).sum();
-                f(v, w, pos);
+                f(v, w, &idx);
             }
             for d in (0..nd).rev() {
                 idx[d] += 1;
@@ -220,11 +274,17 @@ fn pass(
                 idx[d] = off[d];
             }
         }
-        if !step(n as u64) {
+        done += n as f64;
+        if !step(done / total) {
             return Err("cancelled".into());
         }
     }
     Ok(())
+}
+
+/// Flat position of a window index (row-major), as the accumulator keeps it.
+fn flat(idx: &[usize], count: &[usize]) -> u64 {
+    idx.iter().zip(count).fold(0u64, |acc, (&i, &n)| acc * n as u64 + i as u64)
 }
 
 /// The extreme at window position `pos`.
@@ -236,7 +296,10 @@ fn extreme(p: &Prepared, value: f64, pos: u64) -> Extreme {
         idx[d] = (rest % n) as usize;
         rest /= n;
     }
-    let lonlat = p.geom.as_ref().map(|g| g.lonlat[idx[g.y] * g.nx + idx[g.x]]);
+    let lonlat = p.geom.as_ref().map(|g| {
+        let (y, x) = g.dims();
+        g.lonlat(idx[y], idx[x])
+    });
     let index = idx.iter().zip(&p.start).map(|(i, s)| i + s).collect();
     Extreme { value, index, lonlat }
 }
@@ -247,13 +310,14 @@ pub fn compute_stats_with(
     progress: &dyn Fn(f32) -> bool,
     exact_limit: usize,
 ) -> Result<StatsOutcome, String> {
-    let prepared: Vec<Result<Prepared, String>> = req.vars.iter().map(|v| prepare(file, v, req)).collect();
-    let mut total: u64 = prepared.iter().flatten().map(cells).sum::<u64>().max(1);
-    let mut done = 0u64;
-    let mut shown = 0f32;
+    let nvars = req.vars.len().max(1) as f64;
     let mut out = Vec::new();
-    for p in prepared {
-        let p = match p {
+    for (k, var) in req.vars.iter().enumerate() {
+        // Each variable takes an equal share of the bar; a second pass
+        // shares it with the first.
+        let share = |frac: f64| progress(((k as f64 + frac.clamp(0.0, 1.0)) / nvars) as f32);
+        // Prepared one at a time: masks are never held for all variables.
+        let p = match prepare(file, var, req) {
             Ok(p) => p,
             Err(e) => {
                 out.push(Err(e));
@@ -262,27 +326,22 @@ pub fn compute_stats_with(
         };
         let mut acc = Acc::default();
         let mut kept: Option<Vec<f32>> = Some(Vec::new());
-        let mut step = |n: u64, total: u64| {
-            done += n;
-            shown = shown.max((done as f64 / total as f64).min(1.0) as f32);
-            progress(shown)
-        };
         let read = pass(
             file,
             &p,
-            &mut |v, w, pos| {
-                if v.is_nan() {
+            &mut |v, w, idx| {
+                if !v.is_finite() {
                     acc.push_missing(1);
                     return;
                 }
-                acc.push(v, w, pos);
+                acc.push(v, w, flat(idx, &p.count));
                 if acc.valid() as usize > exact_limit {
                     kept = None;
                 } else if let Some(k) = kept.as_mut() {
                     k.push(v);
                 }
             },
-            &mut |n| step(n, total),
+            &mut |f| share(f / 2.0),
         );
         match read {
             Err(e) if e == "cancelled" => return Err(e),
@@ -304,17 +363,16 @@ pub fn compute_stats_with(
             }
             None => {
                 // Second pass: a fine histogram between min and max.
-                total += cells(&p);
                 let mut counts = vec![0u64; HIST_BINS];
                 let read = pass(
                     file,
                     &p,
                     &mut |v, _, _| {
-                        if !v.is_nan() {
+                        if v.is_finite() {
                             counts[bin_of(f64::from(v), lo, hi, HIST_BINS)] += 1;
                         }
                     },
-                    &mut |n| step(n, total),
+                    &mut |f| share(0.5 + f / 2.0),
                 );
                 match read {
                     Err(e) if e == "cancelled" => return Err(e),
@@ -327,6 +385,7 @@ pub fn compute_stats_with(
                 (hist_percentiles(&counts, lo, hi, &PERCENTILES), regroup(&counts, SHOW_BINS), true)
             }
         };
+        share(1.0);
         out.push(Ok(VarStats {
             path: p.path.clone(),
             valid: acc.valid(),
@@ -335,7 +394,7 @@ pub fn compute_stats_with(
             max: extreme(&p, hi, hi_pos),
             mean,
             std,
-            weighted: p.weighted && p.geom.is_some(),
+            weighted: p.weighted,
             percentiles,
             approximate,
             histogram,
@@ -583,5 +642,45 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(done.is_ok() && job.progress() == 1.0);
+    }
+
+    /// `f32grid.nc`: lat 10, 11 and lon 120.0..120.5 step 0.1 stored as
+    /// float32; `t(lat, lon)` = 1, except one +inf.
+    fn write_f32_grid(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("f32grid.nc");
+        let mut f = netcdf::create(&path).unwrap();
+        f.add_dimension("lat", 2).unwrap();
+        f.add_dimension("lon", 6).unwrap();
+        let mut lat = f.add_variable::<f32>("lat", &["lat"]).unwrap();
+        lat.put_attribute("units", "degrees_north").unwrap();
+        lat.put_values(&[10.0f32, 11.0], ..).unwrap();
+        let mut lon = f.add_variable::<f32>("lon", &["lon"]).unwrap();
+        lon.put_attribute("units", "degrees_east").unwrap();
+        let lons: Vec<f32> = (0..6).map(|i| 120.0 + 0.1 * i as f32).collect();
+        lon.put_values(&lons, ..).unwrap();
+        let mut t = f.add_variable::<f32>("t", &["lat", "lon"]).unwrap();
+        let mut v = vec![1.0f32; 12];
+        v[11] = f32::INFINITY;
+        t.put_values(&v, ..).unwrap();
+        path
+    }
+
+    #[test]
+    fn float32_edges_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let nc = NcFile::open(&write_f32_grid(dir.path())).unwrap();
+        // Columns 120.1 .. 120.3 (three), both rows.
+        let s = one(&nc, &req(&["/t"], &[], Some([10.0, 11.0, 120.1, 120.3]), false));
+        assert_eq!(s.valid, 6);
+    }
+
+    #[test]
+    fn infinity_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let nc = NcFile::open(&write_f32_grid(dir.path())).unwrap();
+        let s = one(&nc, &req(&["/t"], &[], None, false));
+        assert_eq!((s.valid, s.missing), (11, 1));
+        assert_eq!((s.mean, s.max.value), (1.0, 1.0));
+        assert_eq!(s.histogram.iter().sum::<u64>(), 11);
     }
 }

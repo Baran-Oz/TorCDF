@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 
 use torcdf_core::NcFile;
-use torcdf_core::cf::{Geo, detect_geo};
+use torcdf_core::cf::{Geo, detect_axes, detect_geo};
 use torcdf_core::stats::{Extreme, StatsJob, StatsOutcome, StatsRequest};
 
 use crate::app::Job;
@@ -59,22 +59,39 @@ fn lonlat_text((lon, lat): (f64, f64)) -> String {
     format!("{:.2} {ns} {:.2} {ew}", lat.abs(), lon.abs())
 }
 
-/// Where an extreme is: each dimension's value (dates for time) except
-/// lat/lon, which are given as degrees at the end.
+/// Where an extreme is: the time as a date, every other dimension as
+/// "name value units" (or "name index" without a coordinate), and lat/lon
+/// as degrees at the end.
 pub fn where_text(nc: &NcFile, sel: &SelectionForm, var: &str, e: &Extreme) -> String {
     let Some(info) = nc.var_info_any(var) else { return String::new() };
-    let geo: Vec<usize> = match detect_geo(&nc.meta_with_derived(), &info) {
+    let ds = nc.meta_with_derived();
+    let geo: Vec<usize> = match detect_geo(&ds, &info) {
         Geo::Regular { lat_dim, lon_dim, .. } => vec![lat_dim, lon_dim],
         Geo::Curvilinear { y_dim, x_dim, .. } => vec![y_dim, x_dim],
         Geo::None => Vec::new(),
     };
+    let time = detect_axes(&ds, &info).time;
     let mut parts: Vec<String> = Vec::new();
     for (d, (name, &i)) in info.dims.iter().zip(&e.index).enumerate() {
         if e.lonlat.is_some() && geo.contains(&d) {
             continue;
         }
-        let text = nc.dim_key(var, name).and_then(|k| sel.text_at(&k, i));
-        parts.push(text.unwrap_or_else(|| format!("{name} {i}")));
+        let key = nc.dim_key(var, name);
+        let value = key.as_ref().and_then(|k| sel.text_at(k, i));
+        let part = match value {
+            Some(v) if time == Some(d) => v,
+            Some(v) => {
+                // The units of the dimension's coordinate variable.
+                let coord = key.map(|k| if k.group == "/" { format!("/{name}") } else { format!("{}/{name}", k.group) });
+                let units = coord.and_then(|p| ds.var(&p)?.attrs.iter().find(|a| a.name == "units")?.value.as_str().map(str::to_string));
+                match units {
+                    Some(u) => format!("{name} {v} {u}"),
+                    None => format!("{name} {v}"),
+                }
+            }
+            None => format!("{name} {i}"),
+        };
+        parts.push(part);
     }
     let mut out = parts.join(", ");
     if let Some(ll) = e.lonlat {
@@ -87,7 +104,8 @@ pub fn where_text(nc: &NcFile, sel: &SelectionForm, var: &str, e: &Extreme) -> S
 }
 
 /// The results of `outcome` (for `sel`'s ticked variables) as a table.
-pub fn build_table(nc: &NcFile, sel: &SelectionForm, req: &StatsRequest, outcome: &StatsOutcome) -> StatsTable {
+/// `title`: the selection as it was when the run started.
+pub fn build_table(nc: &NcFile, sel: &SelectionForm, req: &StatsRequest, outcome: &StatsOutcome, title: String) -> StatsTable {
     let mut columns = Vec::new();
     let mut cells = vec![Vec::new(); ROWS.len()];
     for (var, r) in req.vars.iter().zip(outcome) {
@@ -131,7 +149,7 @@ pub fn build_table(nc: &NcFile, sel: &SelectionForm, req: &StatsRequest, outcome
         }
         columns.push(head);
     }
-    StatsTable { title: format!("{}: {}", sel.file_name, sel.summary()), columns, cells }
+    StatsTable { title, columns, cells }
 }
 
 /// The Statistics window: what to summarise, the run and its results.
@@ -140,8 +158,8 @@ pub struct StatsForm {
     /// "Weight by cell area (cos latitude)".
     pub weighted: bool,
     pub job: Option<StatsJob>,
-    /// The request of the run in progress.
-    pub running: Option<StatsRequest>,
+    /// The request of the run in progress and its title ("<file>: <selection>").
+    pub running: Option<(StatsRequest, String)>,
     /// The last results, with the request they answer.
     pub results: Option<(StatsRequest, StatsTable, StatsOutcome)>,
     /// Last error or save line.
