@@ -5,8 +5,10 @@ pub mod inspector;
 pub mod map_view;
 pub mod plot_area;
 pub mod popup;
+pub mod shortcuts;
 pub mod theme;
 pub mod tree;
+pub mod windows;
 
 use eframe::egui;
 use torcdf_core::cf::TimeUnits;
@@ -16,25 +18,62 @@ use crate::app::Action;
 use crate::view::defaults::ViewKind;
 use crate::view::playback::{FPS_RANGE, Playback};
 use crate::view::var_view::VarView;
+use shortcuts::{Command, keys_of};
+use std::path::PathBuf;
+use windows::Win;
 
-/// Menu bar: File and View (Process and Edit come in later stages).
-pub fn menu_bar(ui: &mut egui::Ui, view: Option<&VarView>, actions: &mut Vec<Action>) {
+/// A menu entry showing its shortcut on the right.
+fn item(text: &str, cmd: Command) -> egui::Button<'_> {
+    egui::Button::new(text).shortcut_text(keys_of(cmd))
+}
+
+/// Menu bar: File, View and Help (Process and Edit come in later stages).
+pub fn menu_bar(
+    ui: &mut egui::Ui,
+    view: Option<&VarView>,
+    recent: &[PathBuf],
+    current_file: Option<u64>,
+    actions: &mut Vec<Action>,
+) {
     egui::MenuBar::new().ui(ui, |ui| {
         ui.label(egui::RichText::new("TorCDF").strong().color(ui.visuals().selection.stroke.color));
         ui.menu_button("File", |ui| {
-            if ui.button("Open...").clicked() {
+            if ui.add(item("Open…", Command::Open)).clicked() {
                 actions.push(Action::OpenDialog);
+                ui.close();
+            }
+            ui.menu_button("Open recent", |ui| {
+                if recent.is_empty() {
+                    ui.weak("No recent files");
+                }
+                for p in recent {
+                    let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+                    if ui.button(name).on_hover_text(p.display().to_string()).clicked() {
+                        actions.push(Action::OpenRecent(p.clone()));
+                        ui.close();
+                    }
+                }
+            });
+            if ui.add_enabled(current_file.is_some(), item("Close file", Command::CloseFile)).clicked() {
+                if let Some(id) = current_file {
+                    actions.push(Action::CloseFile(id));
+                }
                 ui.close();
             }
             // Ctrl+S stays free for saving edited files (stage 3).
             ui.add_enabled_ui(view.is_some(), |ui| {
                 ui.menu_button("Export", |ui| {
-                    if ui.button("Plot as PNG…").clicked() {
+                    if ui.add(item("Plot as PNG…", Command::ExportPng)).clicked() {
                         actions.push(Action::SaveImage);
                         ui.close();
                     }
                 });
             });
+            ui.separator();
+            if ui.add(item("Settings…", Command::Settings)).clicked() {
+                actions.push(Action::ShowWindow(Win::Settings));
+                ui.close();
+            }
             ui.separator();
             if ui.button("Exit").clicked() {
                 actions.push(Action::Exit);
@@ -61,9 +100,19 @@ pub fn menu_bar(ui: &mut egui::Ui, view: Option<&VarView>, actions: &mut Vec<Act
             ui.separator();
             let label = if v.kind == ViewKind::Map { "Fit map to window" } else { "Fit image to window" };
             let fittable = matches!(v.kind, ViewKind::Image | ViewKind::Map);
-            let fit = ui.add_enabled(fittable, egui::Button::new(label));
+            let fit = ui.add_enabled(fittable, item(label, Command::Fit));
             if fit.clicked() {
                 actions.push(Action::FitView);
+                ui.close();
+            }
+        });
+        ui.menu_button("Help", |ui| {
+            if ui.add(item("Keyboard shortcuts", Command::ShortcutHelp)).clicked() {
+                actions.push(Action::ShowWindow(Win::Shortcuts));
+                ui.close();
+            }
+            if ui.button("About TorCDF").clicked() {
+                actions.push(Action::ShowWindow(Win::About));
                 ui.close();
             }
         });

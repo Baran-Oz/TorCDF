@@ -16,7 +16,8 @@ use torcdf_core::{
     VectorPair, default_cache_budget_bytes, layer_path, pair_by_hand, pair_magdir_by_hand,
 };
 
-use crate::settings::{Loaded, PlotDefaults, Settings, WindowGeom};
+use crate::settings::{Loaded, Look, PlotDefaults, Settings, TextSize, WindowGeom};
+use crate::ui::windows::{Win, Windows};
 use crate::ui::inspector::{PanelInput, PanelTab};
 use crate::ui::{self, inspector, plot_area, tree};
 use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO, candidates};
@@ -196,6 +197,16 @@ pub enum Action {
     SetLoop(bool),
     SetPlayDim(usize),
     Exit,
+    OpenRecent(PathBuf),
+    ShowWindow(Win),
+    SetLook(Look),
+    SetTextSize(TextSize),
+    /// What new plots start with; plots already shown keep theirs.
+    SetPlotDefaults(PlotDefaults),
+    SetRecentMax(usize),
+    SetReopenLast(bool),
+    /// Settings back to defaults (recent files and window geometry stay).
+    ResetSettings,
 }
 
 fn file_name(p: &Path) -> String {
@@ -243,6 +254,10 @@ pub struct TorApp {
     save_failed: bool,
     /// The window's last un-maximised geometry and whether it is maximised.
     last_geom: Option<WindowGeom>,
+    /// Settings, About, licences and shortcut windows.
+    pub windows: Windows,
+    /// The graphics adapter, for "Copy version info".
+    renderer: String,
 }
 
 /// The colour settings a new window starts with.
@@ -294,6 +309,8 @@ impl TorApp {
             settings_path: crate::settings::settings_path(),
             save_failed: false,
             last_geom: None,
+            windows: Windows::default(),
+            renderer: "none".into(),
         };
         if let Loaded::Recovered(msg) = loaded {
             app.errors.push(msg);
@@ -301,6 +318,7 @@ impl TorApp {
         app.log.log("window created");
         if let Some(rs) = &cc.wgpu_render_state {
             let info = rs.adapter.get_info();
+            app.renderer = format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type);
             app.log.log(format_args!(
                 "adapter: {} backend={:?} type={:?}",
                 info.name, info.backend, info.device_type
@@ -1068,7 +1086,48 @@ impl TorApp {
                 }
             }
             Action::Exit => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::OpenRecent(p) => self.open(p),
+            Action::ShowWindow(w) => self.windows.open(w),
+            Action::SetLook(look) => {
+                self.settings.look = look;
+                self.apply_look_and_save();
+            }
+            Action::SetTextSize(size) => {
+                self.settings.text_size = size;
+                self.apply_look_and_save();
+            }
+            Action::SetPlotDefaults(d) => {
+                self.settings.plot = d;
+                self.save_settings();
+            }
+            Action::SetRecentMax(n) => {
+                self.settings.recent_max = n;
+                self.settings.recent.truncate(n);
+                self.save_settings();
+            }
+            Action::SetReopenLast(on) => {
+                self.settings.reopen_last = on;
+                self.save_settings();
+            }
+            Action::ResetSettings => {
+                self.settings.reset_preferences();
+                self.settings.recent.truncate(self.settings.recent_max);
+                self.apply_look_and_save();
+            }
         }
+    }
+
+    /// The file of the selection, or else of the view (for Close file).
+    pub(crate) fn current_file(&self) -> Option<u64> {
+        match &self.selection {
+            Some(Selection::File(id) | Selection::Group(id, _) | Selection::Var(id, _)) => Some(*id),
+            None => self.view.as_ref().map(|v| v.file_id),
+        }
+    }
+
+    fn apply_look_and_save(&mut self) {
+        ui::theme::apply_look(&self.ctx, self.settings.look, self.settings.text_size);
+        self.save_settings();
     }
 
 }
@@ -1248,7 +1307,9 @@ impl eframe::App for TorApp {
         let mut actions = Vec::new();
         // The plot's own PNG button hides while its picture is being taken.
         let capturing = self.shots.iter().any(|s| s.popup.is_none());
-        egui::Panel::top("menu").show(ui, |ui| ui::menu_bar(ui, self.view.as_ref(), &mut actions));
+        let current_file = self.current_file();
+        let recent = &self.settings.recent;
+        egui::Panel::top("menu").show(ui, |ui| ui::menu_bar(ui, self.view.as_ref(), recent, current_file, &mut actions));
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| ui::error_banners(ui, &self.errors, &mut actions));
         }
@@ -1296,6 +1357,7 @@ impl eframe::App for TorApp {
         self.plot_rect = Some(central.response.rect);
         let current = self.view.as_ref().map(|v| (v.file_id, &v.var.dims[..], &v.slider_pos[..]));
         ui::popup::show_all(ui.ctx(), &mut self.popups, current, &mut actions);
+        ui::windows::show_all(ui.ctx(), &mut self.windows, &self.settings, &self.renderer, &mut actions);
         ui::drop_overlay(ui.ctx());
         // Detail reads start only after the map has planned them for a resting camera.
         if let Some(v) = &mut self.view {
@@ -1392,6 +1454,8 @@ impl TorApp {
             settings_path: None,
             save_failed: false,
             last_geom: None,
+            windows: Windows::default(),
+            renderer: "none".into(),
         }
     }
 }
@@ -1845,6 +1909,73 @@ mod tests {
         let mut app = TorApp::headless_with(&path, Settings::default());
         app.remember_open_files();
         assert_eq!(app.settings.last_open, vec![path]);
+    }
+
+    #[test]
+    fn set_look_saves_and_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless_with(&torcdf_core::fixtures::write_nc4(dir.path()), Settings::default());
+        app.settings_path = Some(dir.path().join("TorCDF").join("settings.json"));
+        app.apply(Action::SetLook(crate::settings::Look::Dark));
+        assert_eq!(app.settings.look, crate::settings::Look::Dark);
+        assert_eq!(app.ctx.options(|o| o.theme_preference), egui::ThemePreference::Dark);
+        let (saved, _) = Settings::load_from(app.settings_path.as_ref().unwrap());
+        assert_eq!(saved.look, crate::settings::Look::Dark);
+    }
+
+    #[test]
+    fn set_plot_defaults_leaves_current_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        let mut d = PlotDefaults::default();
+        d.projection = crate::map::projection::Projection::Mercator;
+        app.apply(Action::SetPlotDefaults(d.clone()));
+        assert_eq!(app.settings.plot, d);
+        let m = app.view.as_ref().unwrap().map.as_ref().unwrap();
+        assert_eq!(m.camera.proj, crate::map::projection::Projection::Equirectangular);
+    }
+
+    #[test]
+    fn set_recent_max_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless_with(&torcdf_core::fixtures::write_nc4(dir.path()), Settings::default());
+        for i in 0..5 {
+            app.settings.push_recent(Path::new(&format!("C:/d/{i}.nc")));
+        }
+        app.apply(Action::SetRecentMax(0));
+        assert_eq!(app.settings.recent_max, 0);
+        assert!(app.settings.recent.is_empty());
+    }
+
+    #[test]
+    fn reset_settings_keeps_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless_with(&torcdf_core::fixtures::write_nc4(dir.path()), Settings::default());
+        app.settings.push_recent(Path::new("C:/d/a.nc"));
+        app.apply(Action::SetLook(crate::settings::Look::Dark));
+        app.apply(Action::SetReopenLast(true));
+        app.apply(Action::ResetSettings);
+        assert_eq!(app.settings.look, crate::settings::Look::Light);
+        assert!(!app.settings.reopen_last);
+        assert_eq!(app.settings.recent.len(), 1);
+        assert_eq!(app.ctx.options(|o| o.theme_preference), egui::ThemePreference::Light);
+    }
+
+    #[test]
+    fn show_window_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless_with(&torcdf_core::fixtures::write_nc4(dir.path()), Settings::default());
+        app.apply(Action::ShowWindow(ui::windows::Win::About));
+        assert!(app.windows.about);
+        assert!(!app.windows.settings);
+    }
+
+    #[test]
+    fn version_info_has_version() {
+        let s = ui::windows::version_info("Test GPU");
+        assert!(s.contains(env!("CARGO_PKG_VERSION")));
+        assert!(s.contains("Test GPU"));
+        assert!(s.contains("Windows"));
     }
 
     fn uo_app(dir: &Path) -> TorApp {

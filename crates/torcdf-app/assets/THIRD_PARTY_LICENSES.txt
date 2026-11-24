@@ -1,0 +1,400 @@
+TorCDF uses the following third-party software. Their licences follow.
+
+================================================================
+netCDF-C (Unidata / UCAR)
+================================================================
+Copyright 2025 Unidata
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================
+HDF5 (The HDF Group)
+================================================================
+Copyright Notice and License Terms for
+HDF5 (Hierarchical Data Format 5) Software Library and Utilities
+-----------------------------------------------------------------------------
+
+HDF5 (Hierarchical Data Format 5) Software Library and Utilities
+Copyright 2006 by The HDF Group.
+
+NCSA HDF5 (Hierarchical Data Format 5) Software Library and Utilities
+Copyright 1998-2006 by The Board of Trustees of the University of Illinois.
+
+All rights reserved.
+
+This software library and utilities is covered by the 3-clause BSD License.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted for any purpose (including commercial purposes)
+provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions, and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions, and the following disclaimer in the documentation
+   and/or materials provided with the distribution.
+
+3. Neither the name of The HDF Group, the name of the University, nor the
+   name of any Contributor may be used to endorse or promote products derived
+   from this software without specific prior written permission from
+   The HDF Group, the University, or the Contributor, respectively.
+
+DISCLAIMER:
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+“AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+For further details, please refer to the full license text available
+at https://opensource.org/licenses/bsd-3-clause
+
+You are under no obligation whatsoever to provide any bug fixes, patches, or
+upgrades to the features, functionality or performance of the source code
+("Enhancements") to anyone; however, if you choose to make your Enhancements
+available either publicly, or directly to The HDF Group, without imposing a
+separate written license agreement for such Enhancements, then you hereby
+grant the following license: a non-exclusive, royalty-free perpetual license
+to install, use, modify, prepare derivative works, incorporate into other
+computer software, distribute, and sublicense such enhancements or derivative
+works thereof, in binary and source code form.
+
+-----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Contributors:   National Center for Supercomputing Applications (NCSA) at
+the University of Illinois, Fortner Software, Unidata Program Center
+(netCDF), The Independent JPEG Group (JPEG), Jean-loup Gailly and Mark Adler
+(gzip), and Digital Equipment Corporation (DEC).
+
+-----------------------------------------------------------------------------
+
+Portions of HDF5 were developed with support from the Lawrence Berkeley
+National Laboratory (LBNL) and the United States Department of Energy
+under Prime Contract No. DE-AC02-05CH11231.
+
+-----------------------------------------------------------------------------
+
+Portions of HDF5 were developed with support from Lawrence Livermore
+National Laboratory and the United States Department of Energy under
+Prime Contract No. DE-AC52-07NA27344.
+
+-----------------------------------------------------------------------------
+
+Portions of HDF5 were developed with support from the University of
+California, Lawrence Livermore National Laboratory (UC LLNL).
+The following statement applies to those portions of the product and must
+be retained in any redistribution of source code, binaries, documentation,
+and/or accompanying materials:
+
+   This work was partially produced at the University of California,
+   Lawrence Livermore National Laboratory (UC LLNL) under contract
+   no. W-7405-ENG-48 (Contract 48) between the U.S. Department of Energy
+   (DOE) and The Regents of the University of California (University)
+   for the operation of UC LLNL.
+
+   DISCLAIMER:
+   THIS WORK WAS PREPARED AS AN ACCOUNT OF WORK SPONSORED BY AN AGENCY OF
+   THE UNITED STATES GOVERNMENT. NEITHER THE UNITED STATES GOVERNMENT NOR
+   THE UNIVERSITY OF CALIFORNIA NOR ANY OF THEIR EMPLOYEES, MAKES ANY
+   WARRANTY, EXPRESS OR IMPLIED, OR ASSUMES ANY LIABILITY OR RESPONSIBILITY
+   FOR THE ACCURACY, COMPLETENESS, OR USEFULNESS OF ANY INFORMATION,
+   APPARATUS, PRODUCT, OR PROCESS DISCLOSED, OR REPRESENTS THAT ITS USE
+   WOULD NOT INFRINGE PRIVATELY- OWNED RIGHTS. REFERENCE HEREIN TO ANY
+   SPECIFIC COMMERCIAL PRODUCTS, PROCESS, OR SERVICE BY TRADE NAME,
+   TRADEMARK, MANUFACTURER, OR OTHERWISE, DOES NOT NECESSARILY CONSTITUTE
+   OR IMPLY ITS ENDORSEMENT, RECOMMENDATION, OR FAVORING BY THE UNITED
+   STATES GOVERNMENT OR THE UNIVERSITY OF CALIFORNIA. THE VIEWS AND
+   OPINIONS OF AUTHORS EXPRESSED HEREIN DO NOT NECESSARILY STATE OR REFLECT
+   THOSE OF THE UNITED STATES GOVERNMENT OR THE UNIVERSITY OF CALIFORNIA,
+   AND SHALL NOT BE USED FOR ADVERTISING OR PRODUCT ENDORSEMENT PURPOSES.
+
+-----------------------------------------------------------------------------
+
+Portions of HDF5 were developed with support from the National Science
+Foundation under Federal Award No. 2534078.
+
+-----------------------------------------------------------------------------
+================================================================
+zlib (Jean-loup Gailly and Mark Adler)
+================================================================
+Copyright notice:
+
+ (C) 1995-2026 Jean-loup Gailly and Mark Adler
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+  Jean-loup Gailly        Mark Adler
+  jloup@gzip.org          madler@alumni.caltech.edu
+
+================================================================
+Coastlines and borders: Natural Earth (public domain), naturalearthdata.com
+================================================================
+
+================================================================
+Rust crates (name version: licence)
+================================================================
+accesskit v0.25.2: MIT OR Apache-2.0
+accesskit_consumer v0.39.2: MIT OR Apache-2.0
+accesskit_windows v0.35.2: MIT OR Apache-2.0
+accesskit_winit v0.34.2: Apache-2.0
+adler2 v2.0.1: 0BSD OR MIT OR Apache-2.0
+ahash v0.8.12: MIT OR Apache-2.0
+aho-corasick v1.1.5: Unlicense OR MIT
+allocator-api2 v0.2.21: MIT OR Apache-2.0
+arboard v3.7.0: MIT OR Apache-2.0
+arrayvec v0.7.8: MIT OR Apache-2.0
+ash v0.38.0+1.3.281: MIT OR Apache-2.0
+autocfg v1.5.1: Apache-2.0 OR MIT
+bit-set v0.10.0: Apache-2.0 OR MIT
+bit-vec v0.9.1: Apache-2.0 OR MIT
+bitflags v2.13.2: MIT OR Apache-2.0
+bytemuck v1.25.2: Zlib OR Apache-2.0 OR MIT
+bytemuck_derive v1.12.1: Zlib OR Apache-2.0 OR MIT
+byteorder-lite v0.1.0: Unlicense OR MIT
+cc v1.11.3: MIT OR Apache-2.0
+cfg-if v1.0.5: MIT OR Apache-2.0
+cfg_aliases v0.2.2: MIT
+clipboard-win v5.4.3: BSL-1.0
+cmake v0.1.58: MIT OR Apache-2.0
+codespan-reporting v0.13.1: Apache-2.0
+color v0.3.3: Apache-2.0 OR MIT
+crc32fast v1.5.5: MIT OR Apache-2.0
+crossbeam-channel v0.5.17: MIT OR Apache-2.0
+crossbeam-deque v0.8.8: MIT OR Apache-2.0
+crossbeam-epoch v0.9.21: MIT OR Apache-2.0
+crossbeam-utils v0.8.23: MIT OR Apache-2.0
+cursor-icon v1.2.0: MIT OR Apache-2.0 OR Zlib
+displaydoc v0.2.7
+displaydoc v0.2.7: MIT OR Apache-2.0
+document-features v0.2.12
+document-features v0.2.12: MIT OR Apache-2.0
+dpi v0.1.2: Apache-2.0 AND MIT
+ecolor v0.37.0: MIT OR Apache-2.0
+eframe v0.37.0: MIT OR Apache-2.0
+egui v0.37.0: MIT OR Apache-2.0
+egui-wgpu v0.37.0: MIT OR Apache-2.0
+egui-winit v0.37.0: MIT OR Apache-2.0
+egui_extras v0.37.0: MIT OR Apache-2.0
+egui_plot v0.38.0: MIT OR Apache-2.0
+egui_system_font_provider v0.37.0: MIT OR Apache-2.0
+either v1.19.0: MIT OR Apache-2.0
+emath v0.37.0: MIT OR Apache-2.0
+enum-map v3.1.0: MIT OR Apache-2.0
+enum-map-derive v1.0.1: MIT OR Apache-2.0
+epaint v0.37.0: MIT OR Apache-2.0
+epaint_default_fonts v0.37.0: AND OFL-1.1 AND Ubuntu-font-1.0
+equivalent v1.0.3: Apache-2.0 OR MIT
+error-code v3.4.0: BSL-1.0
+euclid v0.22.14: MIT OR Apache-2.0
+fdeflate v0.3.7: MIT OR Apache-2.0
+fearless_simd v0.4.1: Apache-2.0 OR MIT
+find-msvc-tools v0.1.15: MIT OR Apache-2.0
+flate2 v1.1.11: MIT OR Apache-2.0
+foldhash v0.2.0: Zlib
+font-types v0.12.7: MIT OR Apache-2.0
+fontique v0.11.1: Apache-2.0 OR MIT
+form_urlencoded v1.2.3: MIT OR Apache-2.0
+gl_generator v0.14.0: Apache-2.0
+glifo v0.3.0: Apache-2.0 OR MIT
+glow v0.17.0: MIT OR Apache-2.0 OR Zlib
+glutin_wgl_sys v0.6.1: Apache-2.0
+gpu-allocator v0.28.0: MIT OR Apache-2.0
+guillotiere v0.7.0: MIT/Apache-2.0
+half v2.7.1: MIT OR Apache-2.0
+harfrust v0.12.0: MIT
+hashbrown v0.16.1: MIT OR Apache-2.0
+hashbrown v0.17.2: MIT OR Apache-2.0
+hdf5-metno-src v0.10.4: HDF5 licence (above)
+hdf5-metno-sys v0.12.5: MIT OR Apache-2.0
+icu_collections v2.4.0: Unicode-3.0
+icu_locale_core v2.4.0: Unicode-3.0
+icu_normalizer v2.4.0: Unicode-3.0
+icu_normalizer_data v2.4.0: Unicode-3.0
+icu_properties v2.4.0: Unicode-3.0
+icu_properties_data v2.4.0: Unicode-3.0
+icu_provider v2.4.0: Unicode-3.0
+idna v1.1.0: MIT OR Apache-2.0
+idna_adapter v1.2.2: Apache-2.0 OR MIT
+image v0.25.10: MIT OR Apache-2.0
+indexmap v2.14.2: Apache-2.0 OR MIT
+itertools v0.15.0: MIT OR Apache-2.0
+itoa v1.0.19: MIT OR Apache-2.0
+khronos-egl v6.0.0: MIT/Apache-2.0
+khronos_api v3.1.0: Apache-2.0
+kurbo v0.13.1: Apache-2.0 OR MIT
+libc v0.2.191: MIT OR Apache-2.0
+libdeflate-sys v1.26.1: Apache-2.0
+libdeflater v1.26.1: Apache-2.0
+libloading v0.8.9: ISC
+libm v0.2.16: MIT
+libz-sys v1.1.33: MIT OR Apache-2.0
+linebender_resource_handle v0.1.1: Apache-2.0 OR MIT
+litemap v0.8.3: Unicode-3.0
+litrs v1.0.1: MIT OR Apache-2.0
+lock_api v0.4.14: MIT OR Apache-2.0
+log v0.4.35: MIT OR Apache-2.0
+lru v0.19.1: MIT
+matrixmultiply v0.3.11: MIT/Apache-2.0
+memchr v2.8.3: Unlicense OR MIT
+memmap2 v0.9.12: MIT OR Apache-2.0
+miniz_oxide v0.8.9: MIT OR Zlib OR Apache-2.0
+miniz_oxide v0.9.1: MIT OR Zlib OR Apache-2.0
+moxcms v0.8.1: BSD-3-Clause OR Apache-2.0
+naga v30.0.2: MIT OR Apache-2.0
+naga-types v30.0.2: MIT OR Apache-2.0
+ndarray v0.17.2: MIT OR Apache-2.0
+netcdf v0.12.1: MIT OR Apache-2.0
+netcdf-src v0.5.3: netCDF-C licence (above)
+netcdf-sys v0.9.2: MIT
+nohash-hasher v0.2.0: Apache-2.0 OR MIT
+ntapi v0.4.3: Apache-2.0 OR MIT
+num-complex v0.4.6: MIT OR Apache-2.0
+num-integer v0.1.47: MIT OR Apache-2.0
+num-traits v0.2.19: MIT OR Apache-2.0
+once_cell v1.21.4: MIT OR Apache-2.0
+ordered-float v5.5.1: MIT
+parking_lot v0.12.5: MIT OR Apache-2.0
+parking_lot_core v0.9.12: MIT OR Apache-2.0
+parlance v0.1.1: Apache-2.0 OR MIT
+peniko v0.6.1: Apache-2.0 OR MIT
+percent-encoding v2.3.2: MIT OR Apache-2.0
+pin-project-lite v0.2.18: Apache-2.0 OR MIT
+pkg-config v0.3.34: MIT OR Apache-2.0
+png v0.18.1: MIT OR Apache-2.0
+poll-promise v0.3.0: MIT OR Apache-2.0
+pollster v1.0.3: MIT OR Apache-2.0
+polycool v0.4.0: MIT OR Apache-2.0
+potential_utf v0.1.6: Unicode-3.0
+presser v0.3.1: MIT OR Apache-2.0
+proc-macro2 v1.0.107: MIT OR Apache-2.0
+profiling v1.0.18: MIT OR Apache-2.0
+pxfm v0.1.30: BSD-3-Clause OR Apache-2.0
+quote v1.0.47: MIT OR Apache-2.0
+range-alloc v0.1.5: MIT OR Apache-2.0
+raw-window-handle v0.6.2: MIT OR Apache-2.0 OR Zlib
+rawpointer v0.2.1: MIT/Apache-2.0
+rayon v1.12.0: MIT OR Apache-2.0
+rayon-core v1.13.0: MIT OR Apache-2.0
+read-fonts v0.41.0: MIT OR Apache-2.0
+regex v1.13.2: MIT OR Apache-2.0
+regex-automata v0.4.19: MIT OR Apache-2.0
+regex-syntax v0.8.12: MIT OR Apache-2.0
+renderdoc-sys v1.1.0: MIT OR Apache-2.0
+rfd v0.18.0: MIT
+rustc-hash v1.1.0: Apache-2.0/MIT
+rustc-hash v2.1.3: Apache-2.0 OR MIT
+scopeguard v1.2.0: MIT OR Apache-2.0
+self_cell v1.3.0: Apache-2.0 OR GPL-2.0-only
+semver v1.0.28: MIT OR Apache-2.0
+serde v1.0.229: MIT OR Apache-2.0
+serde_core v1.0.229: MIT OR Apache-2.0
+serde_derive v1.0.229
+serde_derive v1.0.229: MIT OR Apache-2.0
+serde_json v1.0.154: MIT OR Apache-2.0
+serde_spanned v1.1.3: MIT OR Apache-2.0
+shlex v2.0.1: MIT OR Apache-2.0
+simd-adler32 v0.3.10: MIT
+skrifa v0.44.0: MIT OR Apache-2.0
+smallvec v1.16.6: MIT OR Apache-2.0
+smol_str v0.2.2: MIT OR Apache-2.0
+spirv v0.4.0+sdk-1.4.341.0: Apache-2.0
+stable_deref_trait v1.2.1: MIT OR Apache-2.0
+static_assertions v1.1.0: MIT OR Apache-2.0
+syn v2.0.119: MIT OR Apache-2.0
+syn v3.0.10: MIT OR Apache-2.0
+synstructure v0.14.0: MIT
+sys-locale v0.3.2: MIT OR Apache-2.0
+sysinfo v0.40.4: MIT
+thiserror v2.0.21: MIT OR Apache-2.0
+thiserror-impl v2.0.21: MIT OR Apache-2.0
+tinystr v0.8.5: Unicode-3.0
+toml v1.2.2+spec-1.1.0: MIT OR Apache-2.0
+toml_datetime v1.1.3+spec-1.1.0: MIT OR Apache-2.0
+toml_parser v1.1.6+spec-1.1.0: MIT OR Apache-2.0
+tracing v0.1.44: MIT
+tracing-core v0.1.36: MIT
+type-map v0.5.1: MIT/Apache-2.0
+unicode-general-category v1.1.0: Apache-2.0
+unicode-ident v1.0.27: AND Unicode-3.0
+unicode-properties v0.1.5: AND Unicode-3.0
+unicode-script v0.5.9: MIT OR Apache-2.0
+unicode-segmentation v1.13.3: MIT OR Apache-2.0
+unicode-width v0.2.3: MIT OR Apache-2.0
+url v2.5.9: MIT OR Apache-2.0
+utf8_iter v1.1.0: Apache-2.0 OR MIT
+utf_types v1.0.0: Apache-2.0 OR MIT
+uuid v1.29.3: Apache-2.0 OR MIT
+vcpkg v0.2.15: MIT/Apache-2.0
+vello_common v0.2.0: Apache-2.0 OR MIT
+vello_cpu v0.2.0: Apache-2.0 OR MIT
+version_check v0.9.5: MIT/Apache-2.0
+web-time v1.1.0: MIT OR Apache-2.0
+webbrowser v1.2.7: MIT OR Apache-2.0
+wgpu v30.0.2: MIT OR Apache-2.0
+wgpu-core v30.0.2: MIT OR Apache-2.0
+wgpu-core-deps-windows-linux-android v30.0.2: MIT OR Apache-2.0
+wgpu-hal v30.0.2: MIT OR Apache-2.0
+wgpu-naga-bridge v30.0.2: MIT OR Apache-2.0
+wgpu-types v30.0.2: MIT OR Apache-2.0
+winapi v0.3.9: MIT/Apache-2.0
+windows v0.62.2: MIT OR Apache-2.0
+windows-collections v0.3.2: MIT OR Apache-2.0
+windows-core v0.62.2: MIT OR Apache-2.0
+windows-future v0.3.2: MIT OR Apache-2.0
+windows-implement v0.60.2: MIT OR Apache-2.0
+windows-interface v0.59.3: MIT OR Apache-2.0
+windows-link v0.2.1: MIT OR Apache-2.0
+windows-numerics v0.3.1: MIT OR Apache-2.0
+windows-result v0.4.1: MIT OR Apache-2.0
+windows-strings v0.5.1: MIT OR Apache-2.0
+windows-sys v0.52.0: MIT OR Apache-2.0
+windows-sys v0.59.0: MIT OR Apache-2.0
+windows-sys v0.61.2: MIT OR Apache-2.0
+windows-targets v0.52.6: MIT OR Apache-2.0
+windows-threading v0.2.1: MIT OR Apache-2.0
+windows_x86_64_msvc v0.52.6: MIT OR Apache-2.0
+winit v0.30.13: Apache-2.0
+winnow v1.0.5: MIT
+winreg v0.56.0: MIT
+winresource v0.1.34: MIT
+writeable v0.6.4: Unicode-3.0
+xml-rs v0.8.29: MIT
+yoke v0.8.4: Unicode-3.0
+yoke-derive v0.8.4: Unicode-3.0
+zerocopy v0.8.64: BSD-2-Clause OR Apache-2.0 OR MIT
+zerocopy-derive v0.8.64: BSD-2-Clause OR Apache-2.0 OR MIT
+zerofrom v0.1.8: Unicode-3.0
+zerofrom-derive v0.1.8: Unicode-3.0
+zerotrie v0.2.5: Unicode-3.0
+zerovec v0.11.9: Unicode-3.0
+zerovec-derive v0.11.7: Unicode-3.0
+zmij v1.0.23: MIT

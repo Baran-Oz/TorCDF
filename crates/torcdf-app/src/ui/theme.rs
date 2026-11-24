@@ -95,10 +95,11 @@ pub fn style_for(p: &Palette, dark: bool) -> egui::Style {
     w.hovered.weak_bg_fill = p.widget_hover;
     w.hovered.bg_stroke = Stroke::new(1.0, p.accent);
     w.hovered.fg_stroke = Stroke::new(1.5, p.text);
-    w.active.bg_fill = p.accent;
-    w.active.weak_bg_fill = p.accent;
+    w.active.bg_fill = p.widget_hover;
+    w.active.weak_bg_fill = p.widget_hover;
     w.active.bg_stroke = Stroke::new(1.0, p.accent);
-    w.active.fg_stroke = Stroke::new(2.0, Color32::WHITE);
+    // Also the colour of strong (bold) text everywhere.
+    w.active.fg_stroke = Stroke::new(1.5, p.text);
     w.open.bg_fill = p.widget_hover;
     w.open.weak_bg_fill = p.widget_hover;
     w.open.bg_stroke = Stroke::new(1.0, p.line);
@@ -183,6 +184,18 @@ mod tests {
             assert!(contrast_ratio(p.text, p.panel) >= 4.5);
             assert!(contrast_ratio(p.weak, p.panel) >= 3.0);
             assert!(contrast_ratio(p.text, p.window) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn strong_and_widget_text_readable() {
+        for (dark, p) in [(false, &LIGHT), (true, &DARK)] {
+            let v = style_for(p, dark).visuals;
+            // Bold text (file names in the tree) uses the pressed-widget colour.
+            assert!(contrast_ratio(v.strong_text_color(), p.panel) >= 4.5, "dark {dark}");
+            for w in [&v.widgets.inactive, &v.widgets.hovered, &v.widgets.active, &v.widgets.open] {
+                assert!(contrast_ratio(w.fg_stroke.color, w.weak_bg_fill) >= 4.5, "dark {dark}");
+            }
         }
     }
 
