@@ -12,6 +12,7 @@ pub fn show(
     files: &[OpenFile],
     opening: &[Opening],
     sel: Option<&Selection>,
+    scroll_to: bool,
     actions: &mut Vec<Action>,
 ) {
     egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
@@ -33,7 +34,7 @@ pub fn show(
                         }
                     });
                 })
-                .body(|ui| group_body(ui, f, &f.nc.meta.root, sel, actions));
+                .body(|ui| group_body(ui, f, &f.nc.meta.root, sel, scroll_to, actions));
         }
         for o in opening {
             ui.horizontal(|ui| {
@@ -52,6 +53,7 @@ fn group_body(
     file: &OpenFile,
     g: &Group,
     sel: Option<&Selection>,
+    scroll_to: bool,
     actions: &mut Vec<Action>,
 ) {
     let file_id = file.id;
@@ -74,7 +76,7 @@ fn group_body(
                     actions.push(Action::Select(s));
                 }
             })
-            .body(|ui| group_body(ui, file, sub, sel, actions));
+            .body(|ui| group_body(ui, file, sub, sel, scroll_to, actions));
     }
     for v in &g.vars {
         let s = Selection::Var(file_id, v.path.clone());
@@ -83,7 +85,7 @@ fn group_body(
         let r = ui
             .selectable_label(sel == Some(&s), text)
             .on_hover_text(format!("{}  shape [{}]", v.path, shape.join(" × ")));
-        accent_edge(ui, &r, sel == Some(&s));
+        accent_edge(ui, &r, sel == Some(&s), scroll_to);
         if r.clicked() {
             actions.push(Action::Select(s));
         }
@@ -100,7 +102,7 @@ fn group_body(
         let r = ui
             .selectable_label(selected, &p.name)
             .on_hover_text(format!("vector: {} + {}", p.east, p.north));
-        accent_edge(ui, &r, selected);
+        accent_edge(ui, &r, selected, scroll_to);
         if r.clicked() {
             actions.push(Action::Select(Selection::Var(file_id, base.clone())));
         }
@@ -113,10 +115,35 @@ fn group_body(
     }
 }
 
-/// The 2 px accent bar on the left of a selected row.
-fn accent_edge(ui: &egui::Ui, r: &egui::Response, selected: bool) {
+/// The 2 px accent bar on the left of a selected row; scrolls it into
+/// view when the selection just moved by keyboard.
+fn accent_edge(ui: &egui::Ui, r: &egui::Response, selected: bool, scroll_to: bool) {
     if selected {
         let rect = egui::Rect::from_min_size(r.rect.min, egui::vec2(2.0, r.rect.height()));
         ui.painter().rect_filled(rect, 0.0, ui.visuals().selection.stroke.color);
+        if scroll_to {
+            r.scroll_to_me(None);
+        }
     }
+}
+
+/// Every variable and vector-pair row, in the order the tree shows them
+/// (groups expanded or not): for ↑/↓.
+pub fn var_order(files: &[OpenFile]) -> Vec<Selection> {
+    fn walk(file: &OpenFile, g: &Group, out: &mut Vec<Selection>) {
+        for sub in &g.groups {
+            walk(file, sub, out);
+        }
+        out.extend(g.vars.iter().map(|v| Selection::Var(file.id, v.path.clone())));
+        for p in file.nc.pairs().iter().filter(|p| p.rotate == RotateChoice::Auto) {
+            if file.nc.meta.group_of(&p.east).path == g.path {
+                out.push(Selection::Var(file.id, p.path.clone()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for f in files {
+        walk(f, &f.nc.meta.root, &mut out);
+    }
+    out
 }

@@ -17,6 +17,7 @@ use torcdf_core::{
 };
 
 use crate::settings::{Loaded, Look, PlotDefaults, Settings, TextSize, WindowGeom};
+use crate::ui::shortcuts::{self, Command};
 use crate::ui::windows::{Win, Windows};
 use crate::ui::inspector::{PanelInput, PanelTab};
 use crate::ui::{self, inspector, plot_area, tree};
@@ -258,6 +259,8 @@ pub struct TorApp {
     pub windows: Windows,
     /// The graphics adapter, for "Copy version info".
     renderer: String,
+    /// Scroll the tree to the selection next frame (it moved by keyboard).
+    scroll_tree: bool,
 }
 
 /// The colour settings a new window starts with.
@@ -311,6 +314,7 @@ impl TorApp {
             last_geom: None,
             windows: Windows::default(),
             renderer: "none".into(),
+            scroll_tree: false,
         };
         if let Loaded::Recovered(msg) = loaded {
             app.errors.push(msg);
@@ -1117,6 +1121,70 @@ impl TorApp {
         }
     }
 
+    /// Carries out a keyboard shortcut.
+    pub(crate) fn command(&mut self, c: Command) {
+        match c {
+            Command::Open => self.apply(Action::OpenDialog),
+            Command::CloseFile => {
+                if let Some(id) = self.current_file() {
+                    self.apply(Action::CloseFile(id));
+                }
+            }
+            Command::ExportPng => {
+                if self.view.is_some() {
+                    self.apply(Action::SaveImage);
+                }
+            }
+            Command::Settings => self.windows.open(Win::Settings),
+            Command::ShortcutHelp => self.windows.open(Win::Shortcuts),
+            Command::StepBack | Command::StepForward | Command::FirstStep | Command::LastStep => self.step(c),
+            Command::PlayPause => {
+                let Some(pb) = &self.playback else { return };
+                if self.view.as_ref().is_some_and(|v| v.slider_dims().contains(&pb.dim)) {
+                    self.apply(if pb.playing { Action::Pause } else { Action::Play });
+                }
+            }
+            Command::Fit => {
+                if self.view.as_ref().is_some_and(|v| matches!(v.kind, ViewKind::Image | ViewKind::Map)) {
+                    self.apply(Action::FitView);
+                }
+            }
+            Command::PrevVar | Command::NextVar => {
+                let step = if c == Command::NextVar { 1 } else { -1 };
+                let order = tree::var_order(&self.files);
+                if let Some(s) = shortcuts::neighbour(&order, self.selection.as_ref(), step)
+                    && self.selection.as_ref() != Some(&s)
+                {
+                    self.apply(Action::Select(s));
+                    self.scroll_tree = true;
+                }
+            }
+        }
+    }
+
+    /// Moves the playback dimension's slider (or the first slider's, when
+    /// that one is not a slider of the view) one step or to an end.
+    fn step(&mut self, c: Command) {
+        let Some(v) = &mut self.view else { return };
+        let dims = v.slider_dims();
+        let Some(dim) = self.playback.as_ref().map(|p| p.dim).filter(|d| dims.contains(d)).or(dims.first().copied())
+        else {
+            return;
+        };
+        let last = v.var.shape[dim] - 1;
+        let pos = v.slider_pos[dim].min(last);
+        let to = match c {
+            Command::StepBack => pos.saturating_sub(1),
+            Command::StepForward => (pos + 1).min(last),
+            Command::FirstStep => 0,
+            _ => last,
+        };
+        if to != v.slider_pos[dim] {
+            v.slider_pos[dim] = to;
+            self.apply(Action::SliderMoved);
+        }
+    }
+
     /// The file of the selection, or else of the view (for Close file).
     pub(crate) fn current_file(&self) -> Option<u64> {
         match &self.selection {
@@ -1297,6 +1365,9 @@ impl eframe::App for TorApp {
         self.poll();
         self.tick_playback();
         self.track_window();
+        for c in shortcuts::pressed(ui.ctx()) {
+            self.command(c);
+        }
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
         });
@@ -1313,8 +1384,9 @@ impl eframe::App for TorApp {
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| ui::error_banners(ui, &self.errors, &mut actions));
         }
+        let scroll_tree = std::mem::take(&mut self.scroll_tree);
         egui::Panel::left("tree").default_size(300.0).show(ui, |ui| {
-            tree::show(ui, &self.files, &self.opening, self.selection.as_ref(), &mut actions)
+            tree::show(ui, &self.files, &self.opening, self.selection.as_ref(), scroll_tree, &mut actions)
         });
         // A vector pair is no variable of the file: its attributes come from the view.
         let pair_attrs =
@@ -1456,6 +1528,7 @@ impl TorApp {
             last_geom: None,
             windows: Windows::default(),
             renderer: "none".into(),
+            scroll_tree: false,
         }
     }
 }
@@ -1968,6 +2041,68 @@ mod tests {
         app.apply(Action::ShowWindow(ui::windows::Win::About));
         assert!(app.windows.about);
         assert!(!app.windows.settings);
+    }
+
+    #[test]
+    fn step_keys_move_playback_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        let dim = app.playback.as_ref().unwrap().dim;
+        let len = app.view.as_ref().unwrap().var.shape[dim];
+        assert!(len > 1);
+        app.command(Command::StepForward);
+        assert_eq!(app.view.as_ref().unwrap().slider_pos[dim], 1);
+        app.command(Command::LastStep);
+        assert_eq!(app.view.as_ref().unwrap().slider_pos[dim], len - 1);
+        app.command(Command::StepForward);
+        assert_eq!(app.view.as_ref().unwrap().slider_pos[dim], len - 1);
+        app.command(Command::FirstStep);
+        assert_eq!(app.view.as_ref().unwrap().slider_pos[dim], 0);
+        app.command(Command::StepBack);
+        assert_eq!(app.view.as_ref().unwrap().slider_pos[dim], 0);
+    }
+
+    #[test]
+    fn keys_without_view_do_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        for c in [Command::StepForward, Command::LastStep, Command::PlayPause, Command::Fit, Command::ExportPng] {
+            app.command(c);
+        }
+        assert!(app.errors.is_empty());
+        assert!(app.view.is_none());
+    }
+
+    #[test]
+    fn next_var_follows_tree_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        let order = tree::var_order(&app.files);
+        assert!(order.len() >= 2);
+        app.command(Command::NextVar);
+        assert_eq!(app.selection.as_ref(), Some(&order[0]));
+        app.command(Command::NextVar);
+        assert_eq!(app.selection.as_ref(), Some(&order[1]));
+        app.command(Command::PrevVar);
+        assert_eq!(app.selection.as_ref(), Some(&order[0]));
+    }
+
+    #[test]
+    fn ctrl_w_closes_current_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        app.command(Command::CloseFile);
+        assert!(app.files.is_empty());
+        assert!(app.view.is_none());
+    }
+
+    #[test]
+    fn f1_and_settings_open_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.command(Command::ShortcutHelp);
+        app.command(Command::Settings);
+        assert!(app.windows.shortcuts && app.windows.settings);
     }
 
     #[test]
