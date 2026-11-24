@@ -83,6 +83,7 @@ fn group_body(
         let r = ui
             .selectable_label(sel == Some(&s), text)
             .on_hover_text(format!("{}  shape [{}]", v.path, shape.join(" × ")));
+        accent_edge(ui, &r, sel == Some(&s));
         if r.clicked() {
             actions.push(Action::Select(s));
         }
@@ -99,6 +100,7 @@ fn group_body(
         let r = ui
             .selectable_label(selected, &p.name)
             .on_hover_text(format!("vector: {} + {}", p.east, p.north));
+        accent_edge(ui, &r, selected);
         if r.clicked() {
             actions.push(Action::Select(Selection::Var(file_id, base.clone())));
         }
@@ -108,5 +110,13 @@ fn group_body(
                 ui.close();
             }
         });
+    }
+}
+
+/// The 2 px accent bar on the left of a selected row.
+fn accent_edge(ui: &egui::Ui, r: &egui::Response, selected: bool) {
+    if selected {
+        let rect = egui::Rect::from_min_size(r.rect.min, egui::vec2(2.0, r.rect.height()));
+        ui.painter().rect_filled(rect, 0.0, ui.visuals().selection.stroke.color);
     }
 }

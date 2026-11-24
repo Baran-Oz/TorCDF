@@ -25,10 +25,6 @@ use crate::view::popup::{Popup, PopupSet};
 use crate::view::map_state::{BORDERS_ID, COAST_ID, GRID_ID, UploadFailure};
 use crate::view::var_view::{Display, VarView};
 
-const COAST_COLOUR: Color32 = Color32::from_gray(45);
-const BORDERS_COLOUR: Color32 = Color32::from_gray(128);
-/// Faint grey: premultiplied grey 170 at alpha 90.
-const GRID_COLOUR: Color32 = Color32::from_rgba_premultiplied(60, 60, 60, 90);
 
 /// The tile a read covers on the plotted axes.
 fn spec_of(req: &SliceRequest, a: AxisChoice) -> TileSpec {
@@ -208,16 +204,17 @@ pub fn show(
         let p = ArrowParams { affine: map_affine(&camera), px_per_unit, wrap, rect_px: camera.rect_px };
         paint_arrows(ui, rect, ARROW_MAP_ID, &p);
     }
+    let overlay = crate::ui::theme::overlay_colours(ui.visuals().dark_mode);
     let line = |colour| LineParams { camera, colour, wrap };
     if map.grid && map.grid_ready() {
-        paint_lines(ui, rect, GRID_ID, &line(GRID_COLOUR));
+        paint_lines(ui, rect, GRID_ID, &line(overlay.grid));
     }
     if map.basemap_ready() {
         if map.borders {
-            paint_lines(ui, rect, BORDERS_ID, &line(BORDERS_COLOUR));
+            paint_lines(ui, rect, BORDERS_ID, &line(overlay.borders));
         }
         if map.coast {
-            paint_lines(ui, rect, COAST_ID, &line(COAST_COLOUR));
+            paint_lines(ui, rect, COAST_ID, &line(overlay.coast));
         }
     }
     let marker = |p: &Popup| {

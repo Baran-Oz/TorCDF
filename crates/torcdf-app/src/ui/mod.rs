@@ -5,6 +5,7 @@ pub mod inspector;
 pub mod map_view;
 pub mod plot_area;
 pub mod popup;
+pub mod theme;
 pub mod tree;
 
 use eframe::egui;
@@ -19,6 +20,7 @@ use crate::view::var_view::VarView;
 /// Menu bar: File and View (Process and Edit come in later stages).
 pub fn menu_bar(ui: &mut egui::Ui, view: Option<&VarView>, actions: &mut Vec<Action>) {
     egui::MenuBar::new().ui(ui, |ui| {
+        ui.label(egui::RichText::new("TorCDF").strong().color(ui.visuals().selection.stroke.color));
         ui.menu_button("File", |ui| {
             if ui.button("Open...").clicked() {
                 actions.push(Action::OpenDialog);

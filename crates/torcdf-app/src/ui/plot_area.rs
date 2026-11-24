@@ -290,6 +290,7 @@ pub fn plot_rects(ui: &mut egui::Ui, id: &str) -> (Rect, Rect, egui::Response) {
     let plot = Rect::from_min_max(full.min, egui::pos2(full.max.x - w, full.max.y));
     let bar = Rect::from_min_max(egui::pos2(full.max.x - w + 8.0, full.min.y), full.max);
     let resp = ui.interact(plot, ui.make_persistent_id(id), egui::Sense::click_and_drag());
+    ui.painter().rect_filled(plot, 0.0, ui.visuals().extreme_bg_color);
     (plot, bar, resp)
 }
 
