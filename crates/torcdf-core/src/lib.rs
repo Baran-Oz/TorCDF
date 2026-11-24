@@ -12,6 +12,7 @@ mod series;
 mod service;
 mod vector;
 
+pub use calc::{CalcError, Derived, FUNCTIONS};
 pub use model::*;
 pub use open::NcFile;
 pub use read::{Slice, SliceRequest};

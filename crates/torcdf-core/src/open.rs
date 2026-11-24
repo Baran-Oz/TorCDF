@@ -29,6 +29,9 @@ pub struct NcFile {
     /// Vector pairs the user made (none at open). They
     /// last for the session only.
     pub(crate) pairs: std::sync::RwLock<Vec<std::sync::Arc<crate::vector::VectorPair>>>,
+    /// Calculated variables the user made (none at open), in the order
+    /// made. They last for the session only.
+    pub(crate) derived: std::sync::RwLock<Vec<std::sync::Arc<crate::calc::Derived>>>,
     /// Resolved staggering and rotation per pair path, with the pair they
     /// were resolved for (a pair replaced at the same path resolves again).
     pub(crate) resolved: std::sync::Mutex<crate::vector::ResolvedCache>,
@@ -150,6 +153,7 @@ impl NcFile {
             c_path,
             open_id,
             pairs: Default::default(),
+            derived: Default::default(),
             resolved: Default::default(),
         }
     }
