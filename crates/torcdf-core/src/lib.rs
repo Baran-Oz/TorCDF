@@ -4,6 +4,7 @@ pub mod basemap;
 pub mod calc;
 pub mod cf;
 pub mod extract;
+pub mod stats;
 mod fast;
 mod h5meta;
 mod model;
