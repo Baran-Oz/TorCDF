@@ -501,6 +501,14 @@ impl MapState {
         }
     }
 
+    /// Starts with the projection and overlay switches chosen in Settings.
+    pub fn apply_defaults(&mut self, d: &crate::settings::PlotDefaults) {
+        self.set_projection(d.projection);
+        self.coast = d.coast;
+        self.borders = d.borders;
+        self.grid = d.grid;
+    }
+
     /// Takes the camera and overlay switches of `old` (the same place shown
     /// again), so the view does not jump.
     pub fn inherit_view(&mut self, old: &MapState) {

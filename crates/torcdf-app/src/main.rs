@@ -44,6 +44,43 @@ fn window_icon() -> Option<egui::IconData> {
     })
 }
 
+/// `pos` when at least a 100 × 40 strip of the window's top edge (its
+/// title bar) at `pos` lies inside `screen`; `None` otherwise.
+fn visible_position(pos: [f32; 2], size: [f32; 2], screen: egui::Rect) -> Option<[f32; 2]> {
+    let bar = egui::Rect::from_min_size(egui::pos2(pos[0], pos[1]), egui::vec2(size[0], 40.0));
+    let seen = bar.intersect(screen);
+    (seen.is_positive() && seen.width() >= 100.0 && seen.height() >= 40.0).then_some(pos)
+}
+
+/// The desktop spanning all monitors, in points at the system scale.
+#[cfg(windows)]
+fn virtual_screen() -> egui::Rect {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    // SAFETY: plain queries without arguments to check.
+    let (x, y, w, h, dpi) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            GetDpiForSystem(),
+        )
+    };
+    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+    egui::Rect::from_min_size(
+        egui::pos2(x as f32 / scale, y as f32 / scale),
+        egui::vec2(w as f32 / scale, h as f32 / scale),
+    )
+}
+
+#[cfg(not(windows))]
+fn virtual_screen() -> egui::Rect {
+    egui::Rect::EVERYTHING
+}
+
 fn main() -> eframe::Result {
     // `args_os`: a path that is not valid Unicode must not panic.
     let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
@@ -61,6 +98,17 @@ fn main() -> eframe::Result {
     if let Some(icon) = window_icon() {
         options.viewport = options.viewport.with_icon(Arc::new(icon));
     }
+    let (settings, loaded) = match settings::settings_path() {
+        Some(p) => settings::Settings::load_from(&p),
+        None => (settings::Settings::default(), settings::Loaded::Fresh),
+    };
+    if let Some(g) = settings.window {
+        let size = [g.size[0].max(640.0), g.size[1].max(400.0)];
+        options.viewport = options.viewport.with_inner_size(size).with_maximized(g.maximized);
+        if let Some(pos) = g.pos.and_then(|p| visible_position(p, size, virtual_screen())) {
+            options.viewport = options.viewport.with_position(pos);
+        }
+    }
     if software
         && let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut options.wgpu_options.wgpu_setup
     {
@@ -69,7 +117,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "TorCDF",
         options,
-        Box::new(move |cc| Ok(Box::new(app::TorApp::new(cc, path)))),
+        Box::new(move |cc| Ok(Box::new(app::TorApp::new(cc, path, settings, loaded)))),
     )
 }
 
@@ -77,6 +125,32 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    fn screen(x0: f32, y0: f32, x1: f32, y1: f32) -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+    }
+
+    #[test]
+    fn visible_position_on_screen() {
+        let s = screen(0.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(visible_position([100.0, 100.0], [800.0, 600.0], s), Some([100.0, 100.0]));
+    }
+
+    #[test]
+    fn visible_position_off_screen() {
+        let s = screen(0.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(visible_position([3000.0, 100.0], [800.0, 600.0], s), None);
+        // Only a 10 px strip of the title bar would show.
+        assert_eq!(visible_position([-790.0, 100.0], [800.0, 600.0], s), None);
+        // Title bar above the top of the screen.
+        assert_eq!(visible_position([100.0, -300.0], [800.0, 600.0], s), None);
+    }
+
+    #[test]
+    fn visible_position_second_monitor() {
+        let s = screen(-1920.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(visible_position([-1500.0, 50.0], [800.0, 600.0], s), Some([-1500.0, 50.0]));
+    }
 
     #[test]
     fn window_icon_decodes() {

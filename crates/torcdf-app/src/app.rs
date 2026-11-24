@@ -16,7 +16,7 @@ use torcdf_core::{
     VectorPair, default_cache_budget_bytes, layer_path, pair_by_hand, pair_magdir_by_hand,
 };
 
-use crate::render::colormap::Colormap;
+use crate::settings::{Loaded, PlotDefaults, Settings, WindowGeom};
 use crate::ui::inspector::{PanelInput, PanelTab};
 use crate::ui::{self, inspector, plot_area, tree};
 use crate::view::arrow_layer::{ArrowLayer, ArrowMode, PICK_TWO, candidates};
@@ -235,11 +235,31 @@ pub struct TorApp {
     log: DebugLog,
     first_image_logged: bool,
     ctx: egui::Context,
+    /// Preferences, recent files and window geometry (saved between runs).
+    pub settings: Settings,
+    /// Where `settings` is saved; `None` never saves (tests).
+    settings_path: Option<PathBuf>,
+    /// A failed save was reported (once per run).
+    save_failed: bool,
+    /// The window's last un-maximised geometry and whether it is maximised.
+    last_geom: Option<WindowGeom>,
+}
+
+/// The colour settings a new window starts with.
+fn initial_display(s: &Settings) -> Display {
+    Display { colormap: s.plot.colormap, log: false, lock: false, range: (0.0, 1.0) }
 }
 
 impl TorApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> TorApp {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        cli_path: Option<PathBuf>,
+        settings: Settings,
+        loaded: Loaded,
+    ) -> TorApp {
         let ctx = cc.egui_ctx.clone();
+        ui::theme::install_fonts(&ctx);
+        ui::theme::apply_look(&ctx, settings.look, settings.text_size);
         let wake = ctx.clone();
         let cache_budget = default_cache_budget_bytes();
         let service = SliceService::new(
@@ -255,12 +275,7 @@ impl TorApp {
             errors: Vec::new(),
             selection: None,
             view: None,
-            display: Display {
-                colormap: Colormap::Viridis,
-                log: false,
-                lock: false,
-                range: (0.0, 1.0),
-            },
+            display: initial_display(&settings),
             popups: PopupSet::default(),
             arrow_layer: None,
             panel_tab: PanelTab::Plot,
@@ -275,7 +290,14 @@ impl TorApp {
             log: DebugLog::from_env(),
             first_image_logged: false,
             ctx,
+            settings,
+            settings_path: crate::settings::settings_path(),
+            save_failed: false,
+            last_geom: None,
         };
+        if let Loaded::Recovered(msg) = loaded {
+            app.errors.push(msg);
+        }
         app.log.log("window created");
         if let Some(rs) = &cc.wgpu_render_state {
             let info = rs.adapter.get_info();
@@ -287,10 +309,65 @@ impl TorApp {
         if cc.wgpu_render_state.is_none() {
             app.errors.push("GPU rendering is unavailable, so images cannot be drawn.".into());
         }
-        if let Some(p) = path {
-            app.open(p);
-        }
+        app.last_geom = app.settings.window;
+        app.start_files(cli_path);
         app
+    }
+
+    /// Opens the command-line file, or else (when Settings ask for it) the
+    /// files open when the app last closed; those now missing get one
+    /// banner each.
+    pub(crate) fn start_files(&mut self, cli_path: Option<PathBuf>) {
+        if let Some(p) = cli_path {
+            self.open(p);
+            return;
+        }
+        if !self.settings.reopen_last {
+            return;
+        }
+        for p in self.settings.last_open.clone() {
+            if p.exists() {
+                self.open(p);
+            } else {
+                self.errors.push(format!("{} from last time was not found", file_name(&p)));
+            }
+        }
+    }
+
+    /// Saves the settings file; a failure is reported once per run.
+    pub(crate) fn save_settings(&mut self) {
+        let Some(path) = &self.settings_path else { return };
+        if let Err(e) = self.settings.save_to(path)
+            && !self.save_failed
+        {
+            self.save_failed = true;
+            self.errors.push(format!("Settings could not be saved: {e}"));
+        }
+    }
+
+    /// Notes the open files, in tree order, for "reopen at start-up".
+    pub(crate) fn remember_open_files(&mut self) {
+        self.settings.last_open = self.files.iter().map(|f| f.nc.meta.path.clone()).collect();
+    }
+
+    /// Follows the window's size and position (kept from before it was
+    /// maximised) for saving at exit.
+    fn track_window(&mut self) {
+        let (outer, inner, maximized) =
+            self.ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect, i.viewport().maximized));
+        let Some(maximized) = maximized else { return };
+        let prev = self.last_geom;
+        self.last_geom = Some(match (maximized, inner) {
+            (false, Some(inner)) => WindowGeom {
+                pos: outer.map(|o| [o.min.x, o.min.y]),
+                size: [inner.width(), inner.height()],
+                maximized: false,
+            },
+            _ => match prev {
+                Some(g) => WindowGeom { maximized, ..g },
+                None => return,
+            },
+        });
     }
 
     /// Opens `path` on a helper thread.
@@ -315,6 +392,8 @@ impl TorApp {
                     let id = self.next_id;
                     self.next_id += 1;
                     self.files.push(OpenFile { id, name: o.name, nc: Arc::new(nc) });
+                    self.settings.push_recent(&o.path);
+                    self.save_settings();
                     if let Some(var) = self.log.select.take() {
                         self.select(Selection::Var(id, var));
                     }
@@ -327,6 +406,14 @@ impl TorApp {
                     "cannot open {}: the open failed unexpectedly",
                     o.path.display()
                 )),
+            }
+            // A recent file that no longer opens leaves the list.
+            if !self.files.iter().any(|f| f.nc.meta.path == o.path) {
+                let before = self.settings.recent.len();
+                self.settings.remove_recent(&o.path);
+                if self.settings.recent.len() != before {
+                    self.save_settings();
+                }
             }
         }
         if let Some(r) = self.dialog.as_ref().and_then(Job::poll) {
@@ -398,7 +485,7 @@ impl TorApp {
                 // A pair's own entry draws its own arrows.
                 self.arrow_layer = Some(ArrowLayer::of_pair(*id, pair.clone()));
                 let mut v = VarView::new_vector(&self.ctx, *id, nc, pair);
-                keep_map_settings(&mut v, old_map.as_ref());
+                keep_map_settings(&mut v, old_map.as_ref(), &self.settings.plot);
                 self.show_view(v);
             } else if let Some((nc, var)) = var {
                 self.log.log(format_args!("select {}", var.path));
@@ -411,7 +498,7 @@ impl TorApp {
                 // Picks refused over the previous variable may fit this one.
                 let retry = keep && self.arrow_layer.as_ref().is_some_and(|l| l.pair.is_none() && !l.missing_picks());
                 let mut v = self.x_view(*id, nc, var);
-                keep_map_settings(&mut v, old_map.as_ref());
+                keep_map_settings(&mut v, old_map.as_ref(), &self.settings.plot);
                 self.show_view(v);
                 if retry {
                     self.pair_from_picks(true);
@@ -657,6 +744,7 @@ impl TorApp {
     /// the arrow length, the colour lock and the playback settings stay.
     fn replace_view(&mut self, mut v: VarView) {
         self.selection = Some(Selection::Var(v.file_id, v.plain_path().to_string()));
+        v.apply_plot_defaults(&self.settings.plot);
         let Some(old) = self.view.take() else {
             self.show_view(v);
             return;
@@ -1088,7 +1176,10 @@ fn png_pending(pending: impl IntoIterator<Item = Option<u64>>, target: Option<u6
 
 /// A new map view of the same file keeps the projection, overlay switches
 /// and camera of the map it replaces; any other view starts from defaults.
-fn keep_map_settings(v: &mut VarView, old: Option<&crate::view::map_state::MapState>) {
+/// A new view starts from the Settings defaults; a map of the same file
+/// shown before keeps its camera and overlay switches instead.
+fn keep_map_settings(v: &mut VarView, old: Option<&crate::view::map_state::MapState>, d: &PlotDefaults) {
+    v.apply_plot_defaults(d);
     if let (Some(new), Some(old)) = (&mut v.map, old) {
         new.inherit_view(old);
     }
@@ -1134,10 +1225,19 @@ fn find_group<'a>(g: &'a torcdf_core::Group, path: &str) -> Option<&'a torcdf_co
 }
 
 impl eframe::App for TorApp {
+    fn on_exit(&mut self) {
+        self.remember_open_files();
+        if self.last_geom.is_some() {
+            self.settings.window = self.last_geom;
+        }
+        self.save_settings();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
         self.poll();
         self.tick_playback();
+        self.track_window();
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
         });
@@ -1252,6 +1352,11 @@ impl TorApp {
     /// An app without a window, with `path` already open as file 1 (opened
     /// on the calling thread). Panics if the file cannot be opened.
     pub fn headless(path: &Path) -> TorApp {
+        TorApp::headless_with(path, Settings::default())
+    }
+
+    /// As [`TorApp::headless`], with `settings` (never saved).
+    pub fn headless_with(path: &Path, settings: Settings) -> TorApp {
         let ctx = egui::Context::default();
         let cache_budget = default_cache_budget_bytes();
         let service = SliceService::new(
@@ -1268,12 +1373,7 @@ impl TorApp {
             errors: Vec::new(),
             selection: None,
             view: None,
-            display: Display {
-                colormap: Colormap::Viridis,
-                log: false,
-                lock: false,
-                range: (0.0, 1.0),
-            },
+            display: initial_display(&settings),
             popups: PopupSet::default(),
             arrow_layer: None,
             panel_tab: PanelTab::Plot,
@@ -1288,6 +1388,10 @@ impl TorApp {
             log: DebugLog { tx: None, t0: Instant::now(), select: None },
             first_image_logged: false,
             ctx,
+            settings,
+            settings_path: None,
+            save_failed: false,
+            last_geom: None,
         }
     }
 }
@@ -1639,6 +1743,108 @@ mod tests {
         // thetao = 10 + 0.01 (p + q) at every time step.
         assert_eq!(p.values.len(), 2);
         assert!(p.values.iter().all(|v| v.is_some_and(|x| (x - 10.02).abs() < 1e-4)), "{:?}", p.values);
+    }
+
+    fn wait_opened(app: &mut TorApp) {
+        let start = Instant::now();
+        while !app.opening.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(20), "open timed out");
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll();
+        }
+    }
+
+    #[test]
+    fn new_view_uses_plot_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.plot.projection = crate::map::projection::Projection::Mercator;
+        s.plot.coast = false;
+        let mut app = TorApp::headless_with(&torcdf_core::fixtures::write_nc4(dir.path()), s);
+        app.apply(Action::Select(Selection::Var(1, "/ocean/uo".into())));
+        let m = app.view.as_ref().unwrap().map.as_ref().expect("uo is a map");
+        assert_eq!(m.camera.proj, crate::map::projection::Projection::Mercator);
+        assert!(!m.coast);
+        assert!(m.borders && m.grid);
+    }
+
+    #[test]
+    fn colormap_default_from_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.plot.colormap = crate::render::colormap::Colormap::Topo;
+        let app = TorApp::headless_with(&torcdf_core::fixtures::write_nc4(dir.path()), s);
+        assert_eq!(app.display.colormap, crate::render::colormap::Colormap::Topo);
+    }
+
+    #[test]
+    fn reopen_last_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = torcdf_core::fixtures::write_nc4(dir.path());
+        let mut s = Settings::default();
+        s.reopen_last = true;
+        s.last_open = vec![path.clone(), PathBuf::from("C:/nope/x.nc")];
+        let mut app = TorApp::headless_with(&path, s);
+        app.start_files(None);
+        assert_eq!(app.opening.len(), 1);
+        assert_eq!(app.errors.len(), 1);
+        assert!(app.errors[0].contains("x.nc"), "{:?}", app.errors);
+        wait_opened(&mut app); // netCDF must not be mid-open at process exit
+    }
+
+    #[test]
+    fn reopen_last_off_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = torcdf_core::fixtures::write_nc4(dir.path());
+        let s = Settings { last_open: vec![path.clone()], ..Settings::default() };
+        let mut app = TorApp::headless_with(&path, s);
+        app.start_files(None);
+        assert!(app.opening.is_empty() && app.errors.is_empty());
+    }
+
+    #[test]
+    fn command_line_path_wins_over_reopen_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = torcdf_core::fixtures::write_nc4(dir.path());
+        let s = Settings { reopen_last: true, last_open: vec![PathBuf::from("C:/nope/x.nc")], ..Settings::default() };
+        let mut app = TorApp::headless_with(&path, s);
+        app.start_files(Some(path.clone()));
+        assert_eq!(app.opening.len(), 1);
+        assert!(app.errors.is_empty());
+        wait_opened(&mut app);
+    }
+
+    #[test]
+    fn open_success_adds_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = torcdf_core::fixtures::write_nc4(dir.path());
+        let mut app = TorApp::headless_with(&path, Settings::default());
+        app.open(path.clone());
+        wait_opened(&mut app);
+        assert_eq!(app.settings.recent.first(), Some(&path));
+    }
+
+    #[test]
+    fn open_failure_removes_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = torcdf_core::fixtures::write_nc4(dir.path());
+        let gone = dir.path().join("gone.nc");
+        let mut s = Settings::default();
+        s.push_recent(&gone);
+        let mut app = TorApp::headless_with(&path, s);
+        app.open(gone.clone());
+        wait_opened(&mut app);
+        assert!(app.settings.recent.is_empty());
+        assert_eq!(app.errors.len(), 1);
+    }
+
+    #[test]
+    fn last_open_lists_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = torcdf_core::fixtures::write_nc4(dir.path());
+        let mut app = TorApp::headless_with(&path, Settings::default());
+        app.remember_open_files();
+        assert_eq!(app.settings.last_open, vec![path]);
     }
 
     fn uo_app(dir: &Path) -> TorApp {

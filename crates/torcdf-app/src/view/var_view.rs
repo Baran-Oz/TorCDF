@@ -162,6 +162,8 @@ pub struct VarView {
     pub image: ImageState,
     /// Map view state; `None` when the variable cannot be mapped.
     pub map: Option<MapState>,
+    /// What a map made later for this view starts with (Settings).
+    pub plot_defaults: crate::settings::PlotDefaults,
     /// One-line notice in the plot area (e.g. why the map fell back to the image).
     pub notice: Option<String>,
     /// A passing message (a pop-up click that opened nothing) and when it
@@ -258,6 +260,7 @@ impl VarView {
         VarView {
             file_id,
             base: None,
+            plot_defaults: Default::default(),
             axes: choose_axes(ds, &var),
             slider_pos: vec![0; var.shape.len()],
             nc,
@@ -325,6 +328,7 @@ impl VarView {
         VarView {
             file_id,
             base: None,
+            plot_defaults: Default::default(),
             axes: Some(AxisChoice { y: hy, x: hx }),
             slider_pos: vec![0; var.shape.len()],
             nc,
@@ -353,6 +357,14 @@ impl VarView {
             resolved: None,
             arrows: Some(ArrowState::default()),
         }
+    }
+
+    /// Settings defaults for this view and for any map it makes later.
+    pub fn apply_plot_defaults(&mut self, d: &crate::settings::PlotDefaults) {
+        if let Some(m) = &mut self.map {
+            m.apply_defaults(d);
+        }
+        self.plot_defaults = d.clone();
     }
 
     /// The map cannot be drawn: show the image view instead, with a notice.
@@ -779,7 +791,9 @@ impl VarView {
                 let regular = matches!(self.geo, Geo::Regular { .. });
                 if !layered && r.regular != regular && self.map.is_some() {
                     self.geo = geo_of_pair(pair, r.regular);
-                    self.map = Some(MapState::new(&self.geo));
+                    let mut m = MapState::new(&self.geo);
+                    m.apply_defaults(&self.plot_defaults);
+                    self.map = Some(m);
                 }
                 self.resolved = Some(r);
                 None
