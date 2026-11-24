@@ -18,31 +18,46 @@ pub fn parse_date(text: &str, t: &TimeUnits) -> Option<f64> {
     if dp.next().is_some() {
         return None;
     }
-    let (h, mi) = if time.is_empty() {
-        (0, 0)
+    // HH:MM, optionally :SS or :SS.fff (as the form writes dates back).
+    let (h, mi, s) = if time.is_empty() {
+        (0, 0, 0.0)
     } else {
-        let (h, mi) = time.split_once(':')?;
-        (h.trim().parse::<u8>().ok()?, mi.trim().parse::<u8>().ok()?)
+        let mut tp = time.split(':');
+        let h = tp.next()?.trim().parse::<u8>().ok()?;
+        let mi = tp.next()?.trim().parse::<u8>().ok()?;
+        let s = tp.next().map_or(Some(0.0), |x| x.trim().parse::<f64>().ok())?;
+        if tp.next().is_some() {
+            return None;
+        }
+        (h, mi, s)
     };
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || !(0.0..60.0).contains(&s) {
         return None;
     }
-    let v = t.encode(y, m, d, h, mi);
+    let v = t.encode(y, m, d, h, mi) + s / t.unit_secs();
     // Days past the month's end (Feb 30 outside 360-day) do not round-trip.
     let back = t.decode(v);
     (back.year == y && back.month == m && back.day == d).then_some(v)
 }
 
-/// Comparison slack for float32 coordinates against typed bounds.
-fn slack(lo: f64, hi: f64) -> f64 {
-    1e-6 * lo.abs().max(hi.abs()).max(1.0)
+/// Comparison slack against typed bounds: enough for float32 coordinates
+/// (relative 1e-6), but never a quarter of the axis's smallest step, so
+/// large values (hours since 1900) never take in a neighbouring step.
+fn slack(values: &[f64], lo: f64, hi: f64) -> f64 {
+    let rel = 1e-6 * lo.abs().max(hi.abs()).max(1.0);
+    let step = values
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .filter(|d| *d > 0.0 && d.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    rel.min(step / 4.0)
 }
 
 /// (start, count) of the positions whose value lies in [lo, hi] (lo/hi in either order):
 /// from the first to the last matching position (so descending or non-monotonic axes work).
 pub fn value_range(values: &[f64], lo: f64, hi: f64) -> Option<(usize, usize)> {
     let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-    let e = slack(lo, hi);
+    let e = slack(values, lo, hi);
     let inside = |v: &f64| *v >= lo - e && *v <= hi + e;
     let first = values.iter().position(inside)?;
     let last = values.iter().rposition(inside)?;
@@ -91,7 +106,7 @@ pub fn curv_box(
     east: f64,
 ) -> Option<[(usize, usize); 2]> {
     let (south, north) = if south <= north { (south, north) } else { (north, south) };
-    let e = slack(south, north);
+    let e = slack(&[], south, north);
     let width = if east - west >= 360.0 { 360.0 } else { (east - west).rem_euclid(360.0) };
     let (mut y0, mut y1, mut x0, mut x1) = (usize::MAX, 0, usize::MAX, 0);
     for y in 0..ny {
@@ -170,5 +185,36 @@ mod tests {
         let lon = [0., 10., 20., 0., 10., 20., 0., 10., 20.];
         assert_eq!(curv_box(&lat, &lon, 3, 3, 15.0, 30.0, 5.0, 20.0), Some([(1, 2), (1, 2)]));
         assert_eq!(curv_box(&lat, &lon, 3, 3, 50.0, 60.0, 5.0, 20.0), None);
+    }
+
+    #[test]
+    fn large_epoch_hours_keep_exact_steps() {
+        // ERA5-like: hours since 1900; 2020-01-01 is about 1 051 896 h.
+        let t = tu("hours since 1900-01-01", None);
+        let first = t.encode(2019, 12, 31, 0, 0);
+        let axis: Vec<f64> = (0..72).map(|i| first + i as f64).collect();
+        let lo = parse_date("2020-01-01 00:00", &t).unwrap();
+        let hi = parse_date("2020-01-01 23:00", &t).unwrap();
+        assert_eq!(value_range(&axis, lo, hi), Some((24, 24)));
+        // Seconds since 1970, 10-minute steps.
+        let t = tu("seconds since 1970-01-01", None);
+        let first = t.encode(2024, 6, 1, 0, 0);
+        let axis: Vec<f64> = (0..20).map(|i| first + 600.0 * i as f64).collect();
+        let (lo, hi) = (parse_date("2024-06-01 00:30", &t).unwrap(), parse_date("2024-06-01 01:00", &t).unwrap());
+        assert_eq!(value_range(&axis, lo, hi), Some((3, 4)));
+        // float32 coordinates still match their typed decimals.
+        assert_eq!(value_range(&[35.0, 35.1f32 as f64, 35.2f32 as f64], 35.1, 35.2), Some((1, 2)));
+    }
+
+    #[test]
+    fn dates_with_seconds() {
+        let t = tu("hours since 2000-01-01", None);
+        assert_eq!(parse_date("2000-01-02 06:00:36", &t), Some(30.01));
+        let v = parse_date("2000-01-01 01:00:00.288", &t).unwrap();
+        assert!((v - (1.0 + 0.288 / 3600.0)).abs() < 1e-9);
+        // What the form writes back reads again.
+        let shown = t.decode(v).to_string();
+        assert_eq!(parse_date(&shown, &t).map(|x| (x * 3600.0).round()), Some((v * 3600.0).round()));
+        assert_eq!(parse_date("2000-01-01 01:00:61", &t), None);
     }
 }

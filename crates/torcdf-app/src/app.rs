@@ -1300,7 +1300,15 @@ impl TorApp {
     /// old formula stays: cached slices go, pop-ups of it close and the view
     /// is rebuilt.
     fn create_derived(&mut self) {
+        // A save computes calculated variables as it goes; changing one
+        // under it would mix old and new values in the file.
+        let saving = self.extract.as_ref().is_some_and(|f| f.job.is_some())
+            || self.popups.list.iter().any(|p| p.nc_job.is_some());
         let Some(form) = self.calc.as_mut() else { return };
+        if saving && form.replacing.is_some() {
+            form.check = Err("A save is running; apply this change once it has finished.".into());
+            return;
+        }
         let Some(f) = self.files.iter().find(|f| f.id == form.file) else {
             self.calc = None;
             return;
@@ -3391,5 +3399,22 @@ mod tests {
         let o = NcFile::open(&out).unwrap();
         assert_eq!(o.meta.var("/ocean/uo").unwrap().shape, [24, 1, 1]);
         assert_eq!(o.meta.var("/ocean/vo").unwrap().shape, [24, 1, 1]);
+    }
+
+    #[test]
+    fn calculated_edits_wait_for_a_running_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_extract(dir.path());
+        let b = derive(&app, "b", "uo*2");
+        app.start_extract(dir.path().join("running.nc"));
+        app.apply(Action::OpenCalculate { file: 1, edit: Some(b.clone()) });
+        fill(&mut app, "b", "uo*3", "");
+        app.apply(Action::CreateDerived);
+        let form = app.calc.as_ref().expect("the window stays open");
+        assert!(form.check.as_ref().is_err_and(|e| e.contains("save")), "{:?}", form.check);
+        assert_eq!(app.files[0].nc.derived(&b).unwrap().formula, "uo*2");
+        wait_extract(&mut app);
+        app.apply(Action::CreateDerived);
+        assert_eq!(app.files[0].nc.derived(&b).unwrap().formula, "uo*3");
     }
 }
