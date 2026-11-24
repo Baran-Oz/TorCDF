@@ -24,15 +24,15 @@ pub fn menu_bar(ui: &mut egui::Ui, view: Option<&VarView>, actions: &mut Vec<Act
                 actions.push(Action::OpenDialog);
                 ui.close();
             }
-            let save = egui::Button::new("Save image…")
-                .shortcut_text(ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
-                    egui::Modifiers::COMMAND,
-                    egui::Key::S,
-                )));
-            if ui.add_enabled(view.is_some(), save).clicked() {
-                actions.push(Action::SaveImage);
-                ui.close();
-            }
+            // Ctrl+S stays free for saving edited files (stage 3).
+            ui.add_enabled_ui(view.is_some(), |ui| {
+                ui.menu_button("Export", |ui| {
+                    if ui.button("Plot as PNG…").clicked() {
+                        actions.push(Action::SaveImage);
+                        ui.close();
+                    }
+                });
+            });
             ui.separator();
             if ui.button("Exit").clicked() {
                 actions.push(Action::Exit);

@@ -1146,10 +1146,8 @@ impl eframe::App for TorApp {
         }
 
         let mut actions = Vec::new();
-        let save_key = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
-        if self.view.is_some() && ui.ctx().input_mut(|i| i.consume_shortcut(&save_key)) {
-            actions.push(Action::SaveImage);
-        }
+        // The plot's own PNG button hides while its picture is being taken.
+        let capturing = self.shots.iter().any(|s| s.popup.is_none());
         egui::Panel::top("menu").show(ui, |ui| ui::menu_bar(ui, self.view.as_ref(), &mut actions));
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| ui::error_banners(ui, &self.errors, &mut actions));
@@ -1190,6 +1188,7 @@ impl eframe::App for TorApp {
                 &self.display,
                 frame.wgpu_render_state(),
                 &self.popups,
+                capturing,
                 &mut actions,
             )
         });

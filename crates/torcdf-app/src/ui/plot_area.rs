@@ -33,6 +33,7 @@ pub fn show(
     display: &Display,
     rs: Option<&RenderState>,
     popups: &PopupSet,
+    capturing: bool,
     actions: &mut Vec<Action>,
 ) -> bool {
     let Some(v) = view else {
@@ -41,7 +42,7 @@ pub fn show(
         });
         return false;
     };
-    header(ui, v);
+    header(ui, v, capturing, actions);
     if let Some(n) = &v.notice {
         ui.colored_label(ui.visuals().warn_fg_color, n);
     }
@@ -83,8 +84,10 @@ fn attr<'a>(v: &'a VarView, name: &str) -> Option<&'a str> {
     v.var.attrs.iter().find(|a| a.name == name).and_then(|a| a.value.as_str())
 }
 
-/// Name, long name and units, with a spinner while data is loading.
-fn header(ui: &mut egui::Ui, v: &VarView) {
+/// Name, long name and units, with a spinner while data is loading, and the
+/// PNG button on the right. The button keeps its space but is not drawn while
+/// the plot's picture is taken, so it stays out of the image.
+fn header(ui: &mut egui::Ui, v: &VarView, capturing: bool, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         ui.strong(&v.var.name);
         if let Some(long) = attr(v, "long_name").or_else(|| attr(v, "standard_name")) {
@@ -96,6 +99,14 @@ fn header(ui: &mut egui::Ui, v: &VarView) {
         if v.loading() {
             ui.spinner();
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let png = ui
+                .add_visible(!capturing, egui::Button::new("PNG"))
+                .on_hover_text("Save the plot as a PNG picture");
+            if png.clicked() {
+                actions.push(Action::SaveImage);
+            }
+        });
     });
 }
 
