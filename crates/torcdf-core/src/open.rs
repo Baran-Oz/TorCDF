@@ -180,7 +180,7 @@ fn c_path_candidates(p: &Path) -> Vec<PathBuf> {
 
 /// The 8.3 form of `p`, if the file exists, has one, and it is ASCII.
 #[cfg(windows)]
-fn short_path(p: &Path) -> Option<PathBuf> {
+pub(crate) fn short_path(p: &Path) -> Option<PathBuf> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     unsafe extern "system" {
         fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
@@ -313,10 +313,10 @@ pub(crate) fn u64s_to_attr(v: Vec<u64>) -> AttrValue {
 // so a second metadata-only handle answers those. Every raw call is made
 // under the same lock the netcdf crate uses.
 
-struct RawHandle(c_int);
+pub(crate) struct RawHandle(pub(crate) c_int);
 
 impl RawHandle {
-    fn open(path: &Path) -> Result<RawHandle, String> {
+    pub(crate) fn open(path: &Path) -> Result<RawHandle, String> {
         let c = CString::new(path.to_str().ok_or("path is not valid UTF-8")?)
             .map_err(|e| e.to_string())?;
         let _g = netcdf_sys::libnetcdf_lock.lock();
@@ -404,7 +404,7 @@ fn var_storage(gid: c_int, v: &VarInfo) -> Option<Storage> {
     }
 }
 
-fn nc_message(code: c_int) -> String {
+pub(crate) fn nc_message(code: c_int) -> String {
     let p = unsafe { netcdf_sys::nc_strerror(code) };
     if p.is_null() {
         return format!("netCDF error {code}");

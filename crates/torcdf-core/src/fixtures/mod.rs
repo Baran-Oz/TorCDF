@@ -449,3 +449,58 @@ pub fn write_unsigned(dir: &Path) -> PathBuf {
     }
     path
 }
+
+/// `desc_lat.nc`: `t(time=4, lat=7, lon=36)` f32 with latitude descending
+/// 30 → -30 (step 10) and longitude 0..350 (step 10); deflate 5 + shuffle,
+/// chunks `[1,7,36]`; `t = time*1000 + lat_index*100 + lon_index`. Global
+/// `history = "made by fixture"` and `title = "desc"`.
+pub fn write_desc_lat(dir: &Path) -> PathBuf {
+    let path = dir.join("desc_lat.nc");
+    let mut f = netcdf::create(&path).unwrap();
+    f.add_attribute("history", "made by fixture").unwrap();
+    f.add_attribute("title", "desc").unwrap();
+    f.add_dimension("time", 4).unwrap();
+    f.add_dimension("lat", 7).unwrap();
+    f.add_dimension("lon", 36).unwrap();
+    let mut time = f.add_variable::<f64>("time", &["time"]).unwrap();
+    time.put_attribute("units", "days since 2000-01-01").unwrap();
+    time.put_values(&[0.0f64, 1.0, 2.0, 3.0], ..).unwrap();
+    let mut lat = f.add_variable::<f64>("lat", &["lat"]).unwrap();
+    lat.put_attribute("units", "degrees_north").unwrap();
+    let lats: Vec<f64> = (0..7).map(|i| 30.0 - 10.0 * f64::from(i)).collect();
+    lat.put_values(&lats, ..).unwrap();
+    let mut lon = f.add_variable::<f64>("lon", &["lon"]).unwrap();
+    lon.put_attribute("units", "degrees_east").unwrap();
+    let lons: Vec<f64> = (0..36).map(|i| 10.0 * f64::from(i)).collect();
+    lon.put_values(&lons, ..).unwrap();
+    let mut t = f.add_variable::<f32>("t", &["time", "lat", "lon"]).unwrap();
+    t.set_chunking(&[1, 7, 36]).unwrap();
+    t.set_compression(5, true).unwrap();
+    t.put_attribute("units", "K").unwrap();
+    let mut data = Vec::with_capacity(4 * 7 * 36);
+    for i in 0..4 {
+        for j in 0..7 {
+            for k in 0..36 {
+                data.push((i * 1000 + j * 100 + k) as f32);
+            }
+        }
+    }
+    t.put_values(&data, ..).unwrap();
+    path
+}
+
+/// The i64 values [`write_i64`] stores: one above 2^53, one far below 0.
+pub const I64_VALUES: [i64; 3] = [(1 << 53) + 1, -(1 << 60), 7];
+
+/// `i64.nc`: `big(n=3)` i64 = [`I64_VALUES`], `units = "1"`, `valid_max`
+/// an i64 attribute of 2^62.
+pub fn write_i64(dir: &Path) -> PathBuf {
+    let path = dir.join("i64.nc");
+    let mut f = netcdf::create(&path).unwrap();
+    f.add_dimension("n", 3).unwrap();
+    let mut v = f.add_variable::<i64>("big", &["n"]).unwrap();
+    v.put_attribute("units", "1").unwrap();
+    v.put_attribute("valid_max", 1i64 << 62).unwrap();
+    v.put_values(&I64_VALUES, ..).unwrap();
+    path
+}
