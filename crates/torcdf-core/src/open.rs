@@ -32,6 +32,9 @@ pub struct NcFile {
     /// Calculated variables the user made (none at open), in the order
     /// made. They last for the session only.
     pub(crate) derived: std::sync::RwLock<Vec<std::sync::Arc<crate::calc::Derived>>>,
+    /// Goes up whenever a calculated variable is added, changed or removed,
+    /// so a read that started before cannot be cached after.
+    pub(crate) derived_epoch: std::sync::atomic::AtomicU64,
     /// Resolved staggering and rotation per pair path, with the pair they
     /// were resolved for (a pair replaced at the same path resolves again).
     pub(crate) resolved: std::sync::Mutex<crate::vector::ResolvedCache>,
@@ -154,6 +157,7 @@ impl NcFile {
             open_id,
             pairs: Default::default(),
             derived: Default::default(),
+            derived_epoch: Default::default(),
             resolved: Default::default(),
         }
     }

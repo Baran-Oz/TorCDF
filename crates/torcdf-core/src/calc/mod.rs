@@ -42,7 +42,13 @@ impl NcFile {
             Some(x) => *x = d.clone(),
             None => all.push(d.clone()),
         }
+        self.derived_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         d
+    }
+
+    /// Changes whenever a calculated variable is added, changed or removed.
+    pub fn derived_epoch(&self) -> u64 {
+        self.derived_epoch.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The calculated variable at `path`.
@@ -94,6 +100,7 @@ impl NcFile {
             return Err(format!("{name} is used by {}", users.join(", ")));
         }
         self.derived.write().unwrap_or_else(|e| e.into_inner()).retain(|d| d.path != path);
+        self.derived_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 

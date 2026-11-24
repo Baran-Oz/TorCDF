@@ -313,14 +313,14 @@ impl NcFile {
 
     fn resolve_uncached(&self, pair: &VectorPair) -> Result<Resolved, CoreError> {
         let unsupported = |msg: &str| CoreError::Unsupported(format!("{}: {msg}", pair.path));
-        let comps = [self.numeric_var(&pair.east)?, self.numeric_var(&pair.north)?];
+        let comps = [self.numeric_any(&pair.east)?, self.numeric_any(&pair.north)?];
         let shape = &pair.centre_shape;
         let rank = shape.len();
         let [hy, hx] = pair.horiz;
         if hy >= rank || hx >= rank || hy == hx || pair.centre_dims.len() != rank {
             return Err(unsupported("the centre grid is malformed"));
         }
-        for c in comps {
+        for c in &comps {
             if c.shape.len() != rank {
                 return Err(unsupported("components and centre grid differ in rank"));
             }
@@ -333,7 +333,7 @@ impl NcFile {
             (Some(lat), Some(lon)) => self.coord_plane(&pair.var_info(), pair.horiz, lat, lon)?,
             _ => None,
         };
-        let planes = [self.geo_plane(comps[0], pair.horiz)?, self.geo_plane(comps[1], pair.horiz)?];
+        let planes = [self.geo_plane(&comps[0], pair.horiz)?, self.geo_plane(&comps[1], pair.horiz)?];
 
         let mut assumed = false;
         // [east, north][y, x]: from coordinates when both sides have them,
@@ -475,8 +475,8 @@ impl NcFile {
     pub(crate) fn read_pair(&self, pair: &VectorPair, r: &SliceRequest) -> Result<Slice, CoreError> {
         let (shape, total) = check_shape(r, &pair.centre_shape)?;
         let res = self.resolve_vector(pair)?;
-        let east_len = self.numeric_var(&pair.east)?.shape.clone();
-        let north_len = self.numeric_var(&pair.north)?.shape.clone();
+        let east_len = self.numeric_any(&pair.east)?.shape;
+        let north_len = self.numeric_any(&pair.north)?.shape;
         let mut east = self.read_component(&pair.east, &east_len, r, &shape, pair.horiz, res.sides[0])?;
         let mut north = self.read_component(&pair.north, &north_len, r, &shape, pair.horiz, res.sides[1])?;
         let [hy, hx] = pair.horiz;

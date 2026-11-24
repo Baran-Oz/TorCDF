@@ -386,6 +386,14 @@ impl NcFile {
         }
     }
 
+    /// A numeric file variable or a calculated one (an owned copy).
+    pub(crate) fn numeric_any(&self, path: &str) -> Result<VarInfo, CoreError> {
+        match self.numeric_var(path) {
+            Ok(v) => Ok(v.clone()),
+            Err(e) => self.derived(path).map(|d| d.info.clone()).ok_or(e),
+        }
+    }
+
     pub(crate) fn numeric_var(&self, path: &str) -> Result<&VarInfo, CoreError> {
         let info = self.meta.var(path).ok_or_else(|| CoreError::Read {
             var: path.into(),

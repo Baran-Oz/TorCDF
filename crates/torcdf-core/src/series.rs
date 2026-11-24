@@ -169,6 +169,7 @@ pub(crate) fn start(
     let run = Arc::new(Run {
         shared: shared.clone(),
         file: file.clone(),
+        epoch: file.derived_epoch(),
         full,
         along: req.along,
         cancelled,
@@ -214,6 +215,8 @@ fn full_request_for(file: &NcFile, req: &SeriesRequest) -> Result<SliceRequest, 
 struct Run {
     shared: Arc<Shared>,
     file: Arc<NcFile>,
+    /// The file's calculated-variable epoch when the series began.
+    epoch: u64,
     full: SliceRequest,
     along: usize,
     cancelled: Arc<AtomicBool>,
@@ -352,7 +355,7 @@ impl Run {
                 vector: series.vector.clone(),
             };
             let key = (self.file.open_id(), self.full.clone());
-            self.shared.lock().insert(key, Arc::new(whole));
+            self.shared.insert_if_current(&self.file, self.epoch, key, Arc::new(whole));
         }
         {
             let mut p = lock(&self.state);

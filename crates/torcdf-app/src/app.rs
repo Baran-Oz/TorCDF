@@ -1231,9 +1231,11 @@ impl TorApp {
         let (file, path, editing) = (form.file, d.path.clone(), form.replacing.is_some());
         let recent = RecentFormula { name: d.name.clone(), formula: d.formula.clone(), units: form.units.trim().to_string() };
         nc.add_derived(d);
+        // Slices cached under this path may hold another formula's values
+        // (an edit, or a deleted variable of the same name).
+        self.service.forget_file(&nc);
         self.calc = None;
         if editing {
-            self.service.forget_file(&nc);
             let affected = nc.affected_by(&path);
             let gone: Vec<u64> = self
                 .popups
@@ -1267,6 +1269,7 @@ impl TorApp {
             self.errors.push(e);
             return;
         }
+        self.service.forget_file(&f.nc);
         let gone: Vec<u64> =
             self.popups.list.iter().filter(|p| p.file_id == file && p.var_path == path).map(|p| p.id).collect();
         for id in gone {
@@ -2157,6 +2160,26 @@ mod tests {
         wait_shown(&mut app, &[0, 0, 0]);
         let v = app.view.as_ref().unwrap();
         let shown = v.shown.as_ref().unwrap();
+        let uo = app.files[0].nc.read_slice(&SliceRequest { var: "/ocean/uo".into(), ..shown.req.clone() }).unwrap();
+        for (a, b) in shown.slice.data.iter().zip(&uo.data) {
+            assert!((a.is_nan() && b.is_nan()) || (a - 2.0 * b).abs() < 1e-5, "{a} vs 2×{b}");
+        }
+    }
+
+    #[test]
+    fn recreated_name_shows_new_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.apply(Action::OpenCalculate { file: 1, edit: None });
+        fill(&mut app, "s", "uo*1", "");
+        app.apply(Action::CreateDerived);
+        wait_shown(&mut app, &[0, 0, 0]);
+        app.apply(Action::DeleteDerived { file: 1, path: "/ocean/s".into() });
+        app.apply(Action::OpenCalculate { file: 1, edit: None });
+        fill(&mut app, "s", "uo*2", "");
+        app.apply(Action::CreateDerived);
+        wait_shown(&mut app, &[0, 0, 0]);
+        let shown = app.view.as_ref().unwrap().shown.as_ref().unwrap();
         let uo = app.files[0].nc.read_slice(&SliceRequest { var: "/ocean/uo".into(), ..shown.req.clone() }).unwrap();
         for (a, b) in shown.slice.data.iter().zip(&uo.data) {
             assert!((a.is_nan() && b.is_nan()) || (a - 2.0 * b).abs() < 1e-5, "{a} vs 2×{b}");

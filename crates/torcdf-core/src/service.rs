@@ -104,6 +104,15 @@ impl Shared {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Caches `slice` unless a calculated variable of `file` changed since
+    /// `epoch` (when its read began): its values may be of an old formula.
+    pub(crate) fn insert_if_current(&self, file: &NcFile, epoch: u64, key: Key, slice: Arc<Slice>) {
+        let mut cache = self.lock();
+        if file.derived_epoch() == epoch {
+            cache.insert(key, slice);
+        }
+    }
+
     /// Calls `on_ready`. A panicking callback must not kill the caller.
     pub(crate) fn ready(&self) {
         let _ = catch_unwind(AssertUnwindSafe(|| (self.on_ready)()));
@@ -225,12 +234,13 @@ fn worker(shared: &Shared, rx: &Receiver<Job>) {
             Some(s) => Ok(s),
             None => {
                 shared.reads.fetch_add(1, Ordering::SeqCst);
+                let epoch = job.file.derived_epoch();
                 // No lock is held during the read.
                 let read = catch_unwind(AssertUnwindSafe(|| job.file.read_slice(&job.req)));
                 match read {
                     Ok(Ok(slice)) => {
                         let slice = Arc::new(slice);
-                        shared.lock().insert(key, slice.clone());
+                        shared.insert_if_current(&job.file, epoch, key, slice.clone());
                         Ok(slice)
                     }
                     Ok(Err(e)) => Err(e),
@@ -285,5 +295,28 @@ impl RequestHandle {
 impl Drop for RequestHandle {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::*;
+    use crate::fixtures;
+
+    #[test]
+    fn stale_read_is_not_cached() {
+        let d = tempfile::tempdir().unwrap();
+        let f = NcFile::open(&fixtures::write_nc4(d.path())).unwrap();
+        let svc = SliceService::new(1 << 22, 1, Arc::new(|| {}));
+        let r = SliceRequest { var: "/ocean/uo".into(), start: vec![0, 0, 0], count: vec![1, 10, 20], stride: vec![1, 1, 1] };
+        let slice = Arc::new(f.read_slice(&r).unwrap());
+        // A read that started before a calculated variable changed.
+        let before = f.derived_epoch();
+        f.add_derived(f.check_formula("s", "uo*2", None, None).unwrap());
+        assert_ne!(f.derived_epoch(), before);
+        svc.shared.insert_if_current(&f, before, (f.open_id(), r.clone()), slice.clone());
+        assert!(svc.cached(&f, &r).is_none(), "a stale read is not kept");
+        svc.shared.insert_if_current(&f, f.derived_epoch(), (f.open_id(), r.clone()), slice);
+        assert!(svc.cached(&f, &r).is_some());
     }
 }

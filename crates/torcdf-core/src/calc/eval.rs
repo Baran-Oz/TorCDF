@@ -382,6 +382,22 @@ mod tests {
     }
 
     #[test]
+    fn arrows_from_calculated_components() {
+        let d = tempfile::tempdir().unwrap();
+        let f = Arc::new(NcFile::open(&fixtures::write_nc4(d.path())).unwrap());
+        let u2 = add(&f, "u2", "uo*2");
+        let v2 = add(&f, "v2", "vo*2");
+        let pair = f.add_pair(crate::pair_by_hand(&f.meta_with_derived(), &u2, &v2).unwrap());
+        let s = f.read_slice(&plane(&layer_path("/ocean/uo", &pair.path), 2)).unwrap();
+        let parts = s.vector.expect("arrows");
+        let uo = f.read_slice(&plane("/ocean/uo", 2)).unwrap();
+        let want: Vec<f32> = uo.data.iter().map(|x| x * 2.0).collect();
+        same(&parts.east, &want);
+        // The pair's own entry reads too.
+        assert!(f.read_slice(&plane(&pair.path, 2)).unwrap().vector.is_some());
+    }
+
+    #[test]
     fn forget_file_drops_cache() {
         let (_d, f) = nc4();
         let p = add(&f, "s", "uo*2");
