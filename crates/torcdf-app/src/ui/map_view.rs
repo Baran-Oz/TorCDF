@@ -69,6 +69,7 @@ pub fn show(
     let (Some(axes), Some(map)) = (v.axes, v.map.as_mut()) else { return false };
     v.hover = None;
     map.activity = "";
+    map.last_rect = Some(rect);
     map.hovering = false;
     map.pointer = None;
     if map.locator.is_none() {

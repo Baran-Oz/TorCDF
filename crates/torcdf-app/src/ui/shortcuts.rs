@@ -21,11 +21,12 @@ pub enum Command {
     NextVar,
     ShortcutHelp,
     Calculate,
+    Extract,
 }
 
 impl Command {
     #[cfg(test)]
-    pub const ALL: [Command; 14] = [
+    pub const ALL: [Command; 15] = [
         Command::Open,
         Command::CloseFile,
         Command::ExportPng,
@@ -40,6 +41,7 @@ impl Command {
         Command::NextVar,
         Command::ShortcutHelp,
         Command::Calculate,
+        Command::Extract,
     ];
 }
 
@@ -57,6 +59,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut { cmd: Command::ExportPng, keys: "Ctrl+E", label: "Export plot as PNG" },
     Shortcut { cmd: Command::Settings, keys: "Ctrl+,", label: "Settings" },
     Shortcut { cmd: Command::Calculate, keys: "Ctrl+K", label: "Calculate new variable" },
+    Shortcut { cmd: Command::Extract, keys: "Ctrl+Shift+E", label: "Extract (crop and save)" },
     Shortcut { cmd: Command::StepBack, keys: "←", label: "Previous time step" },
     Shortcut { cmd: Command::StepForward, keys: "→", label: "Next time step" },
     Shortcut { cmd: Command::FirstStep, keys: "Home", label: "First time step" },
@@ -100,6 +103,10 @@ pub fn pressed(ctx: &egui::Context) -> Vec<Command> {
     let busy = ctx.memory(|m| m.focused().is_some()) || egui::Popup::is_any_open(ctx);
     ctx.input_mut(|i| {
         let mut out = Vec::new();
+        // Before Ctrl+E: egui's consume_key ignores an extra Shift.
+        if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::E) {
+            out.push(Command::Extract);
+        }
         for (k, c) in ctrl {
             if i.consume_key(Modifiers::COMMAND, k) {
                 out.push(c);
@@ -146,7 +153,7 @@ mod tests {
 
     #[test]
     fn no_ctrl_s() {
-        assert!(SHORTCUTS.iter().all(|s| !s.keys.contains("Ctrl+S")));
+        assert!(SHORTCUTS.iter().all(|s| s.keys != "Ctrl+S"));
     }
 
 
@@ -252,6 +259,16 @@ mod tests {
         assert!(got.is_empty(), "{got:?}");
         let (got, _) = press(vec![key(egui::Key::O, egui::Modifiers::COMMAND)], true);
         assert_eq!(got, vec![Command::Open]);
+    }
+
+    #[test]
+    fn ctrl_shift_e_extracts_not_png() {
+        let shift_ctrl = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        let (got, _) = press(vec![key(egui::Key::E, shift_ctrl)], false);
+        assert_eq!(got, vec![Command::Extract]);
+        let (got, _) = press(vec![key(egui::Key::E, egui::Modifiers::COMMAND)], false);
+        assert_eq!(got, vec![Command::ExportPng]);
+        assert_eq!(keys_of(Command::Extract), "Ctrl+Shift+E");
     }
 
     #[test]

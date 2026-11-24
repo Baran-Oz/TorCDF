@@ -26,6 +26,7 @@ use crate::view::defaults::{AxisChoice, ViewKind};
 use crate::view::playback::{FPS_RANGE, Playback, Tick, frame_bytes};
 use crate::view::popup::{Popup, PopupKind, PopupSet};
 use crate::view::png_export;
+use crate::view::extract::{ExtractForm, RegionText, load_coords};
 use crate::view::var_view::{Display, ImageState, VarView};
 
 /// A CSV save: `None` when the dialog was cancelled, else the write result.
@@ -231,6 +232,18 @@ pub enum Action {
     CloseCalculate,
     /// Fill the Calculate window from recent formula `i`.
     UseRecentFormula(usize),
+    /// Open the Extract window for `file`, ticking `var` (else the variable on screen).
+    OpenExtract { file: u64, var: Option<String> },
+    /// A field or tick of the Extract window changed: check again.
+    ExtractEdited,
+    /// Region from the map as shown.
+    ExtractUseView,
+    ExtractWholeGrid,
+    /// Row `row` takes the slider's step (`end`: its To, else its From).
+    ExtractFromSlider { row: usize, end: bool },
+    SaveExtract,
+    CancelExtract,
+    CloseExtract,
 }
 
 fn file_name(p: &Path) -> String {
@@ -286,6 +299,8 @@ pub struct TorApp {
     scroll_tree: bool,
     /// The Calculate window, when open.
     pub calc: Option<CalcForm>,
+    /// The Extract window, when open (it outlives its file while a save runs).
+    pub extract: Option<ExtractForm>,
 }
 
 /// The geometry to save from egui's view of the window. egui reports it
@@ -362,6 +377,7 @@ impl TorApp {
             renderer: "none".into(),
             scroll_tree: false,
             calc: None,
+            extract: None,
         };
         if let Loaded::Recovered(msg) = loaded {
             app.errors.push(msg);
@@ -440,6 +456,7 @@ impl TorApp {
     }
 
     fn poll(&mut self) {
+        self.poll_extract();
         let mut i = 0;
         while i < self.opening.len() {
             let Some(r) = self.opening[i].job.poll() else {
@@ -864,6 +881,8 @@ impl TorApp {
                 let (closed, kept): (Vec<_>, Vec<_>) =
                     std::mem::take(&mut self.files).into_iter().partition(|f| f.id == id);
                 self.files = kept;
+                // The window closes with its file, unless a save is running.
+                self.extract.take_if(|f| f.file == id && f.job.is_none() && f.dialog.is_none());
                 self.arrow_layer.take_if(|l| l.file == id);
                 let view = self.view.take_if(|v| v.file_id == id);
                 if view.is_some() {
@@ -1172,6 +1191,34 @@ impl TorApp {
                 self.recheck_calc();
             }
             Action::DeleteDerived { file, path } => self.delete_derived(file, &path),
+            Action::OpenExtract { file, var } => self.open_extract(file, var),
+            Action::ExtractEdited => self.recheck_extract(),
+            Action::ExtractUseView => {
+                let r = self.view_region();
+                if let (Some(f), Some(r)) = (self.extract.as_mut(), r) {
+                    f.region = Some(f.clamped(r));
+                }
+                self.recheck_extract();
+            }
+            Action::ExtractWholeGrid => {
+                if let Some(f) = self.extract.as_mut() {
+                    f.region = f.whole_region();
+                }
+                self.recheck_extract();
+            }
+            Action::ExtractFromSlider { row, end } => self.extract_from_slider(row, end),
+            Action::SaveExtract => self.save_extract_dialog(),
+            Action::CancelExtract => {
+                if let Some(j) = self.extract.as_ref().and_then(|f| f.job.as_ref()) {
+                    j.cancel();
+                }
+            }
+            Action::CloseExtract => {
+                // A running save is cancelled (its partial file is removed).
+                if let Some(j) = self.extract.take().and_then(|f| f.job) {
+                    j.cancel();
+                }
+            }
         }
     }
 
@@ -1303,6 +1350,11 @@ impl TorApp {
                     self.open_calculate(id, None);
                 }
             }
+            Command::Extract => {
+                if let Some(id) = self.current_file() {
+                    self.open_extract(id, None);
+                }
+            }
             Command::StepBack | Command::StepForward | Command::FirstStep | Command::LastStep => self.step(c),
             Command::PlayPause => {
                 let Some(pb) = &self.playback else { return };
@@ -1364,6 +1416,185 @@ impl TorApp {
         self.save_settings();
     }
 
+}
+
+/// The Extract window.
+impl TorApp {
+    /// Opens the Extract window for `file` (netCDF files only), ticking
+    /// `var`, else the variable on screen (both components of an arrow
+    /// pair). An open window for the same file keeps its choices.
+    fn open_extract(&mut self, file: u64, var: Option<String>) {
+        let Some(f) = self.files.iter().find(|f| f.id == file) else { return };
+        if !f.nc.is_netcdf() {
+            return;
+        }
+        let mut ticks: Vec<String> = Vec::new();
+        match var {
+            Some(v) => ticks.push(v),
+            None => {
+                if let Some(v) = self.view.as_ref().filter(|v| v.file_id == file) {
+                    match (&v.vector, &v.base) {
+                        (Some(p), None) => ticks.extend([p.east.clone(), p.north.clone()]),
+                        _ => ticks.push(v.plain_path().to_string()),
+                    }
+                }
+            }
+        }
+        ticks.retain(|p| f.nc.meta.var(p).is_some() || f.nc.derived(p).is_some());
+        let view_region = self.view_region();
+        match self.extract.as_mut() {
+            Some(form) if form.file == file => form.ticked.extend(ticks),
+            Some(form) if form.job.is_some() => {
+                self.errors.push(format!("A save from {} is running; wait for it or cancel it first.", form.file_name));
+                return;
+            }
+            _ => {
+                let mut form = ExtractForm::new(file, f.name.clone(), ticks.into_iter().collect());
+                form.pending_region = view_region;
+                self.extract = Some(form);
+            }
+        }
+        self.recheck_extract();
+    }
+
+    /// The map's visible lon/lat window as region text.
+    fn view_region(&self) -> Option<RegionText> {
+        let v = self.view.as_ref().filter(|v| v.kind == ViewKind::Map)?;
+        let m = v.map.as_ref()?;
+        let w = crate::view::map_state::visible_window(&m.camera, m.last_rect?)?;
+        let n = crate::view::extract::fmt_num;
+        Some(RegionText { south: n(w.lat[0]), north: n(w.lat[1]), west: n(w.lon[0]), east: n(w.lon[1]) })
+    }
+
+    /// Checks the Extract window again, first reading the coordinates of
+    /// newly ticked variables (off the UI thread).
+    fn recheck_extract(&mut self) {
+        let Some(form) = self.extract.as_mut() else { return };
+        let Some(f) = self.files.iter().find(|f| f.id == form.file) else { return };
+        if !form.ticked.is_empty() && form.coords_stale() {
+            if form.loading.is_none() {
+                let (nc, ticked) = (f.nc.clone(), form.ticked.clone());
+                form.loading = Some(Job::spawn(&self.ctx, move || load_coords(&nc, &ticked)));
+            }
+            form.check = Err("reading coordinates…".into());
+            return;
+        }
+        form.recheck(&f.nc);
+    }
+
+    /// Coordinates arriving, the Save dialog closing and the save finishing.
+    fn poll_extract(&mut self) {
+        let Some(form) = self.extract.as_mut() else { return };
+        if let Some(r) = form.loading.as_ref().and_then(|j| j.poll()) {
+            form.loading = None;
+            let c = r.unwrap_or_else(|()| crate::view::extract::FormCoords {
+                ticked: form.ticked.clone(),
+                dims: Vec::new(),
+                region: None,
+            });
+            form.set_coords(c);
+            self.recheck_extract();
+        }
+        let Some(form) = self.extract.as_mut() else { return };
+        if let Some(r) = form.dialog.as_ref().and_then(|j| j.poll()) {
+            form.dialog = None;
+            if let Ok(Some(path)) = r {
+                self.start_extract(path);
+            }
+        }
+        let Some(form) = self.extract.as_mut() else { return };
+        let Some(job) = &form.job else { return };
+        match job.finished() {
+            Some(Ok(path)) => {
+                let skipped = job.skipped();
+                let mut line = format!("Saved to {}", path.display());
+                if !skipped.is_empty() {
+                    line += &format!(". Not saved: {}", skipped.join(", "));
+                }
+                form.status = Some(line);
+                form.job = None;
+            }
+            Some(Err(e)) => {
+                form.status = Some(format!("Not saved: {e}"));
+                form.job = None;
+            }
+            None => self.ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+        }
+    }
+
+    /// Opens the Save dialog for the checked extract.
+    fn save_extract_dialog(&mut self) {
+        self.recheck_extract();
+        let Some(form) = self.extract.as_mut() else { return };
+        if form.busy() || form.check.is_err() {
+            return;
+        }
+        let Some(f) = self.files.iter().find(|f| f.id == form.file) else { return };
+        let src = f.nc.meta.path.clone();
+        let dir = src.parent().map(Path::to_path_buf);
+        let stem = src.file_stem().map_or_else(|| "extract".into(), |s| s.to_string_lossy().into_owned());
+        let name = format!("{stem}_extract.nc");
+        form.dialog = Some(Job::spawn(&self.ctx, move || {
+            let mut d = rfd::FileDialog::new()
+                .set_title("Save the extract as netCDF")
+                .set_file_name(name)
+                .add_filter("netCDF", &["nc"]);
+            if let Some(dir) = dir {
+                d = d.set_directory(dir);
+            }
+            d.save_file()
+        }));
+    }
+
+    /// Starts saving the checked extract to `path` (never the file being read).
+    pub(crate) fn start_extract(&mut self, path: PathBuf) {
+        let Some(form) = self.extract.as_mut() else { return };
+        if form.job.is_some() {
+            return;
+        }
+        let Some(f) = self.files.iter().find(|f| f.id == form.file) else { return };
+        let plan = match &form.check {
+            Ok(p) => p.clone(),
+            Err(e) => {
+                form.status = Some(format!("Not saved: {e}"));
+                return;
+            }
+        };
+        let src = &f.nc.meta.path;
+        let same = path == *src
+            || matches!((std::fs::canonicalize(&path), std::fs::canonicalize(src)), (Ok(a), Ok(b)) if a == b);
+        if same {
+            form.status = Some("Not saved: that is the file being read; choose another name".into());
+            return;
+        }
+        let line = torcdf_core::extract::history_line(&f.name, &form.summary());
+        form.status = None;
+        form.job = Some(torcdf_core::extract::ExtractJob::start(f.nc.clone(), plan, path, line));
+        self.ctx.request_repaint();
+    }
+
+    /// Row `row` takes the step the view's slider of that dimension is at.
+    fn extract_from_slider(&mut self, row: usize, end: bool) {
+        let (Some(form), Some(v)) = (self.extract.as_mut(), self.view.as_ref()) else { return };
+        if v.file_id != form.file {
+            return;
+        }
+        let Some(key) = form.dims.get(row).map(|r| r.key.clone()) else { return };
+        let Some(d) = slider_dim_of(v, &key) else { return };
+        let Some(text) = form.text_at(&key, v.slider_pos[d]) else { return };
+        if end {
+            form.dims[row].to = text;
+        } else {
+            form.dims[row].from = text;
+        }
+        self.recheck_extract();
+    }
+}
+
+/// The slider dimension of `v` that is the dimension `key`.
+fn slider_dim_of(v: &VarView, key: &torcdf_core::extract::DimKey) -> Option<usize> {
+    let path = v.plain_path();
+    v.slider_dims().into_iter().find(|&d| v.nc.dim_key(path, &v.var.dims[d]).as_ref() == Some(key))
 }
 
 /// Names the Calculate window offers: the file's numeric variables and its
@@ -1564,8 +1795,9 @@ impl eframe::App for TorApp {
         // The plot's own PNG button hides while its picture is being taken.
         let capturing = self.shots.iter().any(|s| s.popup.is_none());
         let current_file = self.current_file();
+        let extract_ok = current_file.and_then(|id| self.files.iter().find(|f| f.id == id)).is_some_and(|f| f.nc.is_netcdf());
         let recent = &self.settings.recent;
-        egui::Panel::top("menu").show(ui, |ui| ui::menu_bar(ui, self.view.as_ref(), recent, current_file, &mut actions));
+        egui::Panel::top("menu").show(ui, |ui| ui::menu_bar(ui, self.view.as_ref(), recent, current_file, extract_ok, &mut actions));
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| ui::error_banners(ui, &self.errors, &mut actions));
         }
@@ -1621,6 +1853,16 @@ impl eframe::App for TorApp {
         {
             let vars = calc_names(&f.nc);
             ui::calc::show(ui.ctx(), form, &f.name, &vars, &self.settings.recent_formulas, &mut actions);
+        }
+        if let Some(form) = self.extract.as_mut() {
+            let nc = self.files.iter().find(|f| f.id == form.file).map(|f| f.nc.clone());
+            let sliders: Vec<torcdf_core::extract::DimKey> = self
+                .view
+                .as_ref()
+                .filter(|v| v.file_id == form.file)
+                .map(|v| v.slider_dims().into_iter().filter_map(|d| v.nc.dim_key(v.plain_path(), &v.var.dims[d])).collect())
+                .unwrap_or_default();
+            ui::extract::show(ui.ctx(), form, nc.as_deref(), &sliders, &mut actions);
         }
         ui::drop_overlay(ui.ctx());
         // Detail reads start only after the map has planned them for a resting camera.
@@ -1722,6 +1964,7 @@ impl TorApp {
             renderer: "none".into(),
             scroll_tree: false,
             calc: None,
+            extract: None,
         }
     }
 }
@@ -2771,5 +3014,121 @@ mod tests {
         assert!(v.on_geo_axes());
         assert_eq!(v.slider_dims(), vec![0]);
         assert_eq!(v.slider_pos[0], 0, "time left an axis: back at 0");
+    }
+
+    // ---- Extract -------------------------------------------------------
+
+    /// Polls until the Extract form has its coordinates and no save runs.
+    fn wait_extract(app: &mut TorApp) {
+        let start = Instant::now();
+        while app.extract.as_ref().is_some_and(|f| f.busy()) {
+            assert!(start.elapsed() < Duration::from_secs(20), "extract timed out");
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll();
+        }
+    }
+
+    fn nc4_extract(dir: &Path) -> TorApp {
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir));
+        app.apply(Action::Select(Selection::Var(1, "/ocean/uo".into())));
+        app.apply(Action::OpenExtract { file: 1, var: None });
+        wait_extract(&mut app);
+        app
+    }
+
+    fn region(app: &mut TorApp, s: &str, n: &str, w: &str, e: &str) {
+        let r = app.extract.as_mut().unwrap().region.as_mut().expect("region rows");
+        (r.south, r.north, r.west, r.east) = (s.into(), n.into(), w.into(), e.into());
+        app.apply(Action::ExtractEdited);
+    }
+
+    #[test]
+    fn extract_defaults_from_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = nc4_extract(dir.path());
+        let f = app.extract.as_ref().expect("form open");
+        assert_eq!(f.ticked.iter().collect::<Vec<_>>(), ["/ocean/uo"]);
+        let time = &f.dims[0];
+        assert_eq!(time.label, "time");
+        assert_eq!((time.from.as_str(), time.to.as_str()), ("2000-01-01 00:00", "2000-01-01 23:00"));
+        assert_eq!(f.dims.len(), 1, "lat/lon are the region");
+        let r = f.region.as_ref().expect("region");
+        assert_eq!((r.south.as_str(), r.north.as_str(), r.west.as_str(), r.east.as_str()), ("-9", "9", "0", "19"));
+        let plan = f.check.as_ref().expect("check ok");
+        assert_eq!(plan.vars[0].count, [24, 10, 20]);
+    }
+
+    #[test]
+    fn typed_ranges_snap_and_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_extract(dir.path());
+        app.extract.as_mut().unwrap().dims[0].from = "2000-01-01 02:30".into();
+        app.apply(Action::ExtractEdited);
+        let f = app.extract.as_ref().unwrap();
+        assert_eq!(f.dims[0].from, "2000-01-01 03:00", "snapped to the next step");
+        assert_eq!(f.check.as_ref().unwrap().vars[0].count[0], 21);
+
+        region(&mut app, "50", "60", "0", "19");
+        assert_eq!(app.extract.as_ref().unwrap().check.as_ref().unwrap_err(), "the selection holds no cells");
+        region(&mut app, "-9", "9", "15", "2");
+        assert_eq!(app.extract.as_ref().unwrap().check.as_ref().unwrap_err(), torcdf_core::extract::range::SEAM);
+        region(&mut app, "-3", "3", "4", "6");
+        let plan = app.extract.as_ref().unwrap().check.clone().unwrap();
+        assert_eq!(plan.vars[0].count, [21, 4, 3]);
+        assert_eq!(app.extract.as_ref().unwrap().summary(), "time 2000-01-01 03:00..2000-01-01 23:00, lat -3..3, lon 4..6");
+    }
+
+    #[test]
+    fn save_writes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_extract(dir.path());
+        region(&mut app, "-3", "3", "4", "6");
+        let out = dir.path().join("cut.nc");
+        app.start_extract(out.clone());
+        wait_extract(&mut app);
+        let status = app.extract.as_ref().unwrap().status.clone().unwrap_or_default();
+        assert!(status.starts_with("Saved to"), "{status}");
+        let o = NcFile::open(&out).unwrap();
+        assert_eq!(o.meta.var("/ocean/uo").unwrap().shape, [24, 4, 3]);
+        let h = o.meta.root.attrs.iter().find(|a| a.name == "history").and_then(|a| a.value.as_str()).unwrap();
+        assert!(h.contains("TorCDF: extracted from nc4.nc: lat -3..3, lon 4..6"), "{h}");
+    }
+
+    #[test]
+    fn save_refuses_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_extract(dir.path());
+        let src = app.files[0].nc.meta.path.clone();
+        app.start_extract(src.clone());
+        wait_extract(&mut app);
+        let status = app.extract.as_ref().unwrap().status.clone().unwrap_or_default();
+        assert!(status.starts_with("Not saved"), "{status}");
+        assert!(NcFile::open(&src).is_ok());
+    }
+
+    #[test]
+    fn closing_file_does_not_stop_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_extract(dir.path());
+        let out = dir.path().join("whole.nc");
+        app.start_extract(out.clone());
+        app.apply(Action::CloseFile(1));
+        wait_extract(&mut app);
+        let status = app.extract.as_ref().unwrap().status.clone().unwrap_or_default();
+        assert!(status.starts_with("Saved to"), "{status}");
+        assert!(NcFile::open(&out).is_ok());
+    }
+
+    #[test]
+    fn ctrl_shift_e_opens_extract_for_netcdf_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.apply(Action::Select(Selection::File(1)));
+        app.command(Command::Extract);
+        assert_eq!(app.extract.as_ref().map(|f| f.file), Some(1));
+        let mut h5 = TorApp::headless(&torcdf_core::fixtures::hdf5::write_hidden_h5(dir.path()));
+        h5.apply(Action::Select(Selection::File(1)));
+        h5.command(Command::Extract);
+        assert!(h5.extract.is_none());
     }
 }

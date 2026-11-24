@@ -93,6 +93,7 @@ fn group_body(
         if r.clicked() {
             actions.push(Action::Select(s));
         }
+        r.context_menu(|ui| extract_item(ui, file, &v.path, actions));
     }
     // Calculated variables of this group.
     for d in file.nc.derived_vars().iter().filter(|d| parent(&d.path) == g.path) {
@@ -108,6 +109,7 @@ fn group_body(
                 actions.push(Action::OpenCalculate { file: file_id, edit: Some(d.path.clone()) });
                 ui.close();
             }
+            extract_item(ui, file, &d.path, actions);
             if ui.button("Delete").clicked() {
                 actions.push(Action::DeleteDerived { file: file_id, path: d.path.clone() });
                 ui.close();
@@ -181,4 +183,14 @@ pub fn var_order(files: &[OpenFile]) -> Vec<Selection> {
         walk(f, &f.nc.meta.root, &mut out);
     }
     out
+}
+
+/// "Extract…" for the variable at `path` (netCDF files only).
+fn extract_item(ui: &mut egui::Ui, file: &OpenFile, path: &str, actions: &mut Vec<Action>) {
+    let ok = file.nc.is_netcdf();
+    let r = ui.add_enabled(ok, egui::Button::new("Extract…")).on_disabled_hover_text("Extract works on netCDF files");
+    if r.clicked() {
+        actions.push(Action::OpenExtract { file: file.id, var: Some(path.to_string()) });
+        ui.close();
+    }
 }

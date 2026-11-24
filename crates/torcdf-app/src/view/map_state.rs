@@ -271,6 +271,8 @@ pub struct MapState {
     pub events: Option<Vec<String>>,
     /// What the map last did this frame, for the slow-frame log.
     pub activity: &'static str,
+    /// The map's screen rect as last drawn (for "Use current map view").
+    pub last_rect: Option<Rect>,
 }
 
 /// A detail tile on the GPU, with the projection of its mesh (curvilinear).
@@ -322,6 +324,7 @@ impl MapState {
             wanted: None,
             events: None,
             activity: "",
+            last_rect: None,
         }
     }
 

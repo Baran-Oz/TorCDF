@@ -1,6 +1,7 @@
 //! Drawing of the main window's panels, plus small formatting helpers.
 
 pub mod calc;
+pub mod extract;
 pub mod colorbar;
 pub mod inspector;
 pub mod map_view;
@@ -34,6 +35,7 @@ pub fn menu_bar(
     view: Option<&VarView>,
     recent: &[PathBuf],
     current_file: Option<u64>,
+    extract_ok: bool,
     actions: &mut Vec<Action>,
 ) {
     egui::MenuBar::new().ui(ui, |ui| {
@@ -58,6 +60,14 @@ pub fn menu_bar(
             if ui.add_enabled(current_file.is_some(), item("Calculate new variable…", Command::Calculate)).clicked() {
                 if let Some(id) = current_file {
                     actions.push(Action::OpenCalculate { file: id, edit: None });
+                }
+                ui.close();
+            }
+            let r = ui.add_enabled(extract_ok, item("Extract…", Command::Extract));
+            let r = if current_file.is_some() { r.on_disabled_hover_text("Extract works on netCDF files") } else { r };
+            if r.clicked() {
+                if let Some(id) = current_file {
+                    actions.push(Action::OpenExtract { file: id, var: None });
                 }
                 ui.close();
             }
