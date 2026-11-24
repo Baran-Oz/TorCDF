@@ -18,7 +18,7 @@ use crate::app::Action;
 use crate::ui::popup::draw_markers;
 use crate::view::popup::{Popup, PopupSet};
 use crate::view::var_view::{Display, Hover, Stats, VarView};
-use crate::view::extract::ExtractOverlay;
+use crate::view::selection::SelectionOverlay;
 
 /// The image panel's one GPU layer (layers are never freed, so the id is fixed).
 const IMAGE_LAYER_ID: u64 = 1;
@@ -36,7 +36,7 @@ pub fn show(
     rs: Option<&RenderState>,
     popups: &PopupSet,
     capturing: bool,
-    overlay: Option<&ExtractOverlay>,
+    overlay: Option<&SelectionOverlay>,
     actions: &mut Vec<Action>,
 ) -> bool {
     let Some(v) = view else {
@@ -119,7 +119,7 @@ fn image(
     display: &Display,
     rs: Option<&RenderState>,
     popups: &PopupSet,
-    overlay: Option<&ExtractOverlay>,
+    overlay: Option<&SelectionOverlay>,
     actions: &mut Vec<Action>,
 ) -> bool {
     let Some(axes) = v.axes else {
@@ -186,7 +186,7 @@ fn image(
         if hx > 0.0 && hy > 0.0 && lx < nx as f32 && ly < ny as f32 {
             let cell = |q: f32, n: usize| (q.max(0.0).floor() as usize).min(n - 1);
             let (r0, r1, c0, c1) = (cell(ly, ny), cell(hy, ny), cell(lx, nx), cell(hx, nx));
-            actions.push(Action::ExtractIndexBoxDrawn { y: (y0 + r0 * sy, y0 + r1 * sy), x: (x0 + c0 * sx, x0 + c1 * sx) });
+            actions.push(Action::IndexBoxDrawn { y: (y0 + r0 * sy, y0 + r1 * sy), x: (x0 + c0 * sx, x0 + c1 * sx) });
         }
     }
     if resp.dragged() && band.is_none() && drawn.is_none() && v.image.band.is_none() {
@@ -349,7 +349,7 @@ fn coord_label(v: &VarView, d: usize, i: usize) -> String {
     slider_label(i, coord, time)
 }
 
-fn line(ui: &mut egui::Ui, v: &VarView, overlay: Option<&ExtractOverlay>, actions: &mut Vec<Action>) {
+fn line(ui: &mut egui::Ui, v: &VarView, overlay: Option<&SelectionOverlay>, actions: &mut Vec<Action>) {
     let Some(shown) = &v.shown else { return };
     if shown.line.is_empty() {
         ui.colored_label(ui.visuals().warn_fg_color, "All values missing");
@@ -399,7 +399,7 @@ fn line(ui: &mut egui::Ui, v: &VarView, overlay: Option<&ExtractOverlay>, action
     if on_time
         && let Some((from, to)) = super::extract::plot_span(ui, span_id, &out, shown_span)
     {
-        actions.push(Action::ExtractTimeDragged { file: v.file_id, from, to });
+        actions.push(Action::TimeDragged { file: v.file_id, from, to });
     }
 }
 

@@ -11,7 +11,7 @@ use torcdf_core::SliceRequest;
 
 use super::{colorbar, extract};
 use crate::app::Action;
-use crate::view::extract::ExtractOverlay;
+use crate::view::selection::SelectionOverlay;
 use super::plot_area::{WHEEL_ZOOM, all_missing, draw_range, plot_rects, reference_arrow};
 use crate::map::arrows::{ArrowInput, ArrowSpace, arrow_step};
 use crate::map::tiles::{TileSpec, visible_windows};
@@ -26,7 +26,7 @@ use crate::ui::popup::draw_markers;
 use crate::view::popup::{Popup, PopupSet};
 use crate::view::map_state::{BORDERS_ID, COAST_ID, GRID_ID, UploadFailure};
 use crate::view::var_view::{Display, VarView};
-pub use crate::view::extract::lonlat_bounds;
+pub use crate::view::selection::lonlat_bounds;
 
 
 /// The tile a read covers on the plotted axes.
@@ -50,7 +50,7 @@ pub fn show(
     display: &Display,
     rs: Option<&RenderState>,
     popups: &PopupSet,
-    marks: Option<&ExtractOverlay>,
+    marks: Option<&SelectionOverlay>,
     actions: &mut Vec<Action>,
 ) -> bool {
     // A failed background job shows once here; it is not retried.
@@ -98,7 +98,7 @@ pub fn show(
         }
         if !pts.is_empty() {
             let (south, north, west, east) = lonlat_bounds(&pts);
-            actions.push(Action::ExtractRegionDrawn { south, north, west, east });
+            actions.push(Action::RegionDrawn { south, north, west, east });
         }
     }
 

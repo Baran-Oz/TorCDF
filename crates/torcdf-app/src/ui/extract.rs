@@ -5,7 +5,7 @@ use eframe::egui;
 use torcdf_core::NcFile;
 use torcdf_core::extract::DimKey;
 
-use crate::app::Action;
+use crate::app::{Action, SelWin};
 use crate::view::extract::ExtractForm;
 
 /// Variables offered: the file's (coordinate variables are kept
@@ -32,12 +32,15 @@ pub fn show(
     actions: &mut Vec<Action>,
 ) {
     let mut open = true;
-    egui::Window::new("Extract")
+    let shown = egui::Window::new("Extract")
         .id(egui::Id::NULL.with("extract"))
         .open(&mut open)
         .default_width(560.0)
         .collapsible(false)
         .show(ctx, |ui| contents(ui, form, nc, sliders, actions));
+    if shown.is_some_and(|r| r.response.contains_pointer()) && ctx.input(|i| i.pointer.any_pressed()) {
+        actions.push(Action::TouchSelection(SelWin::Extract));
+    }
     if !open {
         actions.push(Action::CloseExtract);
     }
@@ -104,7 +107,7 @@ fn fields(ui: &mut egui::Ui, form: &mut ExtractForm, nc: &NcFile, sliders: &[Dim
                     } else {
                         form.ticked.remove(&path);
                     }
-                    actions.push(Action::ExtractEdited);
+                    actions.push(Action::SelectionEdited(SelWin::Extract));
                 }
             }
         });
@@ -122,7 +125,7 @@ fn fields(ui: &mut egui::Ui, form: &mut ExtractForm, nc: &NcFile, sliders: &[Dim
                     ui.label(if end { "To" } else { "From" });
                     edited |= ui.add(egui::TextEdit::singleline(text).desired_width(130.0)).lost_focus();
                     if slider && ui.small_button("◀ slider").on_hover_text("Use the slider's step").clicked() {
-                        actions.push(Action::ExtractFromSlider { row: i, end });
+                        actions.push(Action::FromSlider { win: SelWin::Extract, row: i, end });
                     }
                 });
             }
@@ -154,15 +157,15 @@ fn fields(ui: &mut egui::Ui, form: &mut ExtractForm, nc: &NcFile, sliders: &[Dim
     if form.region.is_some() {
         ui.horizontal(|ui| {
             if ui.button("Use current map view").clicked() {
-                actions.push(Action::ExtractUseView);
+                actions.push(Action::UseView(SelWin::Extract));
             }
             if ui.button("Whole grid").clicked() {
-                actions.push(Action::ExtractWholeGrid);
+                actions.push(Action::WholeGrid(SelWin::Extract));
             }
         });
     }
     if edited {
-        actions.push(Action::ExtractEdited);
+        actions.push(Action::SelectionEdited(SelWin::Extract));
     }
     ui.weak("Tip: Shift+drag on the map to draw the region; Shift+drag on a time series to set the time range.");
 }

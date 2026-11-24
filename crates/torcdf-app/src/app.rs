@@ -26,7 +26,8 @@ use crate::view::defaults::{AxisChoice, ViewKind};
 use crate::view::playback::{FPS_RANGE, Playback, Tick, frame_bytes};
 use crate::view::popup::{Popup, PopupKind, PopupSet};
 use crate::view::png_export;
-use crate::view::extract::{ExtractForm, RegionText, load_coords};
+use crate::view::extract::ExtractForm;
+use crate::view::selection::{RegionText, SelectionForm, load_coords};
 use crate::view::var_view::{Display, ImageState, VarView};
 
 /// A CSV save: `None` when the dialog was cancelled, else the write result.
@@ -236,22 +237,31 @@ pub enum Action {
     UseRecentFormula(usize),
     /// Open the Extract window for `file`, ticking `var` (else the variable on screen).
     OpenExtract { file: u64, var: Option<String> },
-    /// A field or tick of the Extract window changed: check again.
-    ExtractEdited,
+    /// A field or tick of a selection window changed: check again.
+    SelectionEdited(SelWin),
+    /// A selection window was clicked or typed in (it now gets Shift+drags).
+    TouchSelection(SelWin),
     /// Region from the map as shown.
-    ExtractUseView,
-    ExtractWholeGrid,
+    UseView(SelWin),
+    WholeGrid(SelWin),
     /// Row `row` takes the slider's step (`end`: its To, else its From).
-    ExtractFromSlider { row: usize, end: bool },
+    FromSlider { win: SelWin, row: usize, end: bool },
     SaveExtract,
     CancelExtract,
     CloseExtract,
     /// Shift+drag on the map: the region box (degrees).
-    ExtractRegionDrawn { south: f64, north: f64, west: f64, east: f64 },
+    RegionDrawn { south: f64, north: f64, west: f64, east: f64 },
     /// Shift+drag on an image: (first, last) indices along its plotted y and x.
-    ExtractIndexBoxDrawn { y: (usize, usize), x: (usize, usize) },
+    IndexBoxDrawn { y: (usize, usize), x: (usize, usize) },
     /// Shift+drag across a time series of `file`: axis values.
-    ExtractTimeDragged { file: u64, from: f64, to: f64 },
+    TimeDragged { file: u64, from: f64, to: f64 },
+}
+
+/// The two windows that hold a selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelWin {
+    Extract,
+    Stats,
 }
 
 fn file_name(p: &Path) -> String {
@@ -309,6 +319,8 @@ pub struct TorApp {
     pub calc: Option<CalcForm>,
     /// The Extract window, when open (it outlives its file while a save runs).
     pub extract: Option<ExtractForm>,
+    /// The selection window used last (it gets Shift+drags and draws its overlays).
+    pub last_sel: SelWin,
 }
 
 /// The geometry to save from egui's view of the window. egui reports it
@@ -386,6 +398,7 @@ impl TorApp {
             scroll_tree: false,
             calc: None,
             extract: None,
+            last_sel: SelWin::Extract,
         };
         if let Loaded::Recovered(msg) = loaded {
             app.errors.push(msg);
@@ -1202,48 +1215,60 @@ impl TorApp {
             }
             Action::DeleteDerived { file, path } => self.delete_derived(file, &path),
             Action::OpenExtract { file, var } => self.open_extract(file, var),
-            Action::ExtractEdited => self.recheck_extract(),
-            Action::ExtractUseView => {
+            Action::SelectionEdited(w) => {
+                self.last_sel = w;
+                self.recheck_sel(w);
+            }
+            Action::TouchSelection(w) => self.last_sel = w,
+            Action::UseView(w) => {
+                self.last_sel = w;
                 let r = self.view_region();
-                if let (Some(f), Some(r)) = (self.extract.as_mut(), r) {
+                if let (Some(f), Some(r)) = (self.sel_mut(w), r) {
                     f.region = Some(f.clamped(r));
                 }
-                self.recheck_extract();
+                self.recheck_sel(w);
             }
-            Action::ExtractWholeGrid => {
-                if let Some(f) = self.extract.as_mut() {
+            Action::WholeGrid(w) => {
+                self.last_sel = w;
+                if let Some(f) = self.sel_mut(w) {
                     f.region = f.whole_region();
                 }
-                self.recheck_extract();
+                self.recheck_sel(w);
             }
-            Action::ExtractFromSlider { row, end } => self.extract_from_slider(row, end),
-            Action::ExtractRegionDrawn { south, north, west, east } => {
+            Action::FromSlider { win, row, end } => {
+                self.last_sel = win;
+                self.from_slider(win, row, end);
+            }
+            Action::RegionDrawn { south, north, west, east } => {
                 let Some(file) = self.view.as_ref().map(|v| v.file_id) else { return };
-                let n = crate::view::extract::fmt_num;
+                let n = crate::view::selection::fmt_num;
                 let r = RegionText { south: n(south), north: n(north), west: n(west), east: n(east) };
-                if let Some(f) = self.extract_for(file) {
+                let Some(w) = self.drawn_target(file) else { return };
+                if let Some(f) = self.sel_mut(w) {
                     f.pending_region = Some((r, false));
                     f.apply_pending();
                 }
-                self.recheck_extract();
+                self.recheck_sel(w);
             }
-            Action::ExtractIndexBoxDrawn { y, x } => {
+            Action::IndexBoxDrawn { y, x } => {
                 let Some(v) = self.view.as_ref() else { return };
                 let Some(a) = v.axes else { return };
                 let key = |d: usize| v.nc.dim_key(v.plain_path(), &v.var.dims[d]);
                 let (Some(ky), Some(kx), file) = (key(a.y), key(a.x), v.file_id) else { return };
-                if let Some(f) = self.extract_for(file) {
+                let Some(w) = self.drawn_target(file) else { return };
+                if let Some(f) = self.sel_mut(w) {
                     f.pending_index.extend([(ky, y.0, y.1), (kx, x.0, x.1)]);
                     f.apply_pending();
                 }
-                self.recheck_extract();
+                self.recheck_sel(w);
             }
-            Action::ExtractTimeDragged { file, from, to } => {
-                if let Some(f) = self.extract_for(file) {
+            Action::TimeDragged { file, from, to } => {
+                let Some(w) = self.drawn_target(file) else { return };
+                if let Some(f) = self.sel_mut(w) {
                     f.pending_time = Some((from, to));
                     f.apply_pending();
                 }
-                self.recheck_extract();
+                self.recheck_sel(w);
             }
             Action::SaveExtract => self.save_extract_dialog(),
             Action::CancelExtract => {
@@ -1474,20 +1499,9 @@ impl TorApp {
         if !f.nc.is_netcdf() {
             return;
         }
-        let mut ticks: Vec<String> = Vec::new();
-        match var {
-            Some(v) => ticks.push(v),
-            None => {
-                if let Some(v) = self.view.as_ref().filter(|v| v.file_id == file) {
-                    match (&v.vector, &v.base) {
-                        (Some(p), None) => ticks.extend([p.east.clone(), p.north.clone()]),
-                        _ => ticks.push(v.plain_path().to_string()),
-                    }
-                }
-            }
-        }
-        ticks.retain(|p| f.nc.meta.var(p).is_some() || f.nc.derived(p).is_some());
+        let ticks = self.default_ticks(file, var);
         let view_region = self.view_region();
+        self.last_sel = SelWin::Extract;
         match self.extract.as_mut() {
             Some(form) if form.file == file => form.ticked.extend(ticks),
             Some(form) if form.job.is_some() => {
@@ -1503,12 +1517,74 @@ impl TorApp {
         self.recheck_extract();
     }
 
-    /// The Extract window for `file`, opened (with the variable on screen) if needed.
-    fn extract_for(&mut self, file: u64) -> Option<&mut ExtractForm> {
-        if self.extract.as_ref().is_none_or(|f| f.file != file) {
-            self.open_extract(file, None);
+    /// What a selection window opened for `file` ticks: `var`, else the
+    /// variable on screen (both components of an arrow pair).
+    fn default_ticks(&self, file: u64, var: Option<String>) -> Vec<String> {
+        let Some(f) = self.files.iter().find(|f| f.id == file) else { return Vec::new() };
+        let mut ticks: Vec<String> = Vec::new();
+        match var {
+            Some(v) => ticks.push(v),
+            None => {
+                if let Some(v) = self.view.as_ref().filter(|v| v.file_id == file) {
+                    match (&v.vector, &v.base) {
+                        (Some(p), None) => ticks.extend([p.east.clone(), p.north.clone()]),
+                        _ => ticks.push(v.plain_path().to_string()),
+                    }
+                }
+            }
         }
-        self.extract.as_mut().filter(|f| f.file == file)
+        ticks.retain(|p| f.nc.meta.var(p).is_some() || f.nc.derived(p).is_some());
+        ticks
+    }
+
+    /// The selection of window `w`, when open.
+    pub(crate) fn sel(&self, w: SelWin) -> Option<&SelectionForm> {
+        match w {
+            SelWin::Extract => self.extract.as_ref().map(|f| &f.sel),
+            SelWin::Stats => None,
+        }
+    }
+
+    fn sel_mut(&mut self, w: SelWin) -> Option<&mut SelectionForm> {
+        match w {
+            SelWin::Extract => self.extract.as_mut().map(|f| &mut f.sel),
+            SelWin::Stats => None,
+        }
+    }
+
+    /// The other selection window.
+    fn other(w: SelWin) -> SelWin {
+        match w {
+            SelWin::Extract => SelWin::Stats,
+            SelWin::Stats => SelWin::Extract,
+        }
+    }
+
+    /// The window on-screen gestures and overlays go to: the one used
+    /// last if open, else the other one if open.
+    fn active_sel(&self) -> Option<SelWin> {
+        [self.last_sel, Self::other(self.last_sel)].into_iter().find(|&w| self.sel(w).is_some())
+    }
+
+    /// The window a Shift+drag on `file` fills: the active one (reopened
+    /// for `file` if it holds another file), else a new Extract window.
+    fn drawn_target(&mut self, file: u64) -> Option<SelWin> {
+        let w = self.active_sel().unwrap_or(SelWin::Extract);
+        if self.sel(w).is_none_or(|f| f.file != file) {
+            match w {
+                SelWin::Extract => self.open_extract(file, None),
+                SelWin::Stats => {}
+            }
+        }
+        self.sel(w).is_some_and(|f| f.file == file).then_some(w)
+    }
+
+    /// Checks window `w` again.
+    fn recheck_sel(&mut self, w: SelWin) {
+        match w {
+            SelWin::Extract => self.recheck_extract(),
+            SelWin::Stats => {}
+        }
     }
 
     /// The map's visible lon/lat window as region text.
@@ -1516,7 +1592,7 @@ impl TorApp {
         let v = self.view.as_ref().filter(|v| v.kind == ViewKind::Map)?;
         let m = v.map.as_ref()?;
         let w = crate::view::map_state::visible_window(&m.camera, m.last_rect?)?;
-        let n = crate::view::extract::fmt_num;
+        let n = crate::view::selection::fmt_num;
         Some(RegionText { south: n(w.lat[0]), north: n(w.lat[1]), west: n(w.lon[0]), east: n(w.lon[1]) })
     }
 
@@ -1525,11 +1601,7 @@ impl TorApp {
     fn recheck_extract(&mut self) {
         let Some(form) = self.extract.as_mut() else { return };
         let Some(f) = self.files.iter().find(|f| f.id == form.file) else { return };
-        if !form.ticked.is_empty() && form.coords_stale() {
-            if form.loading.is_none() {
-                let (nc, ticked) = (f.nc.clone(), form.ticked.clone());
-                form.loading = Some(Job::spawn(&self.ctx, move || load_coords(&nc, &ticked)));
-            }
+        if !ensure_coords(&mut form.sel, &f.nc, &self.ctx) {
             form.check = Err("reading coordinates…".into());
             return;
         }
@@ -1539,14 +1611,7 @@ impl TorApp {
     /// Coordinates arriving, the Save dialog closing and the save finishing.
     fn poll_extract(&mut self) {
         let Some(form) = self.extract.as_mut() else { return };
-        if let Some(r) = form.loading.as_ref().and_then(|j| j.poll()) {
-            form.loading = None;
-            let c = r.unwrap_or_else(|()| crate::view::extract::FormCoords {
-                ticked: form.ticked.clone(),
-                dims: Vec::new(),
-                region: None,
-            });
-            form.set_coords(c);
+        if poll_coords(&mut form.sel) {
             self.recheck_extract();
         }
         let Some(form) = self.extract.as_mut() else { return };
@@ -1628,8 +1693,12 @@ impl TorApp {
     }
 
     /// Row `row` takes the step the view's slider of that dimension is at.
-    fn extract_from_slider(&mut self, row: usize, end: bool) {
-        let (Some(form), Some(v)) = (self.extract.as_mut(), self.view.as_ref()) else { return };
+    fn from_slider(&mut self, w: SelWin, row: usize, end: bool) {
+        let form = match w {
+            SelWin::Extract => self.extract.as_mut().map(|f| &mut f.sel),
+            SelWin::Stats => None,
+        };
+        let (Some(form), Some(v)) = (form, self.view.as_ref()) else { return };
         if v.file_id != form.file {
             return;
         }
@@ -1641,8 +1710,34 @@ impl TorApp {
         } else {
             form.dims[row].from = text;
         }
-        self.recheck_extract();
+        self.recheck_sel(w);
     }
+}
+
+/// Starts reading the ticked variables' coordinates when the loaded ones
+/// are not theirs (off the UI thread). True when the form can be checked.
+fn ensure_coords(sel: &mut SelectionForm, nc: &Arc<NcFile>, ctx: &egui::Context) -> bool {
+    if sel.ticked.is_empty() || !sel.coords_stale() {
+        return true;
+    }
+    if sel.loading.is_none() {
+        let (nc, ticked) = (nc.clone(), sel.ticked.clone());
+        sel.loading = Some(Job::spawn(ctx, move || load_coords(&nc, &ticked)));
+    }
+    false
+}
+
+/// Takes coordinates that have arrived; true when they did.
+fn poll_coords(sel: &mut SelectionForm) -> bool {
+    let Some(r) = sel.loading.as_ref().and_then(|j| j.poll()) else { return false };
+    sel.loading = None;
+    let c = r.unwrap_or_else(|()| crate::view::selection::FormCoords {
+        ticked: sel.ticked.clone(),
+        dims: Vec::new(),
+        region: None,
+    });
+    sel.set_coords(c);
+    true
 }
 
 /// The slider dimension of `v` that is the dimension `key`.
@@ -1986,7 +2081,7 @@ impl eframe::App for TorApp {
             egui::Panel::bottom("sliders").show(ui, |ui| ui::slider_strip(ui, v, pb, &mut actions));
         }
         // The Extract window's box and span; never in a PNG being taken.
-        let marks = if self.shots.is_empty() { self.extract.as_ref().and_then(|f| f.overlay()) } else { None };
+        let marks = if self.shots.is_empty() { self.active_sel().and_then(|w| self.sel(w)).and_then(|f| f.overlay()) } else { None };
         let central = egui::CentralPanel::default().show(ui, |ui| {
             plot_area::show(
                 ui,
@@ -2121,6 +2216,7 @@ impl TorApp {
             scroll_tree: false,
             calc: None,
             extract: None,
+            last_sel: SelWin::Extract,
         }
     }
 }
@@ -3195,7 +3291,7 @@ mod tests {
     fn region(app: &mut TorApp, s: &str, n: &str, w: &str, e: &str) {
         let r = app.extract.as_mut().unwrap().region.as_mut().expect("region rows");
         (r.south, r.north, r.west, r.east) = (s.into(), n.into(), w.into(), e.into());
-        app.apply(Action::ExtractEdited);
+        app.apply(Action::SelectionEdited(SelWin::Extract));
     }
 
     #[test]
@@ -3219,7 +3315,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = nc4_extract(dir.path());
         app.extract.as_mut().unwrap().dims[0].from = "2000-01-01 02:30".into();
-        app.apply(Action::ExtractEdited);
+        app.apply(Action::SelectionEdited(SelWin::Extract));
         let f = app.extract.as_ref().unwrap();
         assert_eq!(f.dims[0].from, "2000-01-01 03:00", "snapped to the next step");
         assert_eq!(f.check.as_ref().unwrap().vars[0].count[0], 21);
@@ -3293,7 +3389,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
         app.apply(Action::Select(Selection::Var(1, "/ocean/uo".into())));
-        app.apply(Action::ExtractRegionDrawn { south: -10.0, north: 10.0, west: 5.0, east: 25.0 });
+        app.apply(Action::RegionDrawn { south: -10.0, north: 10.0, west: 5.0, east: 25.0 });
         wait_extract(&mut app);
         let f = app.extract.as_ref().expect("the window opens");
         let r = f.region.as_ref().expect("region");
@@ -3306,7 +3402,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
         app.apply(Action::Select(Selection::Var(1, "/ocean/uo".into())));
-        app.apply(Action::ExtractTimeDragged { file: 1, from: 7.0, to: 3.0 });
+        app.apply(Action::TimeDragged { file: 1, from: 7.0, to: 3.0 });
         wait_extract(&mut app);
         let f = app.extract.as_ref().expect("the window opens");
         assert_eq!((f.dims[0].from.as_str(), f.dims[0].to.as_str()), ("2000-01-01 03:00", "2000-01-01 07:00"));
@@ -3319,7 +3415,7 @@ mod tests {
         let mut app = TorApp::headless(&torcdf_core::fixtures::write_bare(dir.path()));
         app.apply(Action::Select(Selection::Var(1, "/data".into())));
         assert_eq!(app.view.as_ref().unwrap().kind, ViewKind::Image);
-        app.apply(Action::ExtractIndexBoxDrawn { y: (1, 2), x: (0, 3) });
+        app.apply(Action::IndexBoxDrawn { y: (1, 2), x: (0, 3) });
         wait_extract(&mut app);
         let f = app.extract.as_ref().expect("the window opens");
         let rows: Vec<(&str, &str, &str)> = f.dims.iter().map(|r| (r.label.as_str(), r.from.as_str(), r.to.as_str())).collect();
@@ -3333,7 +3429,7 @@ mod tests {
         let mut app = nc4_extract(dir.path());
         // lat index 2..=4 is -5..-1; lon index 5..=7 is 5..7.
         app.apply(Action::SetKind(ViewKind::Image));
-        app.apply(Action::ExtractIndexBoxDrawn { y: (2, 4), x: (5, 7) });
+        app.apply(Action::IndexBoxDrawn { y: (2, 4), x: (5, 7) });
         let r = app.extract.as_ref().unwrap().region.clone().unwrap();
         assert_eq!((r.south.as_str(), r.north.as_str(), r.west.as_str(), r.east.as_str()), ("-5", "-1", "5", "7"));
     }
@@ -3416,5 +3512,19 @@ mod tests {
         wait_extract(&mut app);
         app.apply(Action::CreateDerived);
         assert_eq!(app.files[0].nc.derived(&b).unwrap().formula, "uo*3");
+    }
+
+    #[test]
+    fn stats_request_keeps_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_extract(dir.path());
+        region(&mut app, "-3", "3", "15", "2");
+        let f = app.extract.as_ref().unwrap();
+        assert!(f.check.is_err(), "Save refuses the seam box");
+        let r = f.stats_request(true).expect("statistics accept it");
+        assert_eq!(r.region, Some([-3.0, 3.0, 15.0, 2.0]));
+        assert_eq!(r.ranges.get(&f.dims[0].key), Some(&(0, 24)));
+        assert_eq!(r.vars, ["/ocean/uo"]);
+        assert!(r.weighted);
     }
 }

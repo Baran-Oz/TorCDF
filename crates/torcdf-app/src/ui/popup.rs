@@ -6,7 +6,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoints, VLine};
 
 use super::{fmt_value, slider_label};
 use crate::app::Action;
-use crate::view::extract::ExtractOverlay;
+use crate::view::selection::SelectionOverlay;
 use crate::view::popup::{Popup, PopupKind, PopupSet};
 
 /// Radius of a marker ring (points).
@@ -49,7 +49,7 @@ pub fn show_all(
     ctx: &egui::Context,
     set: &mut PopupSet,
     current: Option<Current<'_>>,
-    marks: Option<&ExtractOverlay>,
+    marks: Option<&SelectionOverlay>,
     actions: &mut Vec<Action>,
 ) {
     for p in &mut set.list {
@@ -70,7 +70,7 @@ fn contents(
     ui: &mut egui::Ui,
     p: &mut Popup,
     current: Option<Current<'_>>,
-    marks: Option<&ExtractOverlay>,
+    marks: Option<&SelectionOverlay>,
     actions: &mut Vec<Action>,
 ) {
     ui.horizontal(|ui| {
@@ -150,7 +150,7 @@ fn plot(
     ui: &mut egui::Ui,
     p: &Popup,
     current: Option<Current<'_>>,
-    marks: Option<&ExtractOverlay>,
+    marks: Option<&SelectionOverlay>,
     actions: &mut Vec<Action>,
 ) {
     let profile = p.kind == PopupKind::Profile;
@@ -228,7 +228,7 @@ fn plot(
     if on_time
         && let Some((from, to)) = super::extract::plot_span(ui, span_id, &out, shown_span)
     {
-        actions.push(Action::ExtractTimeDragged { file: p.file_id, from, to });
+        actions.push(Action::TimeDragged { file: p.file_id, from, to });
     }
     if out.response.clicked()
         && let Some(pos) = out.response.interact_pointer_pos()
