@@ -1,7 +1,8 @@
 //! Colour maps as 256-entry RGBA lookup tables.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Colormap {
+    #[default]
     Viridis,
     Diverging,
     Topo,

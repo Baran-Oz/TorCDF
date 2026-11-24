@@ -10,7 +10,7 @@ pub const MERCATOR_LIMIT_DEG: f64 = 85.051_129;
 /// latitude (rounded up, y a hair above pi) round-trips.
 const MERCATOR_Y_MAX: f64 = PI + 1e-6;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Projection {
     #[default]
     Equirectangular,

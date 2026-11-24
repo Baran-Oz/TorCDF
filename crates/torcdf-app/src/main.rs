@@ -4,6 +4,7 @@
 mod app;
 mod map;
 mod render;
+mod settings;
 mod ui;
 mod view;
 
