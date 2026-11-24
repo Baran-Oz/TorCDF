@@ -25,3 +25,6 @@ torcdf-core = { path = "../torcdf-core", features = ["fixtures"] }
 tempfile = "3"
 pollster = "1"
 approx = "0.5"
+
+[build-dependencies]
+winresource = "0.1"

@@ -32,6 +32,18 @@ fn pick_cpu_adapter(
         .ok_or_else(|| "no suitable graphics adapter".to_string())
 }
 
+/// The 256 px app icon for the title bar and taskbar.
+fn window_icon() -> Option<egui::IconData> {
+    let bytes: &[u8] = include_bytes!("../assets/torcdf-256.png");
+    let mut r = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().ok()?;
+    let mut buf = vec![0; r.output_buffer_size()?];
+    let info = r.next_frame(&mut buf).ok()?;
+    (info.color_type == png::ColorType::Rgba && info.bit_depth == png::BitDepth::Eight).then(|| {
+        buf.truncate(info.width as usize * info.height as usize * 4);
+        egui::IconData { rgba: buf, width: info.width, height: info.height }
+    })
+}
+
 fn main() -> eframe::Result {
     // `args_os`: a path that is not valid Unicode must not panic.
     let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
@@ -46,6 +58,9 @@ fn main() -> eframe::Result {
             .with_drag_and_drop(true),
         ..Default::default()
     };
+    if let Some(icon) = window_icon() {
+        options.viewport = options.viewport.with_icon(Arc::new(icon));
+    }
     if software
         && let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut options.wgpu_options.wgpu_setup
     {
@@ -62,6 +77,14 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn window_icon_decodes() {
+        let icon = window_icon().expect("icon");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        assert_eq!(icon.rgba[3], 0, "corner transparent");
+    }
 
     #[test]
     fn software_flag_parsing() {
