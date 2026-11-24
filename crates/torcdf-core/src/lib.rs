@@ -3,6 +3,7 @@ pub mod fixtures;
 pub mod basemap;
 pub mod calc;
 pub mod cf;
+pub mod extract;
 mod fast;
 mod h5meta;
 mod model;

@@ -248,6 +248,15 @@ impl TimeUnits {
         Some(TimeUnits { unit_secs, epoch_day: calendar.to_days(y, m, d), epoch_sod: sod, calendar })
     }
 
+    /// The value (file units) of this date and time; inverse of `decode`.
+    pub fn encode(&self, year: i32, month: u8, day: u8, hour: u8, minute: u8) -> f64 {
+        let day = self.calendar.to_days(i64::from(year), i64::from(month), i64::from(day));
+        let secs = (day - self.epoch_day) as f64 * SECS_PER_DAY + f64::from(hour) * 3600.0
+            + f64::from(minute) * 60.0
+            - self.epoch_sod;
+        secs / self.unit_secs
+    }
+
     /// Length of one unit in seconds (hours: 3600).
     pub fn unit_secs(&self) -> f64 {
         self.unit_secs
