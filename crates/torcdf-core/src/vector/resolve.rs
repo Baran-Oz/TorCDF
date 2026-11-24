@@ -589,6 +589,7 @@ mod tests {
     use crate::fixtures::{self, vectors};
     use crate::fixtures::vectors::{known_east, known_north};
     use crate::{NcFile, RotateChoice, SeriesRequest, Slice, SliceRequest, SliceService};
+    use crate::fixtures::paired;
     use std::sync::Arc;
 
     const LIKELY: &str = "Components assumed to follow the grid and rotated to east/north. \
@@ -662,7 +663,7 @@ mod tests {
     #[test]
     fn angle_from_latlon_turned_grid() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_noclue(d.path(), true)).unwrap();
+        let f = paired(NcFile::open(&vectors::write_noclue(d.path(), true)).unwrap());
         let lat = f.read_horizontal("/lat", "y", "x").unwrap();
         let lon = f.read_horizontal("/lon", "y", "x").unwrap();
         let a = angle_from_latlon(&lat, &lon, 15, 20);
@@ -698,7 +699,7 @@ mod tests {
     #[test]
     fn nemo_known_field() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_nemo_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_nemo_like(d.path())).unwrap());
         assert!(!f.fast_eligible("/uo+vo"));
         let s = f.read_slice(&plane(&f, "/uo+vo", 0)).unwrap();
         check_known(&s, 20, 30, (0.01, 0.01), |j, i| i == 0 || j == 0 || (j == 5 && (i == 10 || i == 11)));
@@ -715,7 +716,7 @@ mod tests {
     #[test]
     fn nemo_land_neighbour_missing() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_nemo_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_nemo_like(d.path())).unwrap());
         let s = f.read_slice(&plane(&f, "/uo+vo", 1)).unwrap();
         let v = s.vector.as_ref().unwrap();
         for i in [10, 11] {
@@ -733,7 +734,7 @@ mod tests {
     #[test]
     fn roms_edges_missing() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_roms_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_roms_like(d.path())).unwrap());
         let s = f.read_slice(&plane(&f, "/u+v", 0)).unwrap();
         let v = s.vector.as_ref().unwrap();
         for j in 0..12 {
@@ -749,7 +750,7 @@ mod tests {
     #[test]
     fn roms_known_field() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_roms_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_roms_like(d.path())).unwrap());
         let s = f.read_slice(&plane(&f, "/u+v", 1)).unwrap();
         check_known(&s, 12, 16, (0.01, 0.01), roms_edge);
         let r = f.resolve_vector(&f.pair("/u+v").unwrap()).unwrap();
@@ -762,7 +763,7 @@ mod tests {
     #[test]
     fn wrf_known_field() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_wrf_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_wrf_like(d.path())).unwrap());
         let s = f.read_slice(&plane(&f, "/U+V", 0)).unwrap();
         check_known(&s, 10, 14, (0.01, 0.01), |_, _| false);
         let r = f.resolve_vector(&f.pair("/U+V").unwrap()).unwrap();
@@ -774,7 +775,7 @@ mod tests {
     #[test]
     fn noclue_flat_unknown() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_noclue(d.path(), false)).unwrap();
+        let f = paired(NcFile::open(&vectors::write_noclue(d.path(), false)).unwrap());
         let s = f.read_slice(&plane(&f, "/u+v", 0)).unwrap();
         let v = s.vector.as_ref().unwrap();
         let raw = |var: &str| {
@@ -802,7 +803,7 @@ mod tests {
     #[test]
     fn noclue_turned_likely() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_noclue(d.path(), true)).unwrap();
+        let f = paired(NcFile::open(&vectors::write_noclue(d.path(), true)).unwrap());
         let s = f.read_slice(&plane(&f, "/u+v", 0)).unwrap();
         check_known(&s, 15, 20, (0.01, 0.01), |_, _| false);
         let r = f.resolve_vector(&f.pair("/u+v").unwrap()).unwrap();
@@ -814,7 +815,7 @@ mod tests {
     #[test]
     fn rotate_off_overrides() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_nemo_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_nemo_like(d.path())).unwrap());
         let off = f.add_pair(f.pair("/uo+vo").unwrap().with_rotate(RotateChoice::Off));
         assert_eq!(off.path, "/uo+vo#off");
         let s = f.read_slice(&plane(&f, &off.path, 0)).unwrap();
@@ -848,7 +849,7 @@ mod tests {
     #[test]
     fn rotate_on_overrides_unknown() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_noclue(d.path(), false)).unwrap();
+        let f = paired(NcFile::open(&vectors::write_noclue(d.path(), false)).unwrap());
         let on = f.add_pair(f.pair("/u+v").unwrap().with_rotate(RotateChoice::On));
         assert_eq!(on.path, "/u+v#on");
         let r = f.resolve_vector(&on).unwrap();
@@ -894,12 +895,12 @@ mod tests {
     fn strided_vector_equals_subsampled_full() {
         let d = tempfile::tempdir().unwrap();
         // ROMS: both components on the minus side, windows [i−1, i].
-        let f = NcFile::open(&vectors::write_roms_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_roms_like(d.path())).unwrap());
         // Starts chosen so the samples reach the last row (11) and column (15).
         check_strided(&f, "/u+v", (12, 16), (3, 4), &[(2, 3), (0, 0), (1, 1), (11, 15)]);
         // WRF: both components on the plus side, windows [i, i+1], whose
         // `count + 1` read ends at the staggered component's last row/column.
-        let f = NcFile::open(&vectors::write_wrf_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_wrf_like(d.path())).unwrap());
         // 10 × 14: with strides 3 and 4, starts (0, 1), (9, 13) and (3, 5)
         // reach the last row (9) and column (13); stride 1 reads every cell
         // and strides (9, 13) jump straight to the last ones.
@@ -911,7 +912,7 @@ mod tests {
     #[test]
     fn cmems_like_pair_unrotated() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&fixtures::write_nc4(d.path())).unwrap();
+        let f = paired(NcFile::open(&fixtures::write_nc4(d.path())).unwrap());
         let req = |var: &str| SliceRequest {
             var: var.into(),
             start: vec![0, 0, 0],
@@ -936,7 +937,7 @@ mod tests {
     #[test]
     fn vector_series_has_components() {
         let d = tempfile::tempdir().unwrap();
-        let f = Arc::new(NcFile::open(&vectors::write_nemo_like(d.path())).unwrap());
+        let f = Arc::new(paired(NcFile::open(&vectors::write_nemo_like(d.path())).unwrap()));
         let svc = SliceService::new(1 << 20, 1, Arc::new(|| {}));
         let req = SeriesRequest { var: "/uo+vo".into(), point: vec![0, 10, 15], along: 0, centre: 1 };
         let wait = |h: &mut crate::SeriesHandle| {
@@ -977,7 +978,7 @@ mod tests {
 
     fn arome_layer(t: usize) -> (tempfile::TempDir, NcFile, String, SliceRequest) {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_arome_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_arome_like(d.path())).unwrap());
         let p = f.pairs().into_iter().find(|p| p.magnitude() == "/wind_speed").expect("magdir pair");
         let l = crate::vector::layer_path("/wind_speed", &p.path);
         let req = SliceRequest {
@@ -1015,7 +1016,7 @@ mod tests {
     #[test]
     fn layer_rejects_misfit() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_roms_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_roms_like(d.path())).unwrap());
         let l = crate::vector::layer_path("/u", "/u+v");
         let req = SliceRequest { var: l, start: vec![0, 0, 0], count: vec![1, 12, 15], stride: vec![1; 3] };
         let e = f.read_slice(&req).err().expect("misfit").to_string();
@@ -1032,7 +1033,7 @@ mod tests {
     #[test]
     fn layer_rejects_nemo_u_grid() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_nemo_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_nemo_like(d.path())).unwrap());
         let mk = |x: &str| SliceRequest {
             var: crate::vector::layer_path(x, "/uo+vo"),
             start: vec![0, 0, 0],

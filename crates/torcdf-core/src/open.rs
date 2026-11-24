@@ -26,7 +26,7 @@ pub struct NcFile {
     /// Windows if the real one was refused), so a second HDF5 open names the same file.
     pub(crate) c_path: PathBuf,
     open_id: u64,
-    /// Vector pairs: detected at open, then added or removed by hand. They
+    /// Vector pairs the user made (none at open). They
     /// last for the session only.
     pub(crate) pairs: std::sync::RwLock<Vec<std::sync::Arc<crate::vector::VectorPair>>>,
     /// Resolved staggering and rotation per pair path, with the pair they
@@ -142,15 +142,14 @@ impl NcFile {
 
     fn assemble(meta: Dataset, backend: Backend, c_path: PathBuf) -> NcFile {
         let open_id = NEXT_OPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Metadata only: no variable data is read.
-        let pairs = crate::vector::detect_pairs(&meta).into_iter().map(std::sync::Arc::new).collect();
+        // No pair is made at open: the user pairs variables themselves.
         NcFile {
             meta,
             fast: Default::default(),
             backend,
             c_path,
             open_id,
-            pairs: std::sync::RwLock::new(pairs),
+            pairs: Default::default(),
             resolved: Default::default(),
         }
     }

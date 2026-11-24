@@ -177,7 +177,7 @@ mod tests {
 
     fn open(f: impl Fn(&std::path::Path) -> std::path::PathBuf) -> (tempfile::TempDir, NcFile) {
         let d = tempfile::tempdir().unwrap();
-        let nc = NcFile::open(&f(d.path())).unwrap();
+        let nc = torcdf_core::fixtures::paired(NcFile::open(&f(d.path())).unwrap());
         (d, nc)
     }
 

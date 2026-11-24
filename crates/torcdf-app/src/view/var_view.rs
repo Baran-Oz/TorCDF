@@ -975,7 +975,7 @@ mod tests {
 
     fn nemo_view() -> (tempfile::TempDir, VarView) {
         let d = tempfile::tempdir().unwrap();
-        let nc = Arc::new(NcFile::open(&fixtures::vectors::write_nemo_like(d.path())).unwrap());
+        let nc = Arc::new(fixtures::paired(NcFile::open(&fixtures::vectors::write_nemo_like(d.path())).unwrap()));
         let pair = nc.pairs().into_iter().next().expect("nemo pair detected");
         let v = VarView::new_vector(&egui::Context::default(), 1, nc, pair);
         (d, v)
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn pair_without_latlon_starts_as_image() {
         let d = tempfile::tempdir().unwrap();
-        let nc = Arc::new(NcFile::open(&fixtures::vectors::write_noclue(d.path(), false)).unwrap());
+        let nc = Arc::new(fixtures::paired(NcFile::open(&fixtures::vectors::write_noclue(d.path(), false)).unwrap()));
         // The fixture carries 2-D lat/lon; drop them from the pair, as when none is found.
         let mut pair = (*nc.pairs().into_iter().next().expect("u/v pair")).clone();
         pair.centre_lat = None;
@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn layered_view_resolves_pair_on_own_grid() {
         let d = tempfile::tempdir().unwrap();
-        let nc = Arc::new(NcFile::open(&fixtures::vectors::write_nemo_like(d.path())).unwrap());
+        let nc = Arc::new(fixtures::paired(NcFile::open(&fixtures::vectors::write_nemo_like(d.path())).unwrap()));
         let pair = nc.pairs().into_iter().next().expect("nemo pair detected");
         let x = nc.meta.var("/thetao").unwrap().clone();
         let mut v = VarView::new_layered(&egui::Context::default(), 1, nc, x, pair.clone());

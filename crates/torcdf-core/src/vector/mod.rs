@@ -1,8 +1,9 @@
 //! Vector fields: east/north components at cell centres.
 //!
 //! A [`VectorPair`] is a virtual variable made of two component variables,
-//! found from the file's metadata ([`detect_pairs`]) or paired by hand
-//! ([`pair_by_hand`]). Pairings last for the session; nothing is written.
+//! paired by the user ([`pair_by_hand`]); the file's metadata ([`detect_pairs`])
+//! only informs a pairing, it never makes one. Pairings last for the
+//! session; nothing is written.
 
 mod detect;
 mod magdir;
@@ -205,8 +206,7 @@ impl crate::NcFile {
         self.pairs.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Registered pairs: detected ones in detection order, then hand pairs
-    /// in the order they were added.
+    /// Registered pairs (the user's), in the order they were added.
     pub fn pairs(&self) -> Vec<Arc<VectorPair>> {
         self.pairs_read().clone()
     }

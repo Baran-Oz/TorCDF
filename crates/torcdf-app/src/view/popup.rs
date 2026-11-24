@@ -441,7 +441,7 @@ mod tests {
     }
 
     fn view_of(path: std::path::PathBuf, var: &str) -> VarView {
-        let nc = Arc::new(NcFile::open(&path).unwrap());
+        let nc = Arc::new(fixtures::paired(NcFile::open(&path).unwrap()));
         let info = nc.meta.var(var).expect("variable").clone();
         let mut v = VarView::new(&egui::Context::default(), 1, nc, info);
         wait_coords(&mut v);
@@ -527,7 +527,7 @@ mod tests {
             let mut p = Popup::open(&v, 3, 4, None, 1, &svc).unwrap();
             check(&v, &mut p);
         }
-        let nc = Arc::new(NcFile::open(&path).unwrap());
+        let nc = Arc::new(fixtures::paired(NcFile::open(&path).unwrap()));
         let pair = nc.pair("/U+V").expect("pair");
         let mut v = VarView::new_vector(&egui::Context::default(), 1, nc, pair);
         wait_coords(&mut v);
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn closing_popup_cancels() {
         let d = tempfile::tempdir().unwrap();
-        let nc = Arc::new(NcFile::open(&fixtures::write_long_series(d.path())).unwrap());
+        let nc = Arc::new(fixtures::paired(NcFile::open(&fixtures::write_long_series(d.path())).unwrap()));
         assert!(!nc.fast_eligible("/v"));
         // An `on_ready` whose first call blocks until released.
         let (entered_tx, entered) = mpsc::sync_channel::<()>(1);
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn vector_popup_has_components() {
         let d = tempfile::tempdir().unwrap();
-        let nc = Arc::new(NcFile::open(&fixtures::vectors::write_nemo_like(d.path())).unwrap());
+        let nc = Arc::new(fixtures::paired(NcFile::open(&fixtures::vectors::write_nemo_like(d.path())).unwrap()));
         let pair = nc.pairs().into_iter().next().expect("pair");
         let mut v = VarView::new_vector(&egui::Context::default(), 1, nc, pair);
         wait_coords(&mut v);

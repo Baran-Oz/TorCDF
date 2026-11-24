@@ -653,7 +653,7 @@ impl TorApp {
         };
         let mode = l.mode;
         // A registered pair of these two in this form is used as it is
-        // (a detected pair keeps its settings), preferring the one on show
+        // (it keeps its settings), preferring the one on show
         // (a pair's own entry keeps its rotation variant).
         let same = |p: &VectorPair| p.east == a && p.north == b && ArrowMode::of_form(p.form) == mode;
         let shown = self.view.as_ref().and_then(|v| v.vector.clone());
@@ -1568,6 +1568,7 @@ mod tests {
     fn rotate_toggle_reselects() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        torcdf_core::fixtures::pair_detected(&app.files[0].nc);
         let pair = app.files[0].nc.pairs().remove(0);
         app.apply(Action::Select(Selection::Var(1, pair.path.clone())));
         app.view.as_mut().unwrap().slider_pos[0] = 1;
@@ -1649,6 +1650,7 @@ mod tests {
     fn mode_switch_uses_that_forms_picks() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = TorApp::headless(&write_arome_like(dir.path()));
+        torcdf_core::fixtures::pair_detected(&app.files[0].nc);
         app.apply(Action::Select(Selection::Var(1, "/wind_speed".into())));
         let slot = app.arrow_layer.as_ref().expect("slot");
         assert_eq!((slot.file, slot.mode), (1, ArrowMode::Off));
@@ -1690,6 +1692,7 @@ mod tests {
     fn layer_kept_on_same_grid_hidden_on_other() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        torcdf_core::fixtures::pair_detected(&app.files[0].nc);
         let pair = app.files[0].nc.pairs().remove(0);
         app.apply(Action::Select(Selection::Var(1, "/thetao".into())));
         app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
@@ -1821,6 +1824,7 @@ mod tests {
     fn pair_entry_mode_switch_turns_arrows_off() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = TorApp::headless(&write_arome_like(dir.path()));
+        torcdf_core::fixtures::pair_detected(&app.files[0].nc);
         app.apply(Action::Select(Selection::Var(1, AROME_PAIR.into())));
         let v = app.view.as_ref().expect("view");
         assert!(v.arrows.as_ref().is_some_and(|a| a.on), "the pair entry draws its arrows");
@@ -1871,9 +1875,22 @@ mod tests {
     /// is magnitude/direction; this test wants plain `uo`/`vo` arrows, so it
     /// uses the NEMO-like `thetao`.
     #[test]
+    fn nothing_is_paired_until_the_user_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        // The tree lists registered pairs only, so no vector row either.
+        assert!(app.files[0].nc.pairs().is_empty());
+        app.apply(Action::Select(Selection::Var(1, "/thetao".into())));
+        let slot = app.arrow_layer.as_ref().expect("slot");
+        assert_eq!(slot.mode, ArrowMode::Off);
+        assert_eq!(slot.picks, [None, None]);
+    }
+
+    #[test]
     fn popup_on_layer_reads_plain_series() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        torcdf_core::fixtures::pair_detected(&app.files[0].nc);
         app.apply(Action::Select(Selection::Var(1, "/thetao".into())));
         app.apply(Action::SetArrowMode(ArrowMode::EastNorth));
         assert!(app.view.as_ref().unwrap().base.is_some(), "layered");
@@ -2360,6 +2377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A pair's own view keeps its horizontal axes.
         let mut app = TorApp::headless(&write_nemo_like(dir.path()));
+        torcdf_core::fixtures::pair_detected(&app.files[0].nc);
         let pair = app.files[0].nc.pairs().remove(0);
         app.apply(Action::Select(Selection::Var(1, pair.path.clone())));
         let v = app.view.as_ref().unwrap();

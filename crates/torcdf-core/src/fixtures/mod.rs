@@ -4,6 +4,21 @@
 
 use std::path::{Path, PathBuf};
 
+/// Registers every pair the metadata declares, as the user would by hand.
+/// Files open with no pairs; tests of arrow drawing start from this.
+pub fn pair_detected(nc: &crate::NcFile) -> &crate::NcFile {
+    for p in crate::vector::detect_pairs(&nc.meta) {
+        nc.add_pair(p);
+    }
+    nc
+}
+
+/// [`pair_detected`] on a file just opened.
+pub fn paired(nc: crate::NcFile) -> crate::NcFile {
+    pair_detected(&nc);
+    nc
+}
+
 /// netCDF-3 classic `classic.nc`: `t(time,lat,lon)` i16 packed with
 /// scale/offset/fill on a CF-style grid with an unlimited `time` dimension.
 pub fn write_classic(dir: &Path) -> PathBuf {

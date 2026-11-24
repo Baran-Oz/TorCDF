@@ -521,6 +521,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{self, vectors};
     use crate::{Attr, AttrValue, DType, Dataset, Dim, FileFormat, Group, NcFile, Storage, VarInfo};
+    use crate::fixtures::paired;
 
     /// A root-only dataset of f32 variables: (name, [(dim, len)], [(attr, text)]).
     #[allow(clippy::type_complexity)]
@@ -574,8 +575,10 @@ mod tests {
         assert_eq!((p.east.as_str(), p.north.as_str()), ("/ocean/uo", "/ocean/vo"));
         assert_eq!(p.horiz, [1, 2]);
         assert!(!p.by_hand);
-        // Registered at open; virtual paths never go to the fast reader.
-        assert_eq!(f.pairs().len(), 1);
+        // Nothing is paired at open: the user pairs. Virtual paths never
+        // go to the fast reader.
+        assert!(f.pairs().is_empty());
+        f.add_pair(p.clone());
         assert!(f.pair("/ocean/uo+vo").is_some());
         assert!(!f.fast_eligible("/ocean/uo+vo"));
         let vi = p.var_info();
@@ -698,7 +701,7 @@ mod tests {
     #[test]
     fn nemo_detected() {
         let d = tempfile::tempdir().unwrap();
-        let f = NcFile::open(&vectors::write_nemo_like(d.path())).unwrap();
+        let f = paired(NcFile::open(&vectors::write_nemo_like(d.path())).unwrap());
         let pairs = detect_pairs(&f.meta);
         assert_eq!(pairs.len(), 1);
         let p = &pairs[0];
@@ -754,7 +757,7 @@ mod tests {
     fn noclue_detected() {
         let d = tempfile::tempdir().unwrap();
         for turned in [false, true] {
-            let f = NcFile::open(&vectors::write_noclue(d.path(), turned)).unwrap();
+            let f = paired(NcFile::open(&vectors::write_noclue(d.path(), turned)).unwrap());
             let names: Vec<&str> = f.meta.root.vars.iter().map(|v| v.name.as_str()).collect();
             assert_eq!(names, ["h", "lat", "lon", "u", "v"]);
             let pairs = f.pairs();
