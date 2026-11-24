@@ -176,6 +176,51 @@ pub struct TimeUnits {
 }
 
 const SECS_PER_DAY: f64 = 86_400.0;
+
+/// A spacing of time-axis ticks: `secs` long (approximate for months), on
+/// the first of the month every `months` months when that is not 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TickStep {
+    pub secs: f64,
+    pub months: u32,
+}
+
+/// Most ticks [`TimeUnits::tick_values`] returns.
+pub const MAX_TICKS: usize = 2000;
+
+const MONTH_SECS: f64 = YEAR_SECS / 12.0;
+const fn secs(s: f64) -> TickStep {
+    TickStep { secs: s, months: 0 }
+}
+const fn months(n: u32) -> TickStep {
+    TickStep { secs: MONTH_SECS * n as f64, months: n }
+}
+
+/// Tick spacings for time axes, finest first.
+pub const TICK_STEPS: &[TickStep] = &[
+    secs(60.0),
+    secs(300.0),
+    secs(900.0),
+    secs(1800.0),
+    secs(3600.0),
+    secs(3.0 * 3600.0),
+    secs(6.0 * 3600.0),
+    secs(12.0 * 3600.0),
+    secs(SECS_PER_DAY),
+    secs(2.0 * SECS_PER_DAY),
+    secs(7.0 * SECS_PER_DAY),
+    secs(14.0 * SECS_PER_DAY),
+    months(1),
+    months(3),
+    months(6),
+    months(12),
+    months(24),
+    months(60),
+    months(120),
+    months(240),
+    months(600),
+    months(1200),
+];
 /// udunits: tropical year.
 const YEAR_SECS: f64 = 365.242198781 * SECS_PER_DAY;
 
@@ -206,6 +251,46 @@ impl TimeUnits {
     /// Length of one unit in seconds (hours: 3600).
     pub fn unit_secs(&self) -> f64 {
         self.unit_secs
+    }
+
+    /// Values in `[lo, hi]` (file units) where ticks of `step` fall: whole
+    /// minutes/hours/days counted from midnight, or the first of every
+    /// `step.months`-th month (January for years). At most [`MAX_TICKS`].
+    pub fn tick_values(&self, lo: f64, hi: f64, step: &TickStep) -> Vec<f64> {
+        let mut out = Vec::new();
+        if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+            return out;
+        }
+        // Seconds since midnight of the epoch day.
+        let secs = |v: f64| v * self.unit_secs + self.epoch_sod;
+        let value = |s: f64| (s - self.epoch_sod) / self.unit_secs;
+        if step.months == 0 {
+            let first = (secs(lo) / step.secs).ceil();
+            for k in 0..MAX_TICKS {
+                let v = value((first + k as f64) * step.secs);
+                if v > hi {
+                    break;
+                }
+                out.push(v);
+            }
+        } else {
+            let d = self.decode(lo);
+            let n = i64::from(step.months);
+            // Months since year 0, rounded down to a multiple of the step.
+            let mut m = (i64::from(d.year) * 12 + i64::from(d.month) - 1).div_euclid(n) * n;
+            while out.len() < MAX_TICKS {
+                let day = self.calendar.to_days(m.div_euclid(12), m.rem_euclid(12) + 1, 1);
+                let v = value((day - self.epoch_day) as f64 * SECS_PER_DAY);
+                if v > hi {
+                    break;
+                }
+                if v >= lo {
+                    out.push(v);
+                }
+                m += n;
+            }
+        }
+        out
     }
 
     pub fn decode(&self, v: f64) -> CfDateTime {
@@ -308,5 +393,51 @@ mod iso_tests {
         assert_eq!(t.iso(), "2000-01-01T00:00:00");
         t.second = 1.5;
         assert_eq!(t.iso(), "2000-01-01T00:00:01.500");
+    }
+}
+
+#[cfg(test)]
+mod tick_tests {
+    use super::*;
+
+    fn dates(t: &TimeUnits, vals: &[f64]) -> Vec<String> {
+        vals.iter().map(|&v| t.decode(v).to_string()).collect()
+    }
+
+    #[test]
+    fn year_ticks_fall_on_new_year() {
+        let t = TimeUnits::parse("seconds since 1970-01-01 00:00:00", Some("gregorian")).unwrap();
+        // 1999-07-15 .. 2003-03-01
+        let (lo, hi) = (932_000_000.0, 1_046_476_800.0);
+        let year = TICK_STEPS.iter().find(|s| s.months == 12).unwrap();
+        let v = t.tick_values(lo, hi, year);
+        assert_eq!(dates(&t, &v), ["2000-01-01 00:00", "2001-01-01 00:00", "2002-01-01 00:00", "2003-01-01 00:00"]);
+    }
+
+    #[test]
+    fn month_ticks_on_the_first() {
+        let t = TimeUnits::parse("days since 2000-01-01", Some("noleap")).unwrap();
+        let three = TICK_STEPS.iter().find(|s| s.months == 3).unwrap();
+        let v = t.tick_values(20.0, 200.0, three);
+        assert_eq!(dates(&t, &v), ["2000-04-01 00:00", "2000-07-01 00:00"]);
+    }
+
+    #[test]
+    fn day_and_hour_ticks_on_whole_units() {
+        let t = TimeUnits::parse("hours since 2025-11-30 06:00:00", None).unwrap();
+        let day = TICK_STEPS.iter().find(|s| s.secs == 86_400.0).unwrap();
+        // 2025-11-30 06:00 .. 2025-12-02 06:00
+        assert_eq!(dates(&t, &t.tick_values(0.0, 48.0, day)), ["2025-12-01 00:00", "2025-12-02 00:00"]);
+        let six = TICK_STEPS.iter().find(|s| s.secs == 21_600.0).unwrap();
+        assert_eq!(dates(&t, &t.tick_values(1.0, 13.0, six)), ["2025-11-30 12:00", "2025-11-30 18:00"]);
+    }
+
+    #[test]
+    fn ticks_are_bounded() {
+        let t = TimeUnits::parse("seconds since 1970-01-01", None).unwrap();
+        let minute = &TICK_STEPS[0];
+        assert!(t.tick_values(0.0, 1e12, minute).len() <= MAX_TICKS);
+        assert!(t.tick_values(f64::NAN, 1.0, minute).is_empty());
+        assert!(t.tick_values(5.0, 1.0, minute).is_empty());
     }
 }

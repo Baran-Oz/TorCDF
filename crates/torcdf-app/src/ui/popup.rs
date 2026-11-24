@@ -150,6 +150,10 @@ fn plot(ui: &mut egui::Ui, p: &Popup, current: Option<Current<'_>>, actions: &mu
             .y_axis_label(along.clone())
             .y_axis_formatter(move |m, _| tick_y(signed(m.value), m.step_size))
     } else {
+        let plot = match p.time.clone() {
+            Some(t) => plot.x_grid_spacer(move |input| super::time_grid(&t, input)),
+            None => plot,
+        };
         plot.x_axis_label(along.clone())
             .y_axis_label(value_label)
             .x_axis_formatter(move |m, _| tick_x(m.value, m.step_size))

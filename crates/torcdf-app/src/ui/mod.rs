@@ -321,6 +321,35 @@ pub fn time_tick(t: &TimeUnits, v: f64, step: f64) -> String {
     if step * t.unit_secs() >= 86_400.0 { date } else { format!("{date} {:02}:{:02}", d.hour, d.minute) }
 }
 
+/// Grid lines of a time axis on calendar dates (whole hours, days, the
+/// first of a month, new year), several spacings at once so one of them
+/// leaves room for date labels. Each line carries the coarsest spacing it
+/// falls on, which egui_plot uses for its weight and label.
+pub fn time_grid(t: &TimeUnits, input: egui_plot::GridInput) -> Vec<egui_plot::GridMark> {
+    use torcdf_core::cf::TICK_STEPS;
+    let unit = t.unit_secs();
+    let base = input.base_step_size * unit;
+    let (lo, hi) = input.bounds;
+    let mut marks: Vec<egui_plot::GridMark> = Vec::new();
+    // From the finest allowed spacing up to ~40 times it (a few hundred
+    // points on screen).
+    for step in TICK_STEPS.iter().filter(|s| s.secs >= base && s.secs <= base * 40.0) {
+        let step_size = step.secs / unit;
+        for value in t.tick_values(lo, hi, step) {
+            let near = |m: &&mut egui_plot::GridMark| (m.value - value).abs() <= 1e-9 * value.abs().max(1.0);
+            match marks.iter_mut().find(near) {
+                Some(m) => m.step_size = step_size,
+                None => marks.push(egui_plot::GridMark { value, step_size }),
+            }
+        }
+    }
+    if marks.is_empty() {
+        // Finer than a minute or coarser than centuries: plain numbers' grid.
+        return egui_plot::log_grid_spacer(10)(input);
+    }
+    marks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +387,23 @@ mod tests {
         assert_eq!(time_tick(&t, 30.0, 100.0), "2025-12-01");
         // Closer ticks would repeat the same date: the time is added.
         assert_eq!(time_tick(&t, 30.0, 6.0), "2025-12-01 06:00");
+    }
+
+    #[test]
+    fn time_grid_on_calendar_dates() {
+        let t = TimeUnits::parse("seconds since 1970-01-01 00:00:00", Some("gregorian")).unwrap();
+        // 1999-07-15 .. 2003-03-01; the finest grid line may be ~1 month.
+        let input = egui_plot::GridInput { bounds: (932_000_000.0, 1_046_476_800.0), base_step_size: 2.5e6 };
+        let marks = time_grid(&t, input);
+        let year = 365.0 * 86_400.0;
+        let new_year = marks.iter().find(|m| t.decode(m.value).to_string() == "2000-01-01 00:00").expect("2000");
+        // A new-year line carries the coarsest step it falls on.
+        assert!(new_year.step_size >= year, "{}", new_year.step_size);
+        // Every line is on the first of a month, and a coarse level exists.
+        assert!(marks.iter().all(|m| t.decode(m.value).day == 1));
+        assert!(marks.iter().any(|m| m.step_size >= year));
+        // Nothing finer than the plot allows.
+        assert!(marks.iter().all(|m| m.step_size >= 2.5e6));
     }
 
     #[test]

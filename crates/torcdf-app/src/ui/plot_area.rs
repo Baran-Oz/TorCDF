@@ -330,8 +330,11 @@ fn line(ui: &mut egui::Ui, v: &VarView) {
     let time = d.filter(|d| v.time_dim == Some(*d)).and(v.time_units.clone());
     let name = v.var.name.clone();
     let ticks = time.clone();
-    egui_plot::Plot::new(("line", &v.var.path))
-        .x_axis_label(x_label)
+    let mut plot = egui_plot::Plot::new(("line", &v.var.path));
+    if let Some(t) = time.clone() {
+        plot = plot.x_grid_spacer(move |input| super::time_grid(&t, input));
+    }
+    plot.x_axis_label(x_label)
         .x_axis_formatter(move |m, _| match &ticks {
             Some(t) => super::time_tick(t, m.value, m.step_size),
             None => fmt_value(m.value),
