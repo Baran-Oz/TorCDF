@@ -273,6 +273,8 @@ pub struct MapState {
     pub activity: &'static str,
     /// The map's screen rect as last drawn (for "Use current map view").
     pub last_rect: Option<Rect>,
+    /// Where a Shift+drag region box started.
+    pub band: Option<eframe::egui::Pos2>,
 }
 
 /// A detail tile on the GPU, with the projection of its mesh (curvilinear).
@@ -325,6 +327,7 @@ impl MapState {
             events: None,
             activity: "",
             last_rect: None,
+            band: None,
         }
     }
 

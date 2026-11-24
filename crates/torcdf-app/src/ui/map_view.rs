@@ -9,7 +9,9 @@ use eframe::egui::{self, Color32, Rect, Vec2};
 use eframe::egui_wgpu::RenderState;
 use torcdf_core::SliceRequest;
 
-use super::colorbar;
+use super::{colorbar, extract};
+use crate::app::Action;
+use crate::view::extract::ExtractOverlay;
 use super::plot_area::{WHEEL_ZOOM, all_missing, draw_range, plot_rects, reference_arrow};
 use crate::map::arrows::{ArrowInput, ArrowSpace, arrow_step};
 use crate::map::tiles::{TileSpec, visible_windows};
@@ -24,6 +26,7 @@ use crate::ui::popup::draw_markers;
 use crate::view::popup::{Popup, PopupSet};
 use crate::view::map_state::{BORDERS_ID, COAST_ID, GRID_ID, UploadFailure};
 use crate::view::var_view::{Display, VarView};
+pub use crate::view::extract::lonlat_bounds;
 
 
 /// The tile a read covers on the plotted axes.
@@ -47,6 +50,8 @@ pub fn show(
     display: &Display,
     rs: Option<&RenderState>,
     popups: &PopupSet,
+    marks: Option<&ExtractOverlay>,
+    actions: &mut Vec<Action>,
 ) -> bool {
     // A failed background job shows once here; it is not retried.
     if let Some(m) = &v.map {
@@ -81,8 +86,24 @@ pub fn show(
     }
     map.fit_if_needed(rect);
 
+    // Shift+drag draws the Extract region instead of panning.
+    let (band, drawn) = extract::band(ui, &resp, &mut map.band, rect);
+    if let Some(r) = drawn {
+        let mut pts = Vec::new();
+        for k in 0..=8 {
+            let t = k as f32 / 8.0;
+            for p in [r.lerp_inside(Vec2::new(t, 0.0)), r.lerp_inside(Vec2::new(t, 1.0)), r.lerp_inside(Vec2::new(0.0, t)), r.lerp_inside(Vec2::new(1.0, t))] {
+                pts.extend(map.camera.screen_to_lonlat(p, rect));
+            }
+        }
+        if !pts.is_empty() {
+            let (south, north, west, east) = lonlat_bounds(&pts);
+            actions.push(Action::ExtractRegionDrawn { south, north, west, east });
+        }
+    }
+
     // Input: camera only.
-    if resp.dragged() {
+    if resp.dragged() && band.is_none() && drawn.is_none() && map.band.is_none() {
         map.camera.pan(resp.drag_delta());
     }
     if let Some(pos) = resp.hover_pos() {
@@ -218,6 +239,16 @@ pub fn show(
             paint_lines(ui, rect, COAST_ID, &line(overlay.coast));
         }
     }
+    if let Some([s, n, w, e]) = marks.filter(|o| o.file == v.file_id).and_then(|o| o.region) {
+        let pts: Vec<Option<egui::Pos2>> = extract::region_outline(s, n, w, e)
+            .into_iter()
+            .map(|(lon, lat)| map.camera.proj.forward(lon, lat).map(|w| map.camera.world_to_screen(w, rect)))
+            .collect();
+        extract::paint_outline(ui, rect, &pts, map.camera.proj.wraps_x());
+    }
+    if let Some(r) = band {
+        extract::paint_band(ui, r);
+    }
     let marker = |p: &Popup| {
         let (lon, lat) = p.lonlat?;
         let w = map.camera.proj.forward(lon, lat)?;
@@ -244,4 +275,16 @@ pub fn show(
         None => {}
     }
     uploaded
+}
+
+#[cfg(test)]
+mod extract_tests {
+    use super::*;
+
+    #[test]
+    fn lonlat_bounds_of_box() {
+        assert_eq!(lonlat_bounds(&[(10.0, 40.0), (20.0, 40.0), (20.0, 50.0), (10.0, 50.0)]), (40.0, 50.0, 10.0, 20.0));
+        // Across the date line the box stays narrow.
+        assert_eq!(lonlat_bounds(&[(170.0, 0.0), (-170.0, 5.0)]), (0.0, 5.0, 170.0, 190.0));
+    }
 }

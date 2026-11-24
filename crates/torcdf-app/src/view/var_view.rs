@@ -114,6 +114,8 @@ pub struct ImageState {
     pub fitted_to: egui::Vec2,
     /// The user panned or zoomed, so new slices and resizes keep the view.
     pub user_moved: bool,
+    /// Where a Shift+drag index box started.
+    pub band: Option<egui::Pos2>,
 }
 
 /// The value under the cursor, with original (unstrided) indices on the

@@ -244,6 +244,12 @@ pub enum Action {
     SaveExtract,
     CancelExtract,
     CloseExtract,
+    /// Shift+drag on the map: the region box (degrees).
+    ExtractRegionDrawn { south: f64, north: f64, west: f64, east: f64 },
+    /// Shift+drag on an image: (first, last) indices along its plotted y and x.
+    ExtractIndexBoxDrawn { y: (usize, usize), x: (usize, usize) },
+    /// Shift+drag across a time series of `file`: axis values.
+    ExtractTimeDragged { file: u64, from: f64, to: f64 },
 }
 
 fn file_name(p: &Path) -> String {
@@ -1207,6 +1213,34 @@ impl TorApp {
                 self.recheck_extract();
             }
             Action::ExtractFromSlider { row, end } => self.extract_from_slider(row, end),
+            Action::ExtractRegionDrawn { south, north, west, east } => {
+                let Some(file) = self.view.as_ref().map(|v| v.file_id) else { return };
+                let n = crate::view::extract::fmt_num;
+                let r = RegionText { south: n(south), north: n(north), west: n(west), east: n(east) };
+                if let Some(f) = self.extract_for(file) {
+                    f.pending_region = Some((r, false));
+                    f.apply_pending();
+                }
+                self.recheck_extract();
+            }
+            Action::ExtractIndexBoxDrawn { y, x } => {
+                let Some(v) = self.view.as_ref() else { return };
+                let Some(a) = v.axes else { return };
+                let key = |d: usize| v.nc.dim_key(v.plain_path(), &v.var.dims[d]);
+                let (Some(ky), Some(kx), file) = (key(a.y), key(a.x), v.file_id) else { return };
+                if let Some(f) = self.extract_for(file) {
+                    f.pending_index.extend([(ky, y.0, y.1), (kx, x.0, x.1)]);
+                    f.apply_pending();
+                }
+                self.recheck_extract();
+            }
+            Action::ExtractTimeDragged { file, from, to } => {
+                if let Some(f) = self.extract_for(file) {
+                    f.pending_time = Some((from, to));
+                    f.apply_pending();
+                }
+                self.recheck_extract();
+            }
             Action::SaveExtract => self.save_extract_dialog(),
             Action::CancelExtract => {
                 if let Some(j) = self.extract.as_ref().and_then(|f| f.job.as_ref()) {
@@ -1450,11 +1484,19 @@ impl TorApp {
             }
             _ => {
                 let mut form = ExtractForm::new(file, f.name.clone(), ticks.into_iter().collect());
-                form.pending_region = view_region;
+                form.pending_region = view_region.map(|r| (r, true));
                 self.extract = Some(form);
             }
         }
         self.recheck_extract();
+    }
+
+    /// The Extract window for `file`, opened (with the variable on screen) if needed.
+    fn extract_for(&mut self, file: u64) -> Option<&mut ExtractForm> {
+        if self.extract.as_ref().is_none_or(|f| f.file != file) {
+            self.open_extract(file, None);
+        }
+        self.extract.as_mut().filter(|f| f.file == file)
     }
 
     /// The map's visible lon/lat window as region text.
@@ -1832,6 +1874,8 @@ impl eframe::App for TorApp {
             let pb = self.playback.as_ref();
             egui::Panel::bottom("sliders").show(ui, |ui| ui::slider_strip(ui, v, pb, &mut actions));
         }
+        // The Extract window's box and span; never in a PNG being taken.
+        let marks = if self.shots.is_empty() { self.extract.as_ref().and_then(|f| f.overlay()) } else { None };
         let central = egui::CentralPanel::default().show(ui, |ui| {
             plot_area::show(
                 ui,
@@ -1840,13 +1884,14 @@ impl eframe::App for TorApp {
                 frame.wgpu_render_state(),
                 &self.popups,
                 capturing,
+                marks.as_ref(),
                 &mut actions,
             )
         });
         let uploaded = central.inner;
         self.plot_rect = Some(central.response.rect);
         let current = self.view.as_ref().map(|v| (v.file_id, &v.var.dims[..], &v.slider_pos[..]));
-        ui::popup::show_all(ui.ctx(), &mut self.popups, current, &mut actions);
+        ui::popup::show_all(ui.ctx(), &mut self.popups, current, marks.as_ref(), &mut actions);
         ui::windows::show_all(ui.ctx(), &mut self.windows, &self.settings, &self.renderer, &mut actions);
         if let Some(form) = self.calc.as_mut()
             && let Some(f) = self.files.iter().find(|f| f.id == form.file)
@@ -3130,5 +3175,55 @@ mod tests {
         h5.apply(Action::Select(Selection::File(1)));
         h5.command(Command::Extract);
         assert!(h5.extract.is_none());
+    }
+
+    #[test]
+    fn drawn_region_fills_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, "/ocean/uo".into())));
+        app.apply(Action::ExtractRegionDrawn { south: -10.0, north: 10.0, west: 5.0, east: 25.0 });
+        wait_extract(&mut app);
+        let f = app.extract.as_ref().expect("the window opens");
+        let r = f.region.as_ref().expect("region");
+        assert_eq!((r.south.as_str(), r.north.as_str(), r.west.as_str(), r.east.as_str()), ("-10", "10", "5", "25"));
+        assert_eq!(f.check.as_ref().expect("check ok").vars[0].count, [24, 10, 15]);
+    }
+
+    #[test]
+    fn dragged_time_fills_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, "/ocean/uo".into())));
+        app.apply(Action::ExtractTimeDragged { file: 1, from: 7.0, to: 3.0 });
+        wait_extract(&mut app);
+        let f = app.extract.as_ref().expect("the window opens");
+        assert_eq!((f.dims[0].from.as_str(), f.dims[0].to.as_str()), ("2000-01-01 03:00", "2000-01-01 07:00"));
+        assert_eq!(f.check.as_ref().expect("check ok").vars[0].count[0], 5);
+    }
+
+    #[test]
+    fn index_box_on_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_bare(dir.path()));
+        app.apply(Action::Select(Selection::Var(1, "/data".into())));
+        assert_eq!(app.view.as_ref().unwrap().kind, ViewKind::Image);
+        app.apply(Action::ExtractIndexBoxDrawn { y: (1, 2), x: (0, 3) });
+        wait_extract(&mut app);
+        let f = app.extract.as_ref().expect("the window opens");
+        let rows: Vec<(&str, &str, &str)> = f.dims.iter().map(|r| (r.label.as_str(), r.from.as_str(), r.to.as_str())).collect();
+        assert_eq!(rows, [("a", "1", "2"), ("b", "0", "3")]);
+        assert_eq!(f.check.as_ref().expect("check ok").vars[0].count, [2, 4]);
+    }
+
+    #[test]
+    fn drawn_box_on_lat_lon_image_sets_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_extract(dir.path());
+        // lat index 2..=4 is -5..-1; lon index 5..=7 is 5..7.
+        app.apply(Action::SetKind(ViewKind::Image));
+        app.apply(Action::ExtractIndexBoxDrawn { y: (2, 4), x: (5, 7) });
+        let r = app.extract.as_ref().unwrap().region.clone().unwrap();
+        assert_eq!((r.south.as_str(), r.north.as_str(), r.west.as_str(), r.east.as_str()), ("-5", "-1", "5", "7"));
     }
 }

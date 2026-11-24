@@ -197,8 +197,15 @@ pub struct ExtractForm {
     pub loading: Option<Job<FormCoords>>,
     /// The Save dialog, while open.
     pub dialog: Option<Job<Option<PathBuf>>>,
-    /// A region to use once coordinates arrive (from the map view).
-    pub pending_region: Option<RegionText>,
+    /// A region to use once coordinates arrive (map view or drawn box;
+    /// `true`: limit it to the grid).
+    pub pending_region: Option<(RegionText, bool)>,
+    /// A time range (axis values) dragged on a plot, waiting for coordinates.
+    pub pending_time: Option<(f64, f64)>,
+    /// Index ranges (first, last) drawn on an image, waiting for coordinates.
+    pub pending_index: Vec<(DimKey, usize, usize)>,
+    /// The y rows of a box drawn on a curvilinear image, until its x arrives.
+    curv_rows: Option<(usize, usize)>,
     /// The selection last checked.
     last: Option<XSelection>,
 }
@@ -218,6 +225,9 @@ impl ExtractForm {
             loading: None,
             dialog: None,
             pending_region: None,
+            pending_time: None,
+            pending_index: Vec::new(),
+            curv_rows: None,
             last: None,
         }
     }
@@ -250,16 +260,97 @@ impl ExtractForm {
             });
             self.dims.push(row);
         }
-        match &c.region {
-            None => self.region = None,
-            Some(_) if self.region.is_some() => {}
-            Some(_) => {
-                self.coords = Some(c);
-                self.region = self.pending_region.take().map(|r| self.clamped(r)).or_else(|| self.whole_region());
-                return;
+        let has_region = c.region.is_some();
+        self.coords = Some(c);
+        if !has_region {
+            self.region = None;
+        } else if self.region.is_none() {
+            self.region = self.whole_region();
+        }
+        self.apply_pending();
+    }
+
+    /// Applies what was drawn or asked for before the coordinates were
+    /// read (kept while they are being read).
+    pub fn apply_pending(&mut self) {
+        if self.coords_stale() {
+            return;
+        }
+        if let Some((r, clamp)) = self.pending_region.take()
+            && self.region.is_some()
+        {
+            self.region = Some(if clamp { self.clamped(r) } else { r });
+        }
+        if let Some((a, b)) = self.pending_time.take() {
+            let time = self.coords.as_ref().and_then(|c| c.dims.iter().find(|d| d.is_time));
+            if let Some(d) = time
+                && let Some(i) = self.dims.iter().position(|r| r.key == d.key)
+            {
+                let text = |v: f64| match (&d.values, &d.time) {
+                    (Some(_), Some(t)) => t.decode(v).to_string(),
+                    (Some(_), None) => fmt_num(v),
+                    (None, _) => (v.round().max(0.0) as usize).to_string(),
+                };
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                (self.dims[i].from, self.dims[i].to) = (text(a), text(b));
             }
         }
-        self.coords = Some(c);
+        for (key, a, b) in std::mem::take(&mut self.pending_index) {
+            let (a, b) = (a.min(b), a.max(b));
+            if let Some(i) = self.dims.iter().position(|r| r.key == key) {
+                if let (Some(x), Some(y)) = (self.text_at(&key, a), self.text_at(&key, b)) {
+                    (self.dims[i].from, self.dims[i].to) = (x, y);
+                }
+                continue;
+            }
+            self.index_to_region(&key, a, b);
+        }
+    }
+
+    /// A drawn index range along a region dimension becomes the region's
+    /// latitudes or longitudes (regular grids), or the lat/lon bounds of
+    /// the cells (curvilinear grids, once both y and x arrived).
+    fn index_to_region(&mut self, key: &DimKey, a: usize, b: usize) {
+        let Some(axes) = self.coords.as_ref().and_then(|c| c.region.as_ref()) else { return };
+        let Some(r) = self.region.as_mut() else { return };
+        match axes {
+            RegionAxes::Regular { lat, lon, lats, lons } => {
+                let (Some(&x), Some(&y)) = (if key == lat { lats } else { lons }.get(a), if key == lat { lats } else { lons }.get(b))
+                else {
+                    return;
+                };
+                let (lo, hi) = (x.min(y), x.max(y));
+                if key == lat {
+                    (r.south, r.north) = (fmt_num(lo), fmt_num(hi));
+                } else if key == lon {
+                    (r.west, r.east) = (fmt_num(lo), fmt_num(hi));
+                }
+            }
+            RegionAxes::Curvilinear { y, x, nx, lat, lon, .. } => {
+                // y arrives first; x completes the box.
+                if key == y {
+                    self.curv_rows = Some((a, b));
+                    return;
+                }
+                let (Some((y0, y1)), true) = (self.curv_rows.take(), key == x) else { return };
+                let mut pts = Vec::new();
+                for j in y0..=y1 {
+                    for i in a..=b {
+                        if let (Some(&la), Some(&lo)) = (lat.get(j * nx + i), lon.get(j * nx + i))
+                            && la.is_finite()
+                            && lo.is_finite()
+                        {
+                            pts.push((lo, la));
+                        }
+                    }
+                }
+                if pts.is_empty() {
+                    return;
+                }
+                let (s, n, w, e) = crate::view::extract::lonlat_bounds(&pts);
+                *r = RegionText { south: fmt_num(s), north: fmt_num(n), west: fmt_num(w), east: fmt_num(e) };
+            }
+        }
     }
 
     /// The whole grid's extent as region text.
@@ -360,5 +451,49 @@ impl ExtractForm {
         }
         parts.extend(self.dims.iter().filter(|r| !is_time(r) && cropped(&r.key)).map(row));
         if parts.is_empty() { "whole variables".into() } else { parts.join(", ") }
+    }
+}
+
+/// (south, north, west, east) of lon/lat points. Longitudes are taken the
+/// short way round, so a box across the date line stays narrow (east may
+/// then pass 180).
+pub fn lonlat_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    let f = |g: fn(f64, f64) -> f64, init: f64, sel: fn(&(f64, f64)) -> f64| points.iter().map(sel).fold(init, g);
+    let (s, n) = (f(f64::min, f64::INFINITY, |p| p.1), f(f64::max, f64::NEG_INFINITY, |p| p.1));
+    let (w, e) = (f(f64::min, f64::INFINITY, |p| p.0), f(f64::max, f64::NEG_INFINITY, |p| p.0));
+    if e - w <= 180.0 {
+        return (s, n, w, e);
+    }
+    // Shifting the western half by 360 gives the narrower box.
+    let shifted = |p: &(f64, f64)| if p.0 < 0.0 { p.0 + 360.0 } else { p.0 };
+    let w2 = points.iter().map(shifted).fold(f64::INFINITY, f64::min);
+    let e2 = points.iter().map(shifted).fold(f64::NEG_INFINITY, f64::max);
+    if e2 - w2 < e - w { (s, n, w2, e2) } else { (s, n, w, e) }
+}
+
+/// What the Extract window shows on the plots of its file.
+pub struct ExtractOverlay {
+    pub file: u64,
+    /// (south, north, west, east) as typed.
+    pub region: Option<[f64; 4]>,
+    /// Index ranges last checked, per dimension.
+    pub ranges: std::collections::BTreeMap<DimKey, (usize, usize)>,
+    /// The time dimension's name and its kept first and last axis values.
+    pub time: Option<(String, f64, f64)>,
+}
+
+impl ExtractForm {
+    pub fn overlay(&self) -> Option<ExtractOverlay> {
+        let sel = self.last.as_ref()?;
+        let region = self.region.as_ref().and_then(|r| {
+            let n = |t: &str| t.trim().parse::<f64>().ok();
+            Some([n(&r.south)?, n(&r.north)?, n(&r.west)?, n(&r.east)?])
+        });
+        let time = self.coords.as_ref()?.dims.iter().find(|d| d.is_time).and_then(|d| {
+            let &(s, c) = sel.ranges.get(&d.key)?;
+            let at = |i: usize| d.values.as_ref().map_or(i as f64, |v| v[i]);
+            Some((d.key.name.clone(), at(s), at(s + c - 1)))
+        });
+        Some(ExtractOverlay { file: self.file, region, ranges: sel.ranges.clone(), time })
     }
 }

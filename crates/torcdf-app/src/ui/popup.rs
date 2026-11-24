@@ -6,6 +6,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoints, VLine};
 
 use super::{fmt_value, slider_label};
 use crate::app::Action;
+use crate::view::extract::ExtractOverlay;
 use crate::view::popup::{Popup, PopupKind, PopupSet};
 
 /// Radius of a marker ring (points).
@@ -48,6 +49,7 @@ pub fn show_all(
     ctx: &egui::Context,
     set: &mut PopupSet,
     current: Option<Current<'_>>,
+    marks: Option<&ExtractOverlay>,
     actions: &mut Vec<Action>,
 ) {
     for p in &mut set.list {
@@ -56,7 +58,7 @@ pub fn show_all(
             .id(egui::Id::NULL.with(("popup", p.id)))
             .default_size([440.0, 330.0])
             .open(&mut open)
-            .show(ctx, |ui| contents(ui, p, current, actions));
+            .show(ctx, |ui| contents(ui, p, current, marks, actions));
         p.rect = shown.map(|r| r.response.rect);
         if !open {
             actions.push(Action::ClosePopup(p.id));
@@ -64,7 +66,13 @@ pub fn show_all(
     }
 }
 
-fn contents(ui: &mut egui::Ui, p: &mut Popup, current: Option<Current<'_>>, actions: &mut Vec<Action>) {
+fn contents(
+    ui: &mut egui::Ui,
+    p: &mut Popup,
+    current: Option<Current<'_>>,
+    marks: Option<&ExtractOverlay>,
+    actions: &mut Vec<Action>,
+) {
     ui.horizontal(|ui| {
         if p.kinds.len() > 1 {
             for (kind, name) in [(PopupKind::Series, "Series"), (PopupKind::Profile, "Profile")] {
@@ -94,7 +102,7 @@ fn contents(ui: &mut egui::Ui, p: &mut Popup, current: Option<Current<'_>>, acti
     if let Some(e) = &p.error {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
-    plot(ui, p, current, actions);
+    plot(ui, p, current, marks, actions);
 }
 
 /// The axis position of the current slider, when this pop-up's file and
@@ -124,7 +132,13 @@ fn points(axis: &[f64], values: &[Option<f32>], profile: bool, down: bool) -> Ve
         .collect()
 }
 
-fn plot(ui: &mut egui::Ui, p: &Popup, current: Option<Current<'_>>, actions: &mut Vec<Action>) {
+fn plot(
+    ui: &mut egui::Ui,
+    p: &Popup,
+    current: Option<Current<'_>>,
+    marks: Option<&ExtractOverlay>,
+    actions: &mut Vec<Action>,
+) {
     let profile = p.kind == PopupKind::Profile;
     let down = profile && p.down;
     let units = p.units.as_ref().map(|u| format!(" [{u}]")).unwrap_or_default();
@@ -145,6 +159,17 @@ fn plot(ui: &mut egui::Ui, p: &Popup, current: Option<Current<'_>>, actions: &mu
     };
     let (tick_x, tick_y, hover) = (tick.clone(), tick, axis_text);
     let mut plot = Plot::new(("popup-plot", p.id, profile)).height(240.0);
+    // A time series: Shift+drag sets the Extract window's time range.
+    let span_id = egui::Id::NULL.with(("extract-span-popup", p.id));
+    let on_time = !profile && p.time.is_some();
+    if on_time && super::extract::span_drag_active(ui, span_id) {
+        plot = plot.allow_drag(false);
+    }
+    let shown_span = marks
+        .filter(|o| on_time && o.file == p.file_id)
+        .and_then(|o| o.time.as_ref())
+        .filter(|(dim, _, _)| dim == p.along_name())
+        .map(|(_, a, b)| (*a, *b));
     plot = if profile {
         plot.x_axis_label(value_label)
             .y_axis_label(along.clone())
@@ -186,6 +211,11 @@ fn plot(ui: &mut egui::Ui, p: &Popup, current: Option<Current<'_>>, actions: &mu
             }
         }
     });
+    if on_time
+        && let Some((from, to)) = super::extract::plot_span(ui, span_id, &out, shown_span)
+    {
+        actions.push(Action::ExtractTimeDragged { file: p.file_id, from, to });
+    }
     if out.response.clicked()
         && let Some(pos) = out.response.interact_pointer_pos()
     {

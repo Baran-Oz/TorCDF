@@ -18,6 +18,7 @@ use crate::app::Action;
 use crate::ui::popup::draw_markers;
 use crate::view::popup::{Popup, PopupSet};
 use crate::view::var_view::{Display, Hover, Stats, VarView};
+use crate::view::extract::ExtractOverlay;
 
 /// The image panel's one GPU layer (layers are never freed, so the id is fixed).
 const IMAGE_LAYER_ID: u64 = 1;
@@ -34,6 +35,7 @@ pub fn show(
     rs: Option<&RenderState>,
     popups: &PopupSet,
     capturing: bool,
+    overlay: Option<&ExtractOverlay>,
     actions: &mut Vec<Action>,
 ) -> bool {
     let Some(v) = view else {
@@ -59,10 +61,10 @@ pub fn show(
         ui.colored_label(ui.visuals().warn_fg_color, p);
     }
     let uploaded = match v.kind {
-        ViewKind::Map => map_view::show(ui, v, display, rs, popups),
-        ViewKind::Image => image(ui, v, display, rs, popups),
+        ViewKind::Map => map_view::show(ui, v, display, rs, popups, overlay, actions),
+        ViewKind::Image => image(ui, v, display, rs, popups, overlay, actions),
         ViewKind::Line => {
-            line(ui, v);
+            line(ui, v, overlay, actions);
             false
         }
         ViewKind::Table => {
@@ -116,6 +118,8 @@ fn image(
     display: &Display,
     rs: Option<&RenderState>,
     popups: &PopupSet,
+    overlay: Option<&ExtractOverlay>,
+    actions: &mut Vec<Action>,
 ) -> bool {
     let Some(axes) = v.axes else {
         ui.weak("This variable has no two dimensions to draw as an image.");
@@ -173,7 +177,18 @@ fn image(
             fit(v)
         }
     };
-    if resp.dragged() {
+    // Shift+drag draws an Extract box (indices) instead of panning.
+    let (band, drawn) = super::extract::band(ui, &resp, &mut v.image.band, rect);
+    if let Some(r) = drawn {
+        let (a, b) = (view_point(r.min, rect, view, flip_y), view_point(r.max, rect, view, flip_y));
+        let (lx, hx, ly, hy) = (a.x.min(b.x), a.x.max(b.x), a.y.min(b.y), a.y.max(b.y));
+        if hx > 0.0 && hy > 0.0 && lx < nx as f32 && ly < ny as f32 {
+            let cell = |q: f32, n: usize| (q.max(0.0).floor() as usize).min(n - 1);
+            let (r0, r1, c0, c1) = (cell(ly, ny), cell(hy, ny), cell(lx, nx), cell(hx, nx));
+            actions.push(Action::ExtractIndexBoxDrawn { y: (y0 + r0 * sy, y0 + r1 * sy), x: (x0 + c0 * sx, x0 + c1 * sx) });
+        }
+    }
+    if resp.dragged() && band.is_none() && drawn.is_none() && v.image.band.is_none() {
         view = pan_view(view, resp.drag_delta(), rect.size(), flip_y);
         v.image.user_moved = true;
     }
@@ -226,6 +241,24 @@ fn image(
         Some(cell_centre_screen(r, c, rect, view, flip_y))
     };
     draw_markers(&ui.painter().with_clip_rect(rect), popups, v.file_id, v.plain_path(), &marker);
+    if let Some(o) = overlay.filter(|o| o.file == v.file_id) {
+        let key = |d: usize| v.nc.dim_key(v.plain_path(), &v.var.dims[d]);
+        let ry = key(axes.y).and_then(|k| o.ranges.get(&k).copied());
+        let rx = key(axes.x).and_then(|k| o.ranges.get(&k).copied());
+        if ry.is_some() || rx.is_some() {
+            let (ys, yc) = ry.unwrap_or((0, v.var.shape[axes.y]));
+            let (xs, xc) = rx.unwrap_or((0, v.var.shape[axes.x]));
+            let row = |i: usize| (i as f32 - y0 as f32) / sy.max(1) as f32;
+            let col = |i: usize| (i as f32 - x0 as f32) / sx.max(1) as f32;
+            let (r0, r1, c0, c1) = (row(ys), row(ys + yc), col(xs), col(xs + xc));
+            let edge = |r: f32, c: f32| Some(cell_edge_screen(r, c, rect, view, flip_y));
+            let pts = [edge(r0, c0), edge(r0, c1), edge(r1, c1), edge(r1, c0), edge(r0, c0)];
+            super::extract::paint_outline(ui, rect, &pts, false);
+        }
+    }
+    if let Some(r) = band {
+        super::extract::paint_band(ui, r);
+    }
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
     let arrow = reference_arrow(v, arrows_drawn);
@@ -315,7 +348,7 @@ fn coord_label(v: &VarView, d: usize, i: usize) -> String {
     slider_label(i, coord, time)
 }
 
-fn line(ui: &mut egui::Ui, v: &VarView) {
+fn line(ui: &mut egui::Ui, v: &VarView, overlay: Option<&ExtractOverlay>, actions: &mut Vec<Action>) {
     let Some(shown) = &v.shown else { return };
     if shown.line.is_empty() {
         ui.colored_label(ui.visuals().warn_fg_color, "All values missing");
@@ -331,10 +364,21 @@ fn line(ui: &mut egui::Ui, v: &VarView) {
     let name = v.var.name.clone();
     let ticks = time.clone();
     let mut plot = egui_plot::Plot::new(("line", &v.var.path));
+    // Along the time axis, Shift+drag sets the Extract window's time range.
+    let on_time = d.is_some() && d == v.time_dim;
+    let span_id = egui::Id::NULL.with(("extract-span", &v.var.path));
+    if on_time && super::extract::span_drag_active(ui, span_id) {
+        plot = plot.allow_drag(false);
+    }
+    let shown_span = overlay
+        .filter(|o| on_time && o.file == v.file_id)
+        .and_then(|o| o.time.as_ref())
+        .filter(|(dim, _, _)| d.is_some_and(|d| v.var.dims[d] == *dim))
+        .map(|(_, a, b)| (*a, *b));
     if let Some(t) = time.clone() {
         plot = plot.x_grid_spacer(move |input| super::time_grid(&t, input));
     }
-    plot.x_axis_label(x_label)
+    let out = plot.x_axis_label(x_label)
         .x_axis_formatter(move |m, _| match &ticks {
             Some(t) => super::time_tick(t, m.value, m.step_size),
             None => fmt_value(m.value),
@@ -351,6 +395,11 @@ fn line(ui: &mut egui::Ui, v: &VarView) {
         .show(ui, |plot| {
             plot.line(egui_plot::Line::new(name.clone(), egui_plot::PlotPoints::from(&shown.line[..])));
         });
+    if on_time
+        && let Some((from, to)) = super::extract::plot_span(ui, span_id, &out, shown_span)
+    {
+        actions.push(Action::ExtractTimeDragged { file: v.file_id, from, to });
+    }
 }
 
 fn table(ui: &mut egui::Ui, v: &VarView) {
@@ -492,6 +541,13 @@ fn cell_index(i: usize, start: usize, stride: usize, n: usize) -> Option<usize> 
     let stride = stride.max(1);
     let d = i.checked_sub(start)?;
     (d % stride == 0 && d / stride < n).then_some(d / stride)
+}
+
+/// Screen position of cell-space point (`row`, `col`) (a cell corner at whole numbers).
+pub fn cell_edge_screen(row: f32, col: f32, rect: Rect, view: Rect, flip_y: bool) -> Pos2 {
+    let u = (col - view.min.x) / view.width();
+    let v = if flip_y { (view.max.y - row) / view.height() } else { (row - view.min.y) / view.height() };
+    rect.min + Vec2::new(u, v) * rect.size()
 }
 
 /// Screen position of the centre of cell `(row, col)`; the inverse of `view_point`.
