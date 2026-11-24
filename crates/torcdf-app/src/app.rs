@@ -27,6 +27,7 @@ use crate::view::playback::{FPS_RANGE, Playback, Tick, frame_bytes};
 use crate::view::popup::{Popup, PopupKind, PopupSet};
 use crate::view::png_export;
 use crate::view::extract::ExtractForm;
+use crate::view::stats::{StatsForm, build_table};
 use crate::view::selection::{RegionText, SelectionForm, load_coords};
 use crate::view::var_view::{Display, ImageState, VarView};
 
@@ -255,10 +256,20 @@ pub enum Action {
     IndexBoxDrawn { y: (usize, usize), x: (usize, usize) },
     /// Shift+drag across a time series of `file`: axis values.
     TimeDragged { file: u64, from: f64, to: f64 },
+    /// Open the Statistics window for `file`, ticking `var` (else the variable on screen).
+    OpenStats { file: u64, var: Option<String> },
+    ComputeStats,
+    CancelStats,
+    CloseStats,
+    /// "Weight by cell area (cos latitude)".
+    SetWeighted(bool),
+    /// Put the results on the clipboard (tab-separated).
+    CopyStats,
+    SaveStatsCsv,
 }
 
 /// The two windows that hold a selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SelWin {
     Extract,
     Stats,
@@ -321,6 +332,8 @@ pub struct TorApp {
     pub extract: Option<ExtractForm>,
     /// The selection window used last (it gets Shift+drags and draws its overlays).
     pub last_sel: SelWin,
+    /// The Statistics window, when open.
+    pub stats: Option<StatsForm>,
 }
 
 /// The geometry to save from egui's view of the window. egui reports it
@@ -399,6 +412,7 @@ impl TorApp {
             calc: None,
             extract: None,
             last_sel: SelWin::Extract,
+            stats: None,
         };
         if let Loaded::Recovered(msg) = loaded {
             app.errors.push(msg);
@@ -478,6 +492,7 @@ impl TorApp {
 
     fn poll(&mut self) {
         self.poll_extract();
+        self.poll_stats();
         self.poll_popup_saves();
         let mut i = 0;
         while i < self.opening.len() {
@@ -905,6 +920,7 @@ impl TorApp {
                 self.files = kept;
                 // The window closes with its file, unless a save is running.
                 self.extract.take_if(|f| f.file == id && f.job.is_none() && f.dialog.is_none());
+                self.stats.take_if(|f| f.file == id && f.job.is_none() && f.csv_dialog.is_none());
                 self.arrow_layer.take_if(|l| l.file == id);
                 let view = self.view.take_if(|v| v.file_id == id);
                 if view.is_some() {
@@ -1237,7 +1253,7 @@ impl TorApp {
             }
             Action::FromSlider { win, row, end } => {
                 self.last_sel = win;
-                self.from_slider(win, row, end);
+                self.take_slider_step(win, row, end);
             }
             Action::RegionDrawn { south, north, west, east } => {
                 let Some(file) = self.view.as_ref().map(|v| v.file_id) else { return };
@@ -1270,6 +1286,29 @@ impl TorApp {
                 }
                 self.recheck_sel(w);
             }
+            Action::OpenStats { file, var } => self.open_stats(file, var),
+            Action::ComputeStats => self.compute_stats(),
+            Action::CancelStats => {
+                if let Some(j) = self.stats.as_ref().and_then(|f| f.job.as_ref()) {
+                    j.cancel();
+                }
+            }
+            Action::CloseStats => {
+                if let Some(j) = self.stats.take().and_then(|f| f.job) {
+                    j.cancel();
+                }
+            }
+            Action::SetWeighted(on) => {
+                if let Some(f) = self.stats.as_mut() {
+                    f.weighted = on;
+                }
+            }
+            Action::CopyStats => {
+                if let Some(t) = self.stats.as_ref().and_then(|f| f.table("	")) {
+                    self.ctx.copy_text(t);
+                }
+            }
+            Action::SaveStatsCsv => self.save_stats_csv_dialog(),
             Action::SaveExtract => self.save_extract_dialog(),
             Action::CancelExtract => {
                 if let Some(j) = self.extract.as_ref().and_then(|f| f.job.as_ref()) {
@@ -1328,6 +1367,7 @@ impl TorApp {
         // A save computes calculated variables as it goes; changing one
         // under it would mix old and new values in the file.
         let saving = self.extract.as_ref().is_some_and(|f| f.job.is_some())
+            || self.stats.as_ref().is_some_and(|f| f.job.is_some())
             || self.popups.list.iter().any(|p| p.nc_job.is_some());
         let Some(form) = self.calc.as_mut() else { return };
         if saving && form.replacing.is_some() {
@@ -1419,6 +1459,11 @@ impl TorApp {
             Command::Calculate => {
                 if let Some(id) = self.current_file() {
                     self.open_calculate(id, None);
+                }
+            }
+            Command::Statistics => {
+                if let Some(id) = self.current_file() {
+                    self.open_stats(id, None);
                 }
             }
             Command::Extract => {
@@ -1541,14 +1586,14 @@ impl TorApp {
     pub(crate) fn sel(&self, w: SelWin) -> Option<&SelectionForm> {
         match w {
             SelWin::Extract => self.extract.as_ref().map(|f| &f.sel),
-            SelWin::Stats => None,
+            SelWin::Stats => self.stats.as_ref().map(|f| &f.sel),
         }
     }
 
     fn sel_mut(&mut self, w: SelWin) -> Option<&mut SelectionForm> {
         match w {
             SelWin::Extract => self.extract.as_mut().map(|f| &mut f.sel),
-            SelWin::Stats => None,
+            SelWin::Stats => self.stats.as_mut().map(|f| &mut f.sel),
         }
     }
 
@@ -1573,7 +1618,7 @@ impl TorApp {
         if self.sel(w).is_none_or(|f| f.file != file) {
             match w {
                 SelWin::Extract => self.open_extract(file, None),
-                SelWin::Stats => {}
+                SelWin::Stats => self.open_stats(file, None),
             }
         }
         self.sel(w).is_some_and(|f| f.file == file).then_some(w)
@@ -1583,7 +1628,7 @@ impl TorApp {
     fn recheck_sel(&mut self, w: SelWin) {
         match w {
             SelWin::Extract => self.recheck_extract(),
-            SelWin::Stats => {}
+            SelWin::Stats => self.recheck_stats(),
         }
     }
 
@@ -1693,10 +1738,10 @@ impl TorApp {
     }
 
     /// Row `row` takes the step the view's slider of that dimension is at.
-    fn from_slider(&mut self, w: SelWin, row: usize, end: bool) {
+    fn take_slider_step(&mut self, w: SelWin, row: usize, end: bool) {
         let form = match w {
             SelWin::Extract => self.extract.as_mut().map(|f| &mut f.sel),
-            SelWin::Stats => None,
+            SelWin::Stats => self.stats.as_mut().map(|f| &mut f.sel),
         };
         let (Some(form), Some(v)) = (form, self.view.as_ref()) else { return };
         if v.file_id != form.file {
@@ -1711,6 +1756,128 @@ impl TorApp {
             form.dims[row].from = text;
         }
         self.recheck_sel(w);
+    }
+}
+
+/// The Statistics window.
+impl TorApp {
+    /// Opens the Statistics window for `file` (any file, plain HDF5 too),
+    /// ticking `var`, else the variable on screen. An open window for the
+    /// same file keeps its choices.
+    fn open_stats(&mut self, file: u64, var: Option<String>) {
+        let Some(f) = self.files.iter().find(|f| f.id == file) else { return };
+        let numeric = |p: &String| f.nc.var_info_any(p).is_some_and(|i| i.dtype.is_numeric());
+        let ticks: Vec<String> = self.default_ticks(file, var).into_iter().filter(numeric).collect();
+        let view_region = self.view_region();
+        self.last_sel = SelWin::Stats;
+        match self.stats.as_mut() {
+            Some(form) if form.file == file => form.ticked.extend(ticks),
+            Some(form) if form.job.is_some() => {
+                self.errors.push(format!("Statistics of {} are running; wait for them or cancel first.", form.file_name));
+                return;
+            }
+            _ => {
+                let mut form = StatsForm::new(file, f.name.clone(), ticks.into_iter().collect());
+                form.pending_region = view_region.map(|r| (r, true));
+                self.stats = Some(form);
+            }
+        }
+        self.recheck_stats();
+    }
+
+    /// Checks the Statistics window again (coordinates first).
+    fn recheck_stats(&mut self) {
+        let Some(form) = self.stats.as_mut() else { return };
+        let Some(f) = self.files.iter().find(|f| f.id == form.file) else { return };
+        if ensure_coords(&mut form.sel, &f.nc, &self.ctx) {
+            // Rows snap; a region Save would refuse is fine here.
+            let _ = form.sel.refresh();
+        }
+    }
+
+    /// Starts a run over the window's selection.
+    fn compute_stats(&mut self) {
+        self.recheck_stats();
+        let Some(form) = self.stats.as_mut() else { return };
+        if form.busy() {
+            return;
+        }
+        let Some(f) = self.files.iter().find(|f| f.id == form.file) else { return };
+        match form.stats_request(form.weighted) {
+            Ok(req) => {
+                form.status = None;
+                form.running = Some(req.clone());
+                form.job = Some(torcdf_core::stats::StatsJob::start(f.nc.clone(), req));
+                self.ctx.request_repaint();
+            }
+            Err(e) => form.status = Some(e),
+        }
+    }
+
+    /// Coordinates arriving, runs finishing and the CSV dialog closing.
+    fn poll_stats(&mut self) {
+        let Some(form) = self.stats.as_mut() else { return };
+        if poll_coords(&mut form.sel) {
+            self.recheck_stats();
+        }
+        let Some(form) = self.stats.as_mut() else { return };
+        if let Some(r) = form.csv_dialog.as_ref().and_then(|j| j.poll()) {
+            form.csv_dialog = None;
+            if let Ok(Some(path)) = r {
+                self.save_stats_csv(path);
+            }
+        }
+        let Some(form) = self.stats.as_mut() else { return };
+        let Some(job) = &form.job else { return };
+        match job.finished() {
+            Some(Ok(outcome)) => {
+                let req = form.running.take().unwrap_or_else(|| form.sel.stats_request(form.weighted).unwrap_or_else(|_| {
+                    torcdf_core::stats::StatsRequest { vars: Vec::new(), ranges: Default::default(), region: None, weighted: false }
+                }));
+                if let Some(f) = self.files.iter().find(|f| f.id == form.file) {
+                    let table = build_table(&f.nc, &form.sel, &req, &outcome);
+                    form.results = Some((req, table, outcome));
+                }
+                form.job = None;
+            }
+            Some(Err(e)) => {
+                form.status = Some(if e == "cancelled" { "Cancelled.".into() } else { format!("Statistics failed: {e}") });
+                form.running = None;
+                form.job = None;
+            }
+            None => self.ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+        }
+    }
+
+    /// Opens the Save dialog for the results as CSV.
+    fn save_stats_csv_dialog(&mut self) {
+        let Some(form) = self.stats.as_mut() else { return };
+        if form.results.is_none() || form.csv_dialog.is_some() {
+            return;
+        }
+        let src = self.files.iter().find(|f| f.id == form.file).map(|f| f.nc.meta.path.clone());
+        let stem = src.as_ref().and_then(|p| p.file_stem()).map_or_else(|| "statistics".into(), |s| s.to_string_lossy().into_owned());
+        let dir = src.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf);
+        let name = format!("{stem}_statistics.csv");
+        form.csv_dialog = Some(Job::spawn(&self.ctx, move || {
+            let mut d = rfd::FileDialog::new().set_title("Save the statistics as CSV").set_file_name(name).add_filter("CSV", &["csv"]);
+            if let Some(dir) = dir {
+                d = d.set_directory(dir);
+            }
+            d.save_file()
+        }));
+    }
+
+    /// Writes the results to `path` as CSV with a UTF-8 BOM.
+    pub(crate) fn save_stats_csv(&mut self, path: PathBuf) {
+        let Some(form) = self.stats.as_mut() else { return };
+        let Some(text) = form.table(",") else { return };
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(text.as_bytes());
+        form.status = Some(match std::fs::write(&path, bytes) {
+            Ok(()) => format!("Saved to {}", path.display()),
+            Err(e) => format!("Not saved: {e}"),
+        });
     }
 }
 
@@ -2115,6 +2282,16 @@ impl eframe::App for TorApp {
                 .unwrap_or_default();
             ui::extract::show(ui.ctx(), form, nc.as_deref(), &sliders, &mut actions);
         }
+        if let Some(form) = self.stats.as_mut() {
+            let nc = self.files.iter().find(|f| f.id == form.file).map(|f| f.nc.clone());
+            let sliders: Vec<torcdf_core::extract::DimKey> = self
+                .view
+                .as_ref()
+                .filter(|v| v.file_id == form.file)
+                .map(|v| v.slider_dims().into_iter().filter_map(|d| v.nc.dim_key(v.plain_path(), &v.var.dims[d])).collect())
+                .unwrap_or_default();
+            ui::stats::show(ui.ctx(), form, nc.as_deref(), &sliders, &mut actions);
+        }
         ui::drop_overlay(ui.ctx());
         // Detail reads start only after the map has planned them for a resting camera.
         if let Some(v) = &mut self.view {
@@ -2217,6 +2394,7 @@ impl TorApp {
             calc: None,
             extract: None,
             last_sel: SelWin::Extract,
+            stats: None,
         }
     }
 }
@@ -3526,5 +3704,120 @@ mod tests {
         assert_eq!(r.ranges.get(&f.dims[0].key), Some(&(0, 24)));
         assert_eq!(r.vars, ["/ocean/uo"]);
         assert!(r.weighted);
+    }
+
+    // ---- Statistics ----------------------------------------------------
+
+    /// Polls until the Statistics window has its coordinates and no run or dialog is open.
+    fn wait_stats(app: &mut TorApp) {
+        let start = Instant::now();
+        while app.stats.as_ref().is_some_and(|f| f.busy()) {
+            assert!(start.elapsed() < Duration::from_secs(20), "statistics timed out");
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll();
+        }
+    }
+
+    fn nc4_stats(dir: &Path) -> TorApp {
+        let mut app = uo_app(dir);
+        app.command(Command::Statistics);
+        wait_stats(&mut app);
+        app
+    }
+
+    #[test]
+    fn stats_opens_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_stats(dir.path());
+        let s = app.stats.as_ref().expect("Statistics open");
+        assert_eq!(s.ticked.iter().collect::<Vec<_>>(), ["/ocean/uo"]);
+        assert!(app.extract.is_none(), "Extract stays closed");
+        app.command(Command::Extract);
+        wait_extract(&mut app);
+        app.extract.as_mut().unwrap().dims[0].from = "2000-01-01 05:00".into();
+        app.apply(Action::SelectionEdited(SelWin::Extract));
+        assert_eq!(app.extract.as_ref().unwrap().dims[0].from, "2000-01-01 05:00");
+        assert_eq!(app.stats.as_ref().unwrap().dims[0].from, "2000-01-01 00:00");
+    }
+
+    #[test]
+    fn compute_fills_and_goes_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_stats(dir.path());
+        app.apply(Action::ComputeStats);
+        wait_stats(&mut app);
+        let s = app.stats.as_ref().unwrap();
+        let text = s.table("\t").expect("a table");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("# nc4.nc: "), "{}", lines[0]);
+        assert_eq!(lines[1], "statistic\tuo [m s-1]");
+        let mean = lines.iter().find(|l| l.starts_with("Mean\t")).expect("Mean row");
+        assert!(mean.ends_with(" (area-weighted)"), "{mean}");
+        assert!(lines.iter().any(|l| l.starts_with("Min at\t2000-01-01")), "{text}");
+        assert!(!s.out_of_date());
+        app.stats.as_mut().unwrap().dims[0].from = "2000-01-01 05:00".into();
+        app.apply(Action::SelectionEdited(SelWin::Stats));
+        assert!(app.stats.as_ref().unwrap().out_of_date());
+    }
+
+    #[test]
+    fn drag_goes_to_last_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        app.command(Command::Extract);
+        wait_extract(&mut app);
+        app.command(Command::Statistics);
+        wait_stats(&mut app);
+        let region = |f: &SelectionForm| f.region.clone().unwrap().south;
+        app.apply(Action::RegionDrawn { south: -5.0, north: 5.0, west: 2.0, east: 8.0 });
+        assert_eq!(region(app.stats.as_ref().unwrap()), "-5");
+        assert_eq!(region(app.extract.as_ref().unwrap()), "-9");
+        app.apply(Action::TouchSelection(SelWin::Extract));
+        app.apply(Action::RegionDrawn { south: -3.0, north: 5.0, west: 2.0, east: 8.0 });
+        assert_eq!(region(app.extract.as_ref().unwrap()), "-3");
+        assert_eq!(region(app.stats.as_ref().unwrap()), "-5");
+    }
+
+    #[test]
+    fn hdf5_file_statistics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::hdf5::write_hidden_h5(dir.path()));
+        app.apply(Action::OpenStats { file: 1, var: Some("/a".into()) });
+        wait_stats(&mut app);
+        app.apply(Action::ComputeStats);
+        wait_stats(&mut app);
+        let text = app.stats.as_ref().unwrap().table("\t").unwrap();
+        let mean = text.lines().find(|l| l.starts_with("Mean\t")).unwrap();
+        assert_eq!(mean, "Mean\t1.25");
+        app.apply(Action::Select(Selection::File(1)));
+        app.command(Command::Extract);
+        assert!(app.extract.is_none());
+    }
+
+    #[test]
+    fn csv_has_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_stats(dir.path());
+        app.apply(Action::ComputeStats);
+        wait_stats(&mut app);
+        let out = dir.path().join("stats.csv");
+        app.save_stats_csv(out.clone());
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert!(String::from_utf8_lossy(&bytes).contains("\nValid,"));
+    }
+
+    #[test]
+    fn edit_refused_while_computing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = nc4_stats(dir.path());
+        let b = derive(&app, "b", "uo*2");
+        app.apply(Action::ComputeStats);
+        app.apply(Action::OpenCalculate { file: 1, edit: Some(b.clone()) });
+        fill(&mut app, "b", "uo*3", "");
+        app.apply(Action::CreateDerived);
+        assert!(app.calc.as_ref().is_some_and(|f| f.check.is_err()));
+        assert_eq!(app.files[0].nc.derived(&b).unwrap().formula, "uo*2");
+        wait_stats(&mut app);
     }
 }

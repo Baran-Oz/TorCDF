@@ -7,15 +7,16 @@ use torcdf_core::extract::DimKey;
 
 use crate::app::{Action, SelWin};
 use crate::view::extract::ExtractForm;
+use crate::view::selection::SelectionForm;
 
 /// Variables offered: the file's (coordinate variables are kept
 /// automatically, so not listed) and its calculated ones.
-fn offered(nc: &NcFile) -> Vec<(String, String)> {
+pub(crate) fn offered(nc: &NcFile, numeric_only: bool) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = nc
         .meta
         .all_vars()
         .into_iter()
-        .filter(|v| !(v.dims.len() == 1 && v.dims[0] == v.name))
+        .filter(|v| !(v.dims.len() == 1 && v.dims[0] == v.name) && (!numeric_only || v.dtype.is_numeric()))
         .map(|v| (v.path.clone(), v.path.trim_start_matches('/').to_string()))
         .collect();
     out.extend(nc.derived_vars().iter().map(|d| (d.path.clone(), format!("ƒ {}", d.path.trim_start_matches('/')))));
@@ -53,7 +54,8 @@ fn contents(ui: &mut egui::Ui, form: &mut ExtractForm, nc: Option<&NcFile>, slid
     });
     let running = form.job.is_some();
     if let Some(nc) = nc {
-        ui.add_enabled_ui(!running, |ui| fields(ui, form, nc, sliders, actions));
+        let heading = "Variables (their coordinates are always kept)";
+        ui.add_enabled_ui(!running, |ui| selection_fields(ui, &mut form.sel, offered(nc, false), sliders, SelWin::Extract, heading, actions));
     } else {
         ui.weak("The file was closed.");
     }
@@ -95,11 +97,21 @@ fn contents(ui: &mut egui::Ui, form: &mut ExtractForm, nc: Option<&NcFile>, slid
     }
 }
 
-fn fields(ui: &mut egui::Ui, form: &mut ExtractForm, nc: &NcFile, sliders: &[DimKey], actions: &mut Vec<Action>) {
-    ui.label("Variables (their coordinates are always kept)");
-    egui::ScrollArea::vertical().id_salt("extract vars").max_height(140.0).show(ui, |ui| {
+/// The selection rows shared by the Extract and Statistics windows: variable
+/// ticks (`offered`: path, label), From/To rows, the region and its buttons.
+pub fn selection_fields(
+    ui: &mut egui::Ui,
+    form: &mut SelectionForm,
+    offered: Vec<(String, String)>,
+    sliders: &[DimKey],
+    win: SelWin,
+    heading: &str,
+    actions: &mut Vec<Action>,
+) {
+    ui.label(heading);
+    egui::ScrollArea::vertical().id_salt(("selection vars", win)).max_height(140.0).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            for (path, label) in offered(nc) {
+            for (path, label) in offered {
                 let mut on = form.ticked.contains(&path);
                 if ui.checkbox(&mut on, label).changed() {
                     if on {
@@ -107,7 +119,7 @@ fn fields(ui: &mut egui::Ui, form: &mut ExtractForm, nc: &NcFile, sliders: &[Dim
                     } else {
                         form.ticked.remove(&path);
                     }
-                    actions.push(Action::SelectionEdited(SelWin::Extract));
+                    actions.push(Action::SelectionEdited(win));
                 }
             }
         });
@@ -125,7 +137,7 @@ fn fields(ui: &mut egui::Ui, form: &mut ExtractForm, nc: &NcFile, sliders: &[Dim
                     ui.label(if end { "To" } else { "From" });
                     edited |= ui.add(egui::TextEdit::singleline(text).desired_width(130.0)).lost_focus();
                     if slider && ui.small_button("◀ slider").on_hover_text("Use the slider's step").clicked() {
-                        actions.push(Action::FromSlider { win: SelWin::Extract, row: i, end });
+                        actions.push(Action::FromSlider { win, row: i, end });
                     }
                 });
             }
@@ -157,15 +169,15 @@ fn fields(ui: &mut egui::Ui, form: &mut ExtractForm, nc: &NcFile, sliders: &[Dim
     if form.region.is_some() {
         ui.horizontal(|ui| {
             if ui.button("Use current map view").clicked() {
-                actions.push(Action::UseView(SelWin::Extract));
+                actions.push(Action::UseView(win));
             }
             if ui.button("Whole grid").clicked() {
-                actions.push(Action::WholeGrid(SelWin::Extract));
+                actions.push(Action::WholeGrid(win));
             }
         });
     }
     if edited {
-        actions.push(Action::SelectionEdited(SelWin::Extract));
+        actions.push(Action::SelectionEdited(win));
     }
     ui.weak("Tip: Shift+drag on the map to draw the region; Shift+drag on a time series to set the time range.");
 }

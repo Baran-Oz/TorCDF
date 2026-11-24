@@ -22,11 +22,12 @@ pub enum Command {
     ShortcutHelp,
     Calculate,
     Extract,
+    Statistics,
 }
 
 impl Command {
     #[cfg(test)]
-    pub const ALL: [Command; 15] = [
+    pub const ALL: [Command; 16] = [
         Command::Open,
         Command::CloseFile,
         Command::ExportPng,
@@ -42,6 +43,7 @@ impl Command {
         Command::ShortcutHelp,
         Command::Calculate,
         Command::Extract,
+        Command::Statistics,
     ];
 }
 
@@ -60,6 +62,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut { cmd: Command::Settings, keys: "Ctrl+,", label: "Settings" },
     Shortcut { cmd: Command::Calculate, keys: "Ctrl+K", label: "Calculate new variable" },
     Shortcut { cmd: Command::Extract, keys: "Ctrl+Shift+E", label: "Extract (crop and save)" },
+    Shortcut { cmd: Command::Statistics, keys: "Ctrl+I", label: "Statistics" },
     Shortcut { cmd: Command::StepBack, keys: "←", label: "Previous time step" },
     Shortcut { cmd: Command::StepForward, keys: "→", label: "Next time step" },
     Shortcut { cmd: Command::FirstStep, keys: "Home", label: "First time step" },
@@ -83,13 +86,14 @@ pub fn keys_of(cmd: Command) -> &'static str {
 /// Call before the panels draw.
 pub fn pressed(ctx: &egui::Context) -> Vec<Command> {
     use egui::{Key, Modifiers};
-    let ctrl: [(Key, Command); 6] = [
+    let ctrl: [(Key, Command); 7] = [
         (Key::O, Command::Open),
         (Key::W, Command::CloseFile),
         (Key::E, Command::ExportPng),
         (Key::Comma, Command::Settings),
         (Key::Num0, Command::Fit),
         (Key::K, Command::Calculate),
+        (Key::I, Command::Statistics),
     ];
     let plain: [(Key, Command); 7] = [
         (Key::ArrowLeft, Command::StepBack),
@@ -299,5 +303,12 @@ mod tests {
         assert_eq!(keys_of(Command::Settings), "Ctrl+,");
         assert_eq!(keys_of(Command::Fit), "Ctrl+0");
         assert_eq!(keys_of(Command::ShortcutHelp), "F1");
+    }
+
+    #[test]
+    fn ctrl_i_statistics() {
+        let (got, _) = press(vec![key(egui::Key::I, egui::Modifiers::COMMAND)], false);
+        assert_eq!(got, vec![Command::Statistics]);
+        assert_eq!(keys_of(Command::Statistics), "Ctrl+I");
     }
 }

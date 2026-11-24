@@ -2,6 +2,7 @@
 
 pub mod calc;
 pub mod extract;
+pub mod stats;
 pub mod colorbar;
 pub mod inspector;
 pub mod map_view;
@@ -68,6 +69,12 @@ pub fn menu_bar(
             if r.clicked() {
                 if let Some(id) = current_file {
                     actions.push(Action::OpenExtract { file: id, var: None });
+                }
+                ui.close();
+            }
+            if ui.add_enabled(current_file.is_some(), item("Statistics…", Command::Statistics)).clicked() {
+                if let Some(id) = current_file {
+                    actions.push(Action::OpenStats { file: id, var: None });
                 }
                 ui.close();
             }

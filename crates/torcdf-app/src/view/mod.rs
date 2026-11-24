@@ -8,4 +8,5 @@ pub mod click;
 pub mod playback;
 pub mod png_export;
 pub mod extract;
+pub mod stats;
 pub mod selection;

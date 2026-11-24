@@ -93,7 +93,13 @@ fn group_body(
         if r.clicked() {
             actions.push(Action::Select(s));
         }
-        r.context_menu(|ui| extract_item(ui, file, &v.path, actions));
+        r.context_menu(|ui| {
+            extract_item(ui, file, &v.path, actions);
+            if v.dtype.is_numeric() && ui.button("Statistics…").clicked() {
+                actions.push(Action::OpenStats { file: file.id, var: Some(v.path.clone()) });
+                ui.close();
+            }
+        });
     }
     // Calculated variables of this group.
     for d in file.nc.derived_vars().iter().filter(|d| parent(&d.path) == g.path) {
@@ -110,6 +116,10 @@ fn group_body(
                 ui.close();
             }
             extract_item(ui, file, &d.path, actions);
+            if ui.button("Statistics…").clicked() {
+                actions.push(Action::OpenStats { file: file_id, var: Some(d.path.clone()) });
+                ui.close();
+            }
             if ui.button("Delete").clicked() {
                 actions.push(Action::DeleteDerived { file: file_id, path: d.path.clone() });
                 ui.close();

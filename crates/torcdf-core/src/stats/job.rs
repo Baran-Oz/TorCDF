@@ -74,6 +74,9 @@ struct Geom {
     lonlat: Vec<(f64, f64)>,
 }
 
+/// (y dim, x dim, latitudes, longitudes, regular grid?).
+type GeoAxes = (usize, usize, Vec<f64>, Vec<f64>, bool);
+
 /// What one variable reads.
 struct Prepared {
     path: String,
@@ -115,8 +118,9 @@ fn prepare(file: &NcFile, path: &str, req: &StatsRequest) -> Result<Prepared, St
     }
     let ds = file.meta_with_derived();
     let read = |p: &str| file.read_coord(p).map_err(|e| e.to_string());
-    // (y dim, x dim, full lat over (y, x), full lon, full nx), regular or curvilinear.
-    let geo: Option<(usize, usize, Vec<f64>, Vec<f64>, bool)> = match detect_geo(&ds, &info) {
+    // (y dim, x dim, latitudes, longitudes, regular?): regular grids hold 1-D
+    // axes, curvilinear ones the full (y, x) planes.
+    let geo: Option<GeoAxes> = match detect_geo(&ds, &info) {
         Geo::Regular { lat_dim, lon_dim, lat_var, lon_var } => Some((lat_dim, lon_dim, read(&lat_var)?, read(&lon_var)?, true)),
         Geo::Curvilinear { y_dim, x_dim, lat_var, lon_var } => {
             let (yn, xn) = (&info.dims[y_dim], &info.dims[x_dim]);
