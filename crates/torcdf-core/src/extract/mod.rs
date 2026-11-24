@@ -3,7 +3,7 @@
 
 mod plan;
 pub mod range;
-mod write;
+pub(crate) mod write;
 
 pub use write::{ExtractJob, history_line, write_extract};
 

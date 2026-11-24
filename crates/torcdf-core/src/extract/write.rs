@@ -228,7 +228,7 @@ fn temp_paths(out: &Path) -> Result<(PathBuf, PathBuf), String> {
 
 /// Pieces of a `count`-shaped block of at most `budget` bytes (at least one
 /// value each): (offset, count) per piece, in row-major order.
-fn slabs(count: &[usize], elem: usize, budget: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
+pub(crate) fn slabs(count: &[usize], elem: usize, budget: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
     let n = count.len();
     if n == 0 {
         return vec![(vec![], vec![])];

@@ -2,5 +2,7 @@
 //! spread, percentiles and a histogram.
 
 mod acc;
+mod job;
 
 pub use acc::*;
+pub use job::*;

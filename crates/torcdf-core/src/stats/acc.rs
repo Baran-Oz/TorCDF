@@ -91,27 +91,33 @@ pub fn exact_percentiles(values: &mut [f32], ps: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// Percentiles from `counts` of equal bins spanning [lo, hi], linear within a bin.
+/// Percentiles from `counts` of equal bins spanning [lo, hi]. As numpy's
+/// linear method, between the two neighbouring sorted values; each of
+/// those is placed inside its own bin, so the error stays within a bin.
 pub fn hist_percentiles(counts: &[u64], lo: f64, hi: f64, ps: &[f64]) -> Vec<f64> {
     let total: u64 = counts.iter().sum();
     if total == 0 || counts.is_empty() {
         return Vec::new();
     }
     let width = (hi - lo) / counts.len() as f64;
+    // The k-th smallest value (0-based), spread evenly through its bin.
+    let nth = |k: u64| {
+        let mut before = 0u64;
+        for (i, &c) in counts.iter().enumerate() {
+            if k < before + c {
+                let frac = ((k - before) as f64 + 0.5) / c as f64;
+                return (lo + (i as f64 + frac) * width).clamp(lo, hi);
+            }
+            before += c;
+        }
+        hi
+    };
     ps.iter()
         .map(|p| {
-            // 0-based rank, as numpy's linear method.
             let rank = p / 100.0 * (total - 1) as f64;
-            let mut before = 0.0;
-            for (i, &c) in counts.iter().enumerate() {
-                let c = c as f64;
-                if c > 0.0 && rank < before + c {
-                    let frac = (rank - before + 0.5) / c;
-                    return (lo + (i as f64 + frac) * width).clamp(lo, hi);
-                }
-                before += c;
-            }
-            hi
+            let k = rank.floor() as u64;
+            let (a, b) = (nth(k), nth((k + 1).min(total - 1)));
+            a + (b - a) * (rank - k as f64)
         })
         .collect()
 }
