@@ -263,6 +263,27 @@ pub struct TorApp {
     scroll_tree: bool,
 }
 
+/// The geometry to save from egui's view of the window. egui reports it
+/// in points divided by the text `zoom`; the window is rebuilt at zoom 1,
+/// so the zoom is undone here. While maximised, the size and position
+/// from before (`prev`) are kept.
+fn window_geom(
+    outer: Option<egui::Rect>,
+    inner: Option<egui::Rect>,
+    maximized: bool,
+    zoom: f32,
+    prev: Option<WindowGeom>,
+) -> Option<WindowGeom> {
+    match (maximized, inner) {
+        (false, Some(inner)) => Some(WindowGeom {
+            pos: outer.map(|o| [o.min.x * zoom, o.min.y * zoom]),
+            size: [inner.width() * zoom, inner.height() * zoom],
+            maximized: false,
+        }),
+        _ => prev.map(|g| WindowGeom { maximized, ..g }),
+    }
+}
+
 /// The colour settings a new window starts with.
 fn initial_display(s: &Settings) -> Display {
     Display { colormap: s.plot.colormap, log: false, lock: false, range: (0.0, 1.0) }
@@ -378,18 +399,10 @@ impl TorApp {
         let (outer, inner, maximized) =
             self.ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect, i.viewport().maximized));
         let Some(maximized) = maximized else { return };
-        let prev = self.last_geom;
-        self.last_geom = Some(match (maximized, inner) {
-            (false, Some(inner)) => WindowGeom {
-                pos: outer.map(|o| [o.min.x, o.min.y]),
-                size: [inner.width(), inner.height()],
-                maximized: false,
-            },
-            _ => match prev {
-                Some(g) => WindowGeom { maximized, ..g },
-                None => return,
-            },
-        });
+        let zoom = self.ctx.zoom_factor();
+        if let Some(g) = window_geom(outer, inner, maximized, zoom, self.last_geom) {
+            self.last_geom = Some(g);
+        }
     }
 
     /// Opens `path` on a helper thread.
@@ -2104,6 +2117,19 @@ mod tests {
         app.command(Command::ShortcutHelp);
         app.command(Command::Settings);
         assert!(app.windows.shortcuts && app.windows.settings);
+    }
+
+    #[test]
+    fn window_geometry_undoes_text_zoom() {
+        // egui reports the window in zoomed points; the builder at start-up
+        // works at zoom 1, so geometry is saved at zoom 1.
+        let r = |x: f32, y: f32, w: f32, h: f32| Some(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)));
+        let g = window_geom(r(80.0, 40.0, 820.0, 580.0), r(84.0, 72.0, 800.0, 560.0), false, 1.25, None).unwrap();
+        assert_eq!(g, WindowGeom { pos: Some([100.0, 50.0]), size: [1000.0, 700.0], maximized: false });
+        // Maximised: the size from before stays.
+        let m = window_geom(r(0.0, 0.0, 2000.0, 1000.0), r(0.0, 0.0, 2000.0, 1000.0), true, 1.0, Some(g)).unwrap();
+        assert_eq!(m, WindowGeom { maximized: true, ..g });
+        assert_eq!(window_geom(None, None, true, 1.0, None), None);
     }
 
     #[test]

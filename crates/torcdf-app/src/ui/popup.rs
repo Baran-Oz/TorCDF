@@ -12,7 +12,20 @@ use crate::view::popup::{Popup, PopupKind, PopupSet};
 const MARKER_RADIUS: f32 = 4.0;
 const EAST: Color32 = Color32::from_rgb(214, 90, 60);
 const NORTH: Color32 = Color32::from_rgb(60, 140, 214);
-const MAIN: Color32 = Color32::from_rgb(70, 70, 70);
+
+#[cfg(test)]
+mod look_tests {
+    use super::*;
+    use crate::ui::theme::{DARK, LIGHT, contrast_ratio, style_for};
+
+    #[test]
+    fn series_line_visible_in_both_looks() {
+        for (dark, p) in [(false, &LIGHT), (true, &DARK)] {
+            let v = style_for(p, dark).visuals;
+            assert!(contrast_ratio(main_colour(&v), v.window_fill) >= 3.0, "dark {dark}");
+        }
+    }
+}
 const NOW: Color32 = Color32::from_gray(150);
 
 /// Index of the value in `axis` closest to `v` (the first of equals).
@@ -140,12 +153,13 @@ fn plot(ui: &mut egui::Ui, p: &Popup, current: Option<Current<'_>>, actions: &mu
         Some(format!("{along} = {}\nvalue = {}", hover(a), fmt_value(val)))
     });
     let mark = current_axis_value(p, current);
+    let main = main_colour(ui.visuals());
     let out = plot.show(ui, |plot_ui| {
         let mut line = |name: &str, values: &[Option<f32>], colour: Color32| {
             let pts = points(&p.axis, values, profile, down);
             plot_ui.line(Line::new(name.to_string(), PlotPoints::from(pts)).color(colour));
         };
-        line(&p.var_name, &p.values, MAIN);
+        line(&p.var_name, &p.values, main);
         if p.show_east {
             line("East", &p.east, EAST);
         }
@@ -207,4 +221,9 @@ mod tests {
         assert_eq!(points(&axis, &v, true, true), vec![[5.0, -1.0], [7.0, -3.0]]);
         assert_eq!(points(&axis, &v, false, false), vec![[1.0, 5.0], [3.0, 7.0]]);
     }
+}
+
+/// The series line: the look's text colour, readable on light and dark.
+fn main_colour(v: &egui::Visuals) -> Color32 {
+    v.text_color()
 }

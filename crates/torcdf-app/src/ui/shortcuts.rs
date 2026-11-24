@@ -70,8 +70,11 @@ pub fn keys_of(cmd: Command) -> &'static str {
 }
 
 /// The commands pressed this frame, consumed so no widget also acts on
-/// them. Keys without Ctrl act only while no text field has focus, so
-/// typing in one stays typing. Call before the panels draw.
+/// them. Keys without Ctrl act only while no widget has keyboard focus
+/// (a text field being typed in, or a Tab-focused checkbox) and no menu or
+/// drop-down list is open (those navigate with the arrows and Space).
+/// Clicking does not give focus in egui, so mouse users always get them.
+/// Call before the panels draw.
 pub fn pressed(ctx: &egui::Context) -> Vec<Command> {
     use egui::{Key, Modifiers};
     let ctrl: [(Key, Command); 5] = [
@@ -90,7 +93,7 @@ pub fn pressed(ctx: &egui::Context) -> Vec<Command> {
         (Key::ArrowUp, Command::PrevVar),
         (Key::ArrowDown, Command::NextVar),
     ];
-    let typing = ctx.text_edit_focused();
+    let busy = ctx.memory(|m| m.focused().is_some()) || egui::Popup::is_any_open(ctx);
     ctx.input_mut(|i| {
         let mut out = Vec::new();
         for (k, c) in ctrl {
@@ -101,7 +104,7 @@ pub fn pressed(ctx: &egui::Context) -> Vec<Command> {
         if i.consume_key(Modifiers::NONE, Key::F1) {
             out.push(Command::ShortcutHelp);
         }
-        if !typing {
+        if !busy {
             for (k, c) in plain {
                 if i.consume_key(Modifiers::NONE, k) {
                     out.push(c);
@@ -188,6 +191,47 @@ mod tests {
         .textures_delta
         .clear();
         (got, left)
+    }
+
+    #[test]
+    fn focused_button_keeps_plain_keys() {
+        // A Tab-focused button or checkbox: Space and arrows stay egui's.
+        let ctx = egui::Context::default();
+        let draw = |ui: &mut egui::Ui| {
+            let r = ui.button("Loop");
+            r.request_focus();
+        };
+        ctx.run_ui(Default::default(), draw).textures_delta.clear();
+        let mut got = Vec::new();
+        let input = egui::RawInput { events: vec![key(egui::Key::Space, egui::Modifiers::NONE)], ..Default::default() };
+        ctx.run_ui(input, |ui| {
+            got = pressed(ui.ctx());
+            draw(ui);
+        })
+        .textures_delta
+        .clear();
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn open_popup_keeps_plain_keys() {
+        // An open menu or drop-down list navigates with the arrows itself.
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("menu");
+        let draw = |ui: &mut egui::Ui| {
+            egui::Popup::open_id(ui.ctx(), id);
+        };
+        ctx.run_ui(Default::default(), draw).textures_delta.clear();
+        let mut got = Vec::new();
+        let input =
+            egui::RawInput { events: vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)], ..Default::default() };
+        ctx.run_ui(input, |ui| {
+            got = pressed(ui.ctx());
+            draw(ui);
+        })
+        .textures_delta
+        .clear();
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
