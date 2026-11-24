@@ -16,7 +16,7 @@ use torcdf_core::{
     VectorPair, default_cache_budget_bytes, layer_path, pair_by_hand, pair_magdir_by_hand,
 };
 
-use crate::settings::{Loaded, Look, PlotDefaults, Settings, TextSize, WindowGeom};
+use crate::settings::{Loaded, Look, PlotDefaults, RecentFormula, Settings, TextSize, WindowGeom};
 use crate::ui::shortcuts::{self, Command};
 use crate::ui::windows::{Win, Windows};
 use crate::ui::inspector::{PanelInput, PanelTab};
@@ -159,6 +159,18 @@ pub enum Selection {
     Var(u64, String),
 }
 
+/// The Calculate window's fields.
+pub struct CalcForm {
+    pub file: u64,
+    pub name: String,
+    pub formula: String,
+    pub units: String,
+    /// The calculated variable being edited.
+    pub replacing: Option<String>,
+    /// The result's description, or what is wrong.
+    pub check: Result<String, String>,
+}
+
 /// What the panels asked for this frame; applied after drawing.
 pub enum Action {
     OpenDialog,
@@ -212,6 +224,13 @@ pub enum Action {
     OpenCalculate { file: u64, edit: Option<String> },
     /// Remove a calculated variable (refused while something uses it).
     DeleteDerived { file: u64, path: String },
+    /// A field of the Calculate window changed: check again.
+    CalcEdited,
+    /// The Calculate window's Create (or Apply when editing).
+    CreateDerived,
+    CloseCalculate,
+    /// Fill the Calculate window from recent formula `i`.
+    UseRecentFormula(usize),
 }
 
 fn file_name(p: &Path) -> String {
@@ -265,6 +284,8 @@ pub struct TorApp {
     renderer: String,
     /// Scroll the tree to the selection next frame (it moved by keyboard).
     scroll_tree: bool,
+    /// The Calculate window, when open.
+    pub calc: Option<CalcForm>,
 }
 
 /// The geometry to save from egui's view of the window. egui reports it
@@ -340,6 +361,7 @@ impl TorApp {
             windows: Windows::default(),
             renderer: "none".into(),
             scroll_tree: false,
+            calc: None,
         };
         if let Loaded::Recovered(msg) = loaded {
             app.errors.push(msg);
@@ -1135,9 +1157,106 @@ impl TorApp {
                 self.settings.recent.truncate(self.settings.recent_max);
                 self.apply_look_and_save();
             }
-            Action::OpenCalculate { .. } => {}
+            Action::OpenCalculate { file, edit } => self.open_calculate(file, edit.as_deref()),
+            Action::CalcEdited => self.recheck_calc(),
+            Action::CreateDerived => self.create_derived(),
+            Action::CloseCalculate => self.calc = None,
+            Action::UseRecentFormula(i) => {
+                if let (Some(form), Some(r)) = (self.calc.as_mut(), self.settings.recent_formulas.get(i)) {
+                    if form.replacing.is_none() {
+                        form.name = r.name.clone();
+                    }
+                    form.formula = r.formula.clone();
+                    form.units = r.units.clone();
+                }
+                self.recheck_calc();
+            }
             Action::DeleteDerived { file, path } => self.delete_derived(file, &path),
         }
+    }
+
+    /// Opens the Calculate window for `file`: empty, or filled from the
+    /// calculated variable `edit`.
+    fn open_calculate(&mut self, file: u64, edit: Option<&str>) {
+        let Some(f) = self.files.iter().find(|f| f.id == file) else { return };
+        let mut form = CalcForm {
+            file,
+            name: String::new(),
+            formula: String::new(),
+            units: String::new(),
+            replacing: None,
+            check: Err(String::new()),
+        };
+        if let Some(d) = edit.and_then(|p| f.nc.derived(p)) {
+            form.name = d.name.clone();
+            form.formula = d.formula.clone();
+            form.units = d.units.clone().unwrap_or_default();
+            form.replacing = Some(d.path.clone());
+        }
+        self.calc = Some(form);
+        self.recheck_calc();
+    }
+
+    /// Checks the Calculate window's formula again (metadata only).
+    fn recheck_calc(&mut self) {
+        let Some(form) = self.calc.as_mut() else { return };
+        let Some(f) = self.files.iter().find(|f| f.id == form.file) else { return };
+        form.check = match f.nc.check_formula(&form.name, &form.formula, Some(&form.units), form.replacing.as_deref()) {
+            Ok(d) => {
+                let shape: Vec<String> = d.info.shape.iter().map(usize::to_string).collect();
+                Ok(format!("{} ({})  {}", d.name, d.info.dims.join(", "), shape.join(" × ")))
+            }
+            Err(e) => Err(e.to_string()),
+        };
+    }
+
+    /// Registers the Calculate window's variable (or the edit of one), shows
+    /// it and closes the window. After an edit nothing computed from the
+    /// old formula stays: cached slices go, pop-ups of it close and the view
+    /// is rebuilt.
+    fn create_derived(&mut self) {
+        let Some(form) = self.calc.as_mut() else { return };
+        let Some(f) = self.files.iter().find(|f| f.id == form.file) else {
+            self.calc = None;
+            return;
+        };
+        let nc = f.nc.clone();
+        let d = match nc.check_formula(&form.name, &form.formula, Some(&form.units), form.replacing.as_deref()) {
+            Ok(d) => d,
+            Err(e) => {
+                form.check = Err(e.to_string());
+                return;
+            }
+        };
+        let (file, path, editing) = (form.file, d.path.clone(), form.replacing.is_some());
+        let recent = RecentFormula { name: d.name.clone(), formula: d.formula.clone(), units: form.units.trim().to_string() };
+        nc.add_derived(d);
+        self.calc = None;
+        if editing {
+            self.service.forget_file(&nc);
+            let affected = nc.affected_by(&path);
+            let gone: Vec<u64> = self
+                .popups
+                .list
+                .iter()
+                .filter(|p| p.file_id == file && affected.contains(&p.var_path))
+                .map(|p| p.id)
+                .collect();
+            for id in gone {
+                self.popups.close(id);
+            }
+            if let Some(sel @ Selection::Var(id, _)) = self.selection.clone()
+                && id == file
+            {
+                self.selection = None;
+                self.select(sel);
+            }
+        } else {
+            self.select(Selection::Var(file, path));
+            self.scroll_tree = true;
+        }
+        self.settings.push_formula(recent);
+        self.save_settings();
     }
 
     /// Removes a calculated variable; refused (with a banner) while
@@ -1176,6 +1295,11 @@ impl TorApp {
             }
             Command::Settings => self.windows.open(Win::Settings),
             Command::ShortcutHelp => self.windows.open(Win::Shortcuts),
+            Command::Calculate => {
+                if let Some(id) = self.current_file() {
+                    self.open_calculate(id, None);
+                }
+            }
             Command::StepBack | Command::StepForward | Command::FirstStep | Command::LastStep => self.step(c),
             Command::PlayPause => {
                 let Some(pb) = &self.playback else { return };
@@ -1237,6 +1361,25 @@ impl TorApp {
         self.save_settings();
     }
 
+}
+
+/// Names the Calculate window offers: the file's numeric variables and its
+/// calculated ones, as a backtick path where the name is not unique.
+fn calc_names(nc: &NcFile) -> Vec<String> {
+    let ds = nc.meta_with_derived();
+    let vars: Vec<&VarInfo> = ds.all_vars().into_iter().filter(|v| v.dtype.is_numeric()).collect();
+    vars.iter()
+        .map(|v| {
+            let plain = v.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && v.name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+            let unique = vars.iter().filter(|w| w.name == v.name).count() == 1;
+            match (plain, unique) {
+                (true, true) => v.name.clone(),
+                (false, true) => format!("`{}`", v.name),
+                _ => format!("`{}`", v.path),
+            }
+        })
+        .collect()
 }
 
 /// Title and attributes of the selected item.
@@ -1470,6 +1613,12 @@ impl eframe::App for TorApp {
         let current = self.view.as_ref().map(|v| (v.file_id, &v.var.dims[..], &v.slider_pos[..]));
         ui::popup::show_all(ui.ctx(), &mut self.popups, current, &mut actions);
         ui::windows::show_all(ui.ctx(), &mut self.windows, &self.settings, &self.renderer, &mut actions);
+        if let Some(form) = self.calc.as_mut()
+            && let Some(f) = self.files.iter().find(|f| f.id == form.file)
+        {
+            let vars = calc_names(&f.nc);
+            ui::calc::show(ui.ctx(), form, &f.name, &vars, &self.settings.recent_formulas, &mut actions);
+        }
         ui::drop_overlay(ui.ctx());
         // Detail reads start only after the map has planned them for a resting camera.
         if let Some(v) = &mut self.view {
@@ -1569,6 +1718,7 @@ impl TorApp {
             windows: Windows::default(),
             renderer: "none".into(),
             scroll_tree: false,
+            calc: None,
         }
     }
 }
@@ -1933,6 +2083,84 @@ mod tests {
         app.apply(Action::PickArrowVar { slot: 1, path: v2 });
         let slot = app.arrow_layer.as_ref().expect("slot");
         assert_eq!(slot.pair.as_ref().map(|p| p.east.clone()), Some(u2), "{:?}", slot.problem);
+    }
+
+    /// Types into the open Calculate window and re-checks.
+    fn fill(app: &mut TorApp, name: &str, formula: &str, units: &str) {
+        let f = app.calc.as_mut().expect("Calculate window open");
+        f.name = name.into();
+        f.formula = formula.into();
+        f.units = units.into();
+        app.apply(Action::CalcEdited);
+    }
+
+    #[test]
+    fn calculate_creates_and_selects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.apply(Action::OpenCalculate { file: 1, edit: None });
+        fill(&mut app, "speed", "sqrt(uo^2+vo^2)", "m s-1");
+        assert_eq!(app.calc.as_ref().unwrap().check, Ok("speed (time, lat, lon)  24 × 10 × 20".to_string()));
+        app.apply(Action::CreateDerived);
+        assert!(app.calc.is_none(), "the window closes");
+        assert!(app.files[0].nc.derived("/ocean/speed").is_some());
+        assert_eq!(app.selection, Some(Selection::Var(1, "/ocean/speed".into())));
+        let r = &app.settings.recent_formulas[0];
+        assert_eq!((r.name.as_str(), r.formula.as_str(), r.units.as_str()), ("speed", "sqrt(uo^2+vo^2)", "m s-1"));
+        // Recent fills the form.
+        app.apply(Action::OpenCalculate { file: 1, edit: None });
+        app.apply(Action::UseRecentFormula(0));
+        assert_eq!(app.calc.as_ref().unwrap().formula, "sqrt(uo^2+vo^2)");
+        assert_eq!(app.calc.as_ref().unwrap().check, Err("speed already exists".to_string()));
+    }
+
+    #[test]
+    fn bad_formula_keeps_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.apply(Action::OpenCalculate { file: 1, edit: None });
+        fill(&mut app, "x", "uo +", "");
+        assert!(app.calc.as_ref().unwrap().check.is_err());
+        app.apply(Action::CreateDerived);
+        assert!(app.calc.is_some());
+        assert!(app.files[0].nc.derived_vars().is_empty());
+    }
+
+    #[test]
+    fn ctrl_k_without_file_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.apply(Action::Select(Selection::File(1)));
+        app.command(Command::Calculate);
+        assert_eq!(app.calc.as_ref().map(|c| c.file), Some(1));
+        app.apply(Action::CloseCalculate);
+        app.apply(Action::CloseFile(1));
+        app.command(Command::Calculate);
+        assert!(app.calc.is_none());
+    }
+
+    #[test]
+    fn edit_refreshes_view_and_closes_popups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        app.apply(Action::OpenCalculate { file: 1, edit: None });
+        fill(&mut app, "s", "uo*1", "");
+        app.apply(Action::CreateDerived);
+        wait_shown(&mut app, &[0, 0, 0]);
+        app.apply(Action::OpenPopup { iy: 1, ix: 1, lonlat: None });
+        assert_eq!(app.popups.list.len(), 1);
+        app.apply(Action::OpenCalculate { file: 1, edit: Some("/ocean/s".into()) });
+        assert_eq!(app.calc.as_ref().unwrap().formula, "uo*1");
+        fill(&mut app, "s", "uo*2", "");
+        app.apply(Action::CreateDerived);
+        assert!(app.popups.list.is_empty(), "pop-ups of the old formula close");
+        wait_shown(&mut app, &[0, 0, 0]);
+        let v = app.view.as_ref().unwrap();
+        let shown = v.shown.as_ref().unwrap();
+        let uo = app.files[0].nc.read_slice(&SliceRequest { var: "/ocean/uo".into(), ..shown.req.clone() }).unwrap();
+        for (a, b) in shown.slice.data.iter().zip(&uo.data) {
+            assert!((a.is_nan() && b.is_nan()) || (a - 2.0 * b).abs() < 1e-5, "{a} vs 2×{b}");
+        }
     }
 
     #[test]

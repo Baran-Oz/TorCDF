@@ -1,5 +1,6 @@
 //! Drawing of the main window's panels, plus small formatting helpers.
 
+pub mod calc;
 pub mod colorbar;
 pub mod inspector;
 pub mod map_view;
@@ -54,6 +55,12 @@ pub fn menu_bar(
                     }
                 }
             });
+            if ui.add_enabled(current_file.is_some(), item("Calculate new variable…", Command::Calculate)).clicked() {
+                if let Some(id) = current_file {
+                    actions.push(Action::OpenCalculate { file: id, edit: None });
+                }
+                ui.close();
+            }
             if ui.add_enabled(current_file.is_some(), item("Close file", Command::CloseFile)).clicked() {
                 if let Some(id) = current_file {
                     actions.push(Action::CloseFile(id));

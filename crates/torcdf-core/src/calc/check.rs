@@ -236,6 +236,7 @@ mod tests {
     }
 
     /// A root-only dataset: (name, dtype, [(dim, len)]).
+    #[allow(clippy::type_complexity)]
     fn ds(vars: &[(&str, DType, &[(&str, usize)])]) -> Dataset {
         let mut dims: Vec<Dim> = Vec::new();
         let vars = vars

@@ -109,7 +109,22 @@ pub struct Settings {
     pub last_open: Vec<PathBuf>,
     #[serde(deserialize_with = "lenient")]
     pub window: Option<WindowGeom>,
+    /// Formulas of calculated variables made, newest first (typing help).
+    #[serde(deserialize_with = "lenient")]
+    pub recent_formulas: Vec<RecentFormula>,
 }
+
+/// A formula used before: its name, text and units.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct RecentFormula {
+    pub name: String,
+    pub formula: String,
+    pub units: String,
+}
+
+/// Most formulas kept in [`Settings::recent_formulas`].
+const RECENT_FORMULAS_MAX: usize = 20;
 
 const DEFAULT_RECENT_MAX: usize = 10;
 
@@ -130,6 +145,7 @@ impl Default for Settings {
             recent: Vec::new(),
             last_open: Vec::new(),
             window: None,
+            recent_formulas: Vec::new(),
         }
     }
 }
@@ -211,6 +227,14 @@ impl Settings {
         let key = path_key(p);
         self.recent.retain(|r| path_key(r) != key);
     }
+
+    /// `f` becomes the newest recent formula (an earlier one with the same
+    /// name and formula is dropped); at most 20 are kept.
+    pub fn push_formula(&mut self, f: RecentFormula) {
+        self.recent_formulas.retain(|r| !(r.name == f.name && r.formula == f.formula));
+        self.recent_formulas.insert(0, f);
+        self.recent_formulas.truncate(RECENT_FORMULAS_MAX);
+    }
 }
 
 /// `%APPDATA%\TorCDF\settings.json`; `None` without `APPDATA`.
@@ -228,6 +252,32 @@ mod tests {
 
     fn file_in(dir: &Path) -> PathBuf {
         dir.join("settings.json")
+    }
+
+    fn formula(name: &str, f: &str, units: &str) -> RecentFormula {
+        RecentFormula { name: name.into(), formula: f.into(), units: units.into() }
+    }
+
+    #[test]
+    fn recent_formulas_roundtrip_and_cap() {
+        let mut s = Settings::default();
+        for i in 0..25 {
+            s.push_formula(formula(&format!("v{i}"), &format!("uo*{i}"), ""));
+        }
+        assert_eq!(s.recent_formulas.len(), 20);
+        assert_eq!(s.recent_formulas[0].name, "v24");
+        // A repeat moves to the front, with its new units.
+        s.push_formula(formula("v10", "uo*10", "m"));
+        assert_eq!(s.recent_formulas.len(), 20);
+        assert_eq!(s.recent_formulas[0], formula("v10", "uo*10", "m"));
+        assert_eq!(s.recent_formulas.iter().filter(|r| r.name == "v10").count(), 1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        s.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path).0.recent_formulas, s.recent_formulas);
+        // Older settings files have none.
+        std::fs::write(&path, r#"{"version": 1}"#).unwrap();
+        assert!(Settings::load_from(&path).0.recent_formulas.is_empty());
     }
 
     #[test]
@@ -259,6 +309,7 @@ mod tests {
             recent: vec![PathBuf::from(r"C:\a.nc")],
             last_open: vec![PathBuf::from(r"C:\b.nc")],
             window: Some(WindowGeom { pos: Some([10.0, 20.0]), size: [800.0, 600.0], maximized: true }),
+            recent_formulas: vec![RecentFormula { name: "s".into(), formula: "u*2".into(), units: "m".into() }],
         }
     }
 

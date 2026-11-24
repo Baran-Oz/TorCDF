@@ -20,11 +20,12 @@ pub enum Command {
     PrevVar,
     NextVar,
     ShortcutHelp,
+    Calculate,
 }
 
 impl Command {
     #[cfg(test)]
-    pub const ALL: [Command; 13] = [
+    pub const ALL: [Command; 14] = [
         Command::Open,
         Command::CloseFile,
         Command::ExportPng,
@@ -38,6 +39,7 @@ impl Command {
         Command::PrevVar,
         Command::NextVar,
         Command::ShortcutHelp,
+        Command::Calculate,
     ];
 }
 
@@ -54,6 +56,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut { cmd: Command::CloseFile, keys: "Ctrl+W", label: "Close file" },
     Shortcut { cmd: Command::ExportPng, keys: "Ctrl+E", label: "Export plot as PNG" },
     Shortcut { cmd: Command::Settings, keys: "Ctrl+,", label: "Settings" },
+    Shortcut { cmd: Command::Calculate, keys: "Ctrl+K", label: "Calculate new variable" },
     Shortcut { cmd: Command::StepBack, keys: "←", label: "Previous time step" },
     Shortcut { cmd: Command::StepForward, keys: "→", label: "Next time step" },
     Shortcut { cmd: Command::FirstStep, keys: "Home", label: "First time step" },
@@ -77,12 +80,13 @@ pub fn keys_of(cmd: Command) -> &'static str {
 /// Call before the panels draw.
 pub fn pressed(ctx: &egui::Context) -> Vec<Command> {
     use egui::{Key, Modifiers};
-    let ctrl: [(Key, Command); 5] = [
+    let ctrl: [(Key, Command); 6] = [
         (Key::O, Command::Open),
         (Key::W, Command::CloseFile),
         (Key::E, Command::ExportPng),
         (Key::Comma, Command::Settings),
         (Key::Num0, Command::Fit),
+        (Key::K, Command::Calculate),
     ];
     let plain: [(Key, Command); 7] = [
         (Key::ArrowLeft, Command::StepBack),
@@ -248,6 +252,13 @@ mod tests {
         assert!(got.is_empty(), "{got:?}");
         let (got, _) = press(vec![key(egui::Key::O, egui::Modifiers::COMMAND)], true);
         assert_eq!(got, vec![Command::Open]);
+    }
+
+    #[test]
+    fn ctrl_k_calculates() {
+        let (got, _) = press(vec![key(egui::Key::K, egui::Modifiers::COMMAND)], false);
+        assert_eq!(got, vec![Command::Calculate]);
+        assert_eq!(keys_of(Command::Calculate), "Ctrl+K");
     }
 
     #[test]
