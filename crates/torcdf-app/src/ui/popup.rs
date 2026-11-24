@@ -137,14 +137,22 @@ fn plot(ui: &mut egui::Ui, p: &Popup, current: Option<Current<'_>>, actions: &mu
         None => fmt_value(v),
     };
     let signed = move |v: f64| if down { -v } else { v };
-    let (text_x, text_y, hover) = (axis_text.clone(), axis_text.clone(), axis_text);
+    // Tick text: dates on a time axis.
+    let tick_time = p.time.clone();
+    let tick = move |v: f64, step: f64| match &tick_time {
+        Some(t) => super::time_tick(t, v, step),
+        None => fmt_value(v),
+    };
+    let (tick_x, tick_y, hover) = (tick.clone(), tick, axis_text);
     let mut plot = Plot::new(("popup-plot", p.id, profile)).height(240.0);
     plot = if profile {
         plot.x_axis_label(value_label)
             .y_axis_label(along.clone())
-            .y_axis_formatter(move |m, _| text_y(signed(m.value)))
+            .y_axis_formatter(move |m, _| tick_y(signed(m.value), m.step_size))
     } else {
-        plot.x_axis_label(along.clone()).y_axis_label(value_label).x_axis_formatter(move |m, _| text_x(m.value))
+        plot.x_axis_label(along.clone())
+            .y_axis_label(value_label)
+            .x_axis_formatter(move |m, _| tick_x(m.value, m.step_size))
     };
     plot = plot.label_formatter(move |h| {
         let (egui_plot::HoverPosition::NearDataPoint { position: v, .. }

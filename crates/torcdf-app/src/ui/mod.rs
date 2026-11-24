@@ -312,6 +312,15 @@ pub fn slider_label(index: usize, coord: Option<f64>, time: Option<&TimeUnits>) 
     }
 }
 
+/// Label of a tick on a time axis at `v`, with ticks `step` apart (both in
+/// the file's time units): `YYYY-MM-DD`, plus `HH:MM` when ticks are less
+/// than a day apart (they would repeat the same date).
+pub fn time_tick(t: &TimeUnits, v: f64, step: f64) -> String {
+    let d = t.decode(v);
+    let date = format!("{:04}-{:02}-{:02}", d.year, d.month, d.day);
+    if step * t.unit_secs() >= 86_400.0 { date } else { format!("{date} {:02}:{:02}", d.hour, d.minute) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +348,16 @@ mod tests {
         assert_eq!(fmt_value(1.5e20), "1.5e20");
         assert_eq!(fmt_value(-2.5e-7), "-2.5e-7");
         assert_eq!(fmt_value(f64::INFINITY), "inf");
+    }
+
+    #[test]
+    fn time_ticks_are_dates() {
+        let t = TimeUnits::parse("hours since 2025-11-30 00:00:00", None).unwrap();
+        // Ticks a day or more apart: the date alone.
+        assert_eq!(time_tick(&t, 48.0, 24.0), "2025-12-02");
+        assert_eq!(time_tick(&t, 30.0, 100.0), "2025-12-01");
+        // Closer ticks would repeat the same date: the time is added.
+        assert_eq!(time_tick(&t, 30.0, 6.0), "2025-12-01 06:00");
     }
 
     #[test]

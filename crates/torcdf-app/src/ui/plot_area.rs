@@ -329,8 +329,13 @@ fn line(ui: &mut egui::Ui, v: &VarView) {
     let units = attr(v, "units").map(|u| format!(" [{u}]")).unwrap_or_default();
     let time = d.filter(|d| v.time_dim == Some(*d)).and(v.time_units.clone());
     let name = v.var.name.clone();
+    let ticks = time.clone();
     egui_plot::Plot::new(("line", &v.var.path))
         .x_axis_label(x_label)
+        .x_axis_formatter(move |m, _| match &ticks {
+            Some(t) => super::time_tick(t, m.value, m.step_size),
+            None => fmt_value(m.value),
+        })
         .y_axis_label(format!("{name}{units}"))
         .label_formatter(move |h| {
             let p = match h {

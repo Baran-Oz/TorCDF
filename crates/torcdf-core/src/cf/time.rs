@@ -203,6 +203,11 @@ impl TimeUnits {
         Some(TimeUnits { unit_secs, epoch_day: calendar.to_days(y, m, d), epoch_sod: sod, calendar })
     }
 
+    /// Length of one unit in seconds (hours: 3600).
+    pub fn unit_secs(&self) -> f64 {
+        self.unit_secs
+    }
+
     pub fn decode(&self, v: f64) -> CfDateTime {
         // Keep arithmetic comfortably inside i64 even for garbage values.
         let v = if v.is_finite() { v } else { 0.0 };
