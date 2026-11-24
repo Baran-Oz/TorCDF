@@ -1,6 +1,7 @@
 #[cfg(feature = "fixtures")]
 pub mod fixtures;
 pub mod basemap;
+pub mod calc;
 pub mod cf;
 mod fast;
 mod h5meta;
