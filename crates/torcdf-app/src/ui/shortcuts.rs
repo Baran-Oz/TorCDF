@@ -23,6 +23,7 @@ pub enum Command {
 }
 
 impl Command {
+    #[cfg(test)]
     pub const ALL: [Command; 13] = [
         Command::Open,
         Command::CloseFile,

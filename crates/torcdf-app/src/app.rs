@@ -1918,9 +1918,11 @@ mod tests {
     fn reopen_last_skips_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = torcdf_core::fixtures::write_nc4(dir.path());
-        let mut s = Settings::default();
-        s.reopen_last = true;
-        s.last_open = vec![path.clone(), PathBuf::from("C:/nope/x.nc")];
+        let s = Settings {
+            reopen_last: true,
+            last_open: vec![path.clone(), PathBuf::from("C:/nope/x.nc")],
+            ..Settings::default()
+        };
         let mut app = TorApp::headless_with(&path, s);
         app.start_files(None);
         assert_eq!(app.opening.len(), 1);
@@ -2000,8 +2002,7 @@ mod tests {
     fn set_plot_defaults_leaves_current_view() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = uo_app(dir.path());
-        let mut d = PlotDefaults::default();
-        d.projection = crate::map::projection::Projection::Mercator;
+        let d = PlotDefaults { projection: crate::map::projection::Projection::Mercator, ..Default::default() };
         app.apply(Action::SetPlotDefaults(d.clone()));
         assert_eq!(app.settings.plot, d);
         let m = app.view.as_ref().unwrap().map.as_ref().unwrap();

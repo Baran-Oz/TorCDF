@@ -56,10 +56,6 @@ pub const DARK: Palette = Palette {
     widget_hover: Color32::from_rgb(0x40, 0x44, 0x4a),
 };
 
-pub fn palette(dark: bool) -> &'static Palette {
-    if dark { &DARK } else { &LIGHT }
-}
-
 /// egui's own light or dark style, recoloured with `p`.
 pub fn style_for(p: &Palette, dark: bool) -> egui::Style {
     let mut s = egui::Style {
@@ -159,6 +155,7 @@ pub fn overlay_colours(dark: bool) -> OverlayColours {
     }
 }
 
+#[cfg(test)]
 fn luminance(c: Color32) -> f32 {
     let lin = |u: u8| {
         let s = u as f32 / 255.0;
@@ -168,6 +165,7 @@ fn luminance(c: Color32) -> f32 {
 }
 
 /// WCAG contrast ratio of two opaque colours (1 to 21).
+#[cfg(test)]
 pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
@@ -243,9 +241,4 @@ mod tests {
         assert_eq!(ctx.zoom_factor(), 1.0);
     }
 
-    #[test]
-    fn palette_by_mode() {
-        assert_eq!(palette(false).panel, LIGHT.panel);
-        assert_eq!(palette(true).panel, DARK.panel);
-    }
 }
