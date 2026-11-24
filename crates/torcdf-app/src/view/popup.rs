@@ -69,6 +69,12 @@ pub struct Popup {
     infos: Vec<KindInfo>,
     handle: Option<SeriesHandle>,
     nc: Arc<NcFile>,
+    /// The netCDF save of this point, while it runs.
+    pub nc_job: Option<torcdf_core::extract::ExtractJob>,
+    /// The Save dialog of that save, while open.
+    pub nc_dialog: Option<crate::app::Job<Option<std::path::PathBuf>>>,
+    /// Last netCDF save outcome ("Saved to …" / "Not saved: …").
+    pub nc_status: Option<String>,
 }
 
 fn attr<'a>(v: &'a VarInfo, name: &str) -> Option<&'a str> {
@@ -197,6 +203,9 @@ impl Popup {
             infos,
             handle: None,
             nc: view.nc.clone(),
+            nc_job: None,
+            nc_dialog: None,
+            nc_status: None,
         };
         popup.select(popup.kind, service);
         Ok(popup)
@@ -426,6 +435,40 @@ impl PopupSet {
     pub fn poll(&mut self) -> bool {
         self.list.iter_mut().fold(false, |any, p| p.poll() | any)
     }
+}
+
+impl Popup {
+    /// A netCDF save of this point is being chosen or written.
+    pub fn saving(&self) -> bool {
+        self.nc_job.is_some() || self.nc_dialog.is_some()
+    }
+
+    /// Whether its file can be extracted from (netCDF, not plain HDF5).
+    pub fn is_netcdf(&self) -> bool {
+        self.nc.is_netcdf()
+    }
+}
+
+/// What a pop-up's Save netCDF writes: its variable (an arrow pair's two
+/// components), at its cell (one index on every other dimension: the
+/// clicked y/x and the sliders), over the whole `along` dimension.
+pub fn popup_selection(p: &Popup, nc: &NcFile) -> torcdf_core::extract::Selection {
+    let vars = match nc.pair(&p.var_path) {
+        Some(pair) => vec![pair.east.clone(), pair.north.clone()],
+        None => vec![p.var_path.clone()],
+    };
+    let mut sel = torcdf_core::extract::Selection { vars, ..Default::default() };
+    if let Some(info) = nc.var_info_any(&p.var_path) {
+        for (d, name) in info.dims.iter().enumerate() {
+            if d == p.along {
+                continue;
+            }
+            if let (Some(key), Some(&i)) = (nc.dim_key(&p.var_path, name), p.point.get(d)) {
+                sel.ranges.insert(key, (i, 1));
+            }
+        }
+    }
+    sel
 }
 
 #[cfg(test)]
@@ -720,3 +763,4 @@ mod tests {
         assert_eq!(csv.lines().count(), 3);
     }
 }
+

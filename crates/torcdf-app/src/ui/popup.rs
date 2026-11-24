@@ -86,6 +86,16 @@ fn contents(
         if ui.button("Save CSV…").clicked() {
             actions.push(Action::SavePopupCsv(p.id));
         }
+        let nc = ui
+            .add_enabled(p.is_netcdf() && !p.saving(), egui::Button::new("Save netCDF…"))
+            .on_hover_text("This point's whole series, with its coordinates and attributes")
+            .on_disabled_hover_text(if p.is_netcdf() { "Saving…" } else { "Extract works on netCDF files" });
+        if nc.clicked() {
+            actions.push(Action::SavePopupNetcdf(p.id));
+        }
+        if let Some(job) = &p.nc_job {
+            ui.add(egui::ProgressBar::new(job.progress()).desired_width(60.0).show_percentage());
+        }
         if ui.button("PNG").clicked() {
             actions.push(Action::SavePopupPng(p.id));
         }
@@ -103,6 +113,10 @@ fn contents(
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
     plot(ui, p, current, marks, actions);
+    if let Some(s) = &p.nc_status {
+        let colour = if s.starts_with("Saved") { ui.visuals().text_color() } else { ui.visuals().error_fg_color };
+        ui.add(egui::Label::new(egui::RichText::new(s).color(colour)).wrap());
+    }
 }
 
 /// The axis position of the current slider, when this pop-up's file and

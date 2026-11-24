@@ -28,6 +28,7 @@ pub const WHEEL_ZOOM: f32 = 0.0025;
 const COLORBAR_WIDTH: f32 = 130.0;
 
 /// Draws the selected variable. Returns true when a new image was uploaded.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     view: Option<&mut VarView>,

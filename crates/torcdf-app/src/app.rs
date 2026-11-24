@@ -201,6 +201,8 @@ pub enum Action {
     /// A click in a pop-up: move the slider of that dimension (plan P7).
     JumpTo { file: u64, dim_name: String, index: usize },
     SavePopupCsv(u64),
+    /// Save a pop-up's point (its whole series) as netCDF.
+    SavePopupNetcdf(u64),
     /// Save the plot area with its colour bar as a PNG.
     SaveImage,
     SavePopupPng(u64),
@@ -463,6 +465,7 @@ impl TorApp {
 
     fn poll(&mut self) {
         self.poll_extract();
+        self.poll_popup_saves();
         let mut i = 0;
         while i < self.opening.len() {
             let Some(r) = self.opening[i].job.poll() else {
@@ -1077,6 +1080,7 @@ impl TorApp {
                 v.refresh(&self.ctx, &self.service);
                 self.slider_changed_at = Some((Instant::now(), v.slider_pos.clone()));
             }
+            Action::SavePopupNetcdf(id) => self.save_popup_netcdf_dialog(id),
             Action::SavePopupCsv(id) => {
                 let Some(p) = self.popups.list.iter().find(|p| p.id == id) else { return };
                 if self.saves.iter().any(|(s, _)| *s == id) {
@@ -1637,6 +1641,105 @@ impl TorApp {
 fn slider_dim_of(v: &VarView, key: &torcdf_core::extract::DimKey) -> Option<usize> {
     let path = v.plain_path();
     v.slider_dims().into_iter().find(|&d| v.nc.dim_key(path, &v.var.dims[d]).as_ref() == Some(key))
+}
+
+/// A pop-up's Save netCDF.
+impl TorApp {
+    /// Opens the Save dialog for pop-up `id`'s point.
+    fn save_popup_netcdf_dialog(&mut self, id: u64) {
+        let Some(p) = self.popups.list.iter_mut().find(|p| p.id == id) else { return };
+        if p.saving() || !p.is_netcdf() {
+            return;
+        }
+        let Some(f) = self.files.iter().find(|f| f.id == p.file_id) else { return };
+        let src = f.nc.meta.path.clone();
+        let name = popup_file_name(&src, &p.var_name, p.lonlat);
+        let dir = src.parent().map(Path::to_path_buf);
+        p.nc_dialog = Some(Job::spawn(&self.ctx, move || {
+            let mut d = rfd::FileDialog::new()
+                .set_title("Save the point as netCDF")
+                .set_file_name(name)
+                .add_filter("netCDF", &["nc"]);
+            if let Some(dir) = dir {
+                d = d.set_directory(dir);
+            }
+            d.save_file()
+        }));
+    }
+
+    /// Starts saving pop-up `id`'s point to `path`.
+    pub(crate) fn start_popup_extract(&mut self, id: u64, path: PathBuf) {
+        let Some(p) = self.popups.list.iter_mut().find(|p| p.id == id) else { return };
+        if p.nc_job.is_some() {
+            return;
+        }
+        let Some(f) = self.files.iter().find(|f| f.id == p.file_id) else { return };
+        let plan = match f.nc.plan_extract(&crate::view::popup::popup_selection(p, &f.nc)) {
+            Ok(plan) => plan,
+            Err(e) => {
+                p.nc_status = Some(format!("Not saved: {e}"));
+                return;
+            }
+        };
+        let src = &f.nc.meta.path;
+        if path == *src || matches!((std::fs::canonicalize(&path), std::fs::canonicalize(src)), (Ok(a), Ok(b)) if a == b) {
+            p.nc_status = Some("Not saved: that is the file being read; choose another name".into());
+            return;
+        }
+        let summary = match p.lonlat {
+            Some((lon, lat)) => format!("point lat {lat:.4}, lon {lon:.4}"),
+            None => format!("point {}", p.title),
+        };
+        let line = torcdf_core::extract::history_line(&f.name, &summary);
+        p.nc_status = None;
+        p.nc_job = Some(torcdf_core::extract::ExtractJob::start(f.nc.clone(), plan, path, line));
+        self.ctx.request_repaint();
+    }
+
+    /// Pop-up Save dialogs closing and saves finishing.
+    fn poll_popup_saves(&mut self) {
+        let mut chosen = Vec::new();
+        let mut running = false;
+        for p in &mut self.popups.list {
+            if let Some(r) = p.nc_dialog.as_ref().and_then(|j| j.poll()) {
+                p.nc_dialog = None;
+                if let Ok(Some(path)) = r {
+                    chosen.push((p.id, path));
+                }
+            }
+            let Some(job) = &p.nc_job else { continue };
+            match job.finished() {
+                Some(Ok(path)) => {
+                    p.nc_status = Some(format!("Saved to {}", path.display()));
+                    p.nc_job = None;
+                }
+                Some(Err(e)) => {
+                    p.nc_status = Some(format!("Not saved: {e}"));
+                    p.nc_job = None;
+                }
+                None => running = true,
+            }
+        }
+        if running {
+            self.ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        for (id, path) in chosen {
+            self.start_popup_extract(id, path);
+        }
+    }
+}
+
+/// `<stem>_<var>_<lat>_<lon>.nc` (4 decimals, `-` as `m`), or
+/// `<stem>_<var>_point.nc` without a lon/lat.
+fn popup_file_name(src: &Path, var: &str, lonlat: Option<(f64, f64)>) -> String {
+    let stem = src.file_stem().map_or_else(|| "point".into(), |s| s.to_string_lossy().into_owned());
+    match lonlat {
+        Some((lon, lat)) => {
+            let n = |v: f64| format!("{v:.4}").replace('-', "m");
+            format!("{stem}_{var}_{}_{}.nc", n(lat), n(lon))
+        }
+        None => format!("{stem}_{var}_point.nc"),
+    }
 }
 
 /// Names the Calculate window offers: the file's numeric variables and its
@@ -3225,5 +3328,68 @@ mod tests {
         app.apply(Action::ExtractIndexBoxDrawn { y: (2, 4), x: (5, 7) });
         let r = app.extract.as_ref().unwrap().region.clone().unwrap();
         assert_eq!((r.south.as_str(), r.north.as_str(), r.west.as_str(), r.east.as_str()), ("-5", "-1", "5", "7"));
+    }
+
+    /// Polls until pop-up `id`'s series is read and any netCDF save is done.
+    fn wait_popup(app: &mut TorApp, id: u64) {
+        let start = Instant::now();
+        loop {
+            app.poll();
+            let p = app.popups.list.iter().find(|p| p.id == id).expect("pop-up open");
+            let (done, total) = p.progress();
+            if total > 0 && done == total && !p.saving() {
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "pop-up timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn popup_netcdf_is_one_cell_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = uo_app(dir.path());
+        app.apply(Action::OpenPopup { iy: 2, ix: 5, lonlat: Some((5.0, -5.0)) });
+        let id = app.popups.list[0].id;
+        wait_popup(&mut app, id);
+        let out = dir.path().join("point.nc");
+        app.start_popup_extract(id, out.clone());
+        wait_popup(&mut app, id);
+        let p = app.popups.list.iter().find(|p| p.id == id).unwrap();
+        assert!(p.nc_status.as_deref().is_some_and(|s| s.starts_with("Saved to")), "{:?}", p.nc_status);
+        let o = NcFile::open(&out).unwrap();
+        assert_eq!(o.meta.var("/ocean/uo").unwrap().shape, [24, 1, 1]);
+        assert_eq!(o.read_coord("/ocean/lat").unwrap(), [-5.0]);
+        assert_eq!(o.read_coord("/ocean/lon").unwrap(), [5.0]);
+        let got = o
+            .read_slice(&torcdf_core::SliceRequest {
+                var: "/ocean/uo".into(),
+                start: vec![0, 0, 0],
+                count: vec![24, 1, 1],
+                stride: vec![1, 1, 1],
+            })
+            .unwrap()
+            .data;
+        let want: Vec<f32> = p.values.iter().map(|v| v.unwrap_or(f32::NAN)).collect();
+        assert_eq!(got, want);
+        assert_eq!(popup_file_name(Path::new("/d/nc4.nc"), "uo", Some((-12.5, 45.1234))), "nc4_uo_45.1234_m12.5000.nc");
+    }
+
+    #[test]
+    fn pair_popup_saves_both_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = TorApp::headless(&torcdf_core::fixtures::write_nc4(dir.path()));
+        torcdf_core::fixtures::pair_detected(&app.files[0].nc);
+        let pair = app.files[0].nc.pairs()[0].path.clone();
+        app.apply(Action::Select(Selection::Var(1, pair)));
+        app.apply(Action::OpenPopup { iy: 2, ix: 5, lonlat: None });
+        let id = app.popups.list[0].id;
+        wait_popup(&mut app, id);
+        let out = dir.path().join("pair.nc");
+        app.start_popup_extract(id, out.clone());
+        wait_popup(&mut app, id);
+        let o = NcFile::open(&out).unwrap();
+        assert_eq!(o.meta.var("/ocean/uo").unwrap().shape, [24, 1, 1]);
+        assert_eq!(o.meta.var("/ocean/vo").unwrap().shape, [24, 1, 1]);
     }
 }
