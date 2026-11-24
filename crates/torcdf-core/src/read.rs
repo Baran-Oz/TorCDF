@@ -74,6 +74,11 @@ impl NcFile {
             return self.read_pair(&pair, r);
         }
         if self.meta.var(&r.var).is_none()
+            && let Some(d) = self.derived(&r.var)
+        {
+            return self.read_derived(&d, r);
+        }
+        if self.meta.var(&r.var).is_none()
             && let Some((var, pair)) = crate::vector::split_layer(&r.var)
         {
             return self.read_layer(var, pair, r);
@@ -139,10 +144,15 @@ impl NcFile {
             return check_shape(r, &pair.centre_shape).map(|(shape, _)| shape);
         }
         if self.meta.var(&r.var).is_none()
+            && let Some(d) = self.derived(&r.var)
+        {
+            return check_shape(r, &d.info.shape).map(|(shape, _)| shape);
+        }
+        if self.meta.var(&r.var).is_none()
             && let Some((var, _)) = crate::vector::split_layer(&r.var)
         {
             let x = SliceRequest { var: var.into(), ..r.clone() };
-            return self.check_request(&x).map(|(_, shape, _)| shape);
+            return self.check_any_request(&x);
         }
         self.check_request(r).map(|(_, shape, _)| shape)
     }

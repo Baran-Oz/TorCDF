@@ -199,6 +199,7 @@ fn full_request_for(file: &NcFile, req: &SeriesRequest) -> Result<SliceRequest, 
         None => file
             .pair(&req.var)
             .map(|p| p.centre_shape.clone())
+            .or_else(|| file.derived(&req.var).map(|d| d.info.shape.clone()))
             .ok_or_else(|| err("no such variable".into()))?,
     };
     let len = shape.get(req.along).copied().ok_or_else(|| {

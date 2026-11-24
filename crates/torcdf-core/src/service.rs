@@ -52,6 +52,16 @@ impl Cache {
         self.lru.get(key).cloned()
     }
 
+    /// Removes every entry of the file with this open id.
+    fn forget(&mut self, open_id: u64) {
+        let keys: Vec<Key> = self.lru.iter().filter(|(k, _)| k.0 == open_id).map(|(k, _)| k.clone()).collect();
+        for k in keys {
+            if let Some(old) = self.lru.pop(&k) {
+                self.bytes -= old.byte_size();
+            }
+        }
+    }
+
     /// Inserts `slice`, evicting least-recently-used entries until the total
     /// is within budget. A slice larger than the budget is not stored.
     pub(crate) fn insert(&mut self, key: Key, slice: Arc<Slice>) {
@@ -171,6 +181,12 @@ impl SliceService {
     /// The cached slice for `req`, if present (marks it recently used).
     pub fn cached(&self, file: &NcFile, req: &SliceRequest) -> Option<Arc<Slice>> {
         self.shared.lock().get(&(file.open_id(), req.clone()))
+    }
+
+    /// Drops every cached slice and series of `file` (after a calculated
+    /// variable was edited, so no value of the old formula is shown).
+    pub fn forget_file(&self, file: &NcFile) {
+        self.shared.lock().forget(file.open_id());
     }
 
     /// Number of reads actually performed against files (cache hits and

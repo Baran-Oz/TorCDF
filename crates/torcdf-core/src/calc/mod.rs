@@ -3,6 +3,7 @@
 //! last for the session.
 
 mod check;
+mod eval;
 pub mod parse;
 
 pub use check::Derived;

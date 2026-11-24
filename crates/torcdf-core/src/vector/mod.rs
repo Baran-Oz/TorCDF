@@ -188,7 +188,13 @@ impl crate::NcFile {
     /// the same dims and shape, and the same horizontal coordinates (so a
     /// u- or v-grid variable of identical shape does not fit).
     pub fn layer_fits(&self, var: &str, pair: &VectorPair) -> bool {
-        let Ok(v) = self.numeric_var(var) else { return false };
+        // A file variable, or a calculated one (always numeric).
+        let derived = self.derived(var);
+        let v = match (self.numeric_var(var), &derived) {
+            (Ok(v), _) => v,
+            (Err(_), Some(d)) => &d.info,
+            _ => return false,
+        };
         if v.dims != pair.centre_dims || v.shape != pair.centre_shape {
             return false;
         }
