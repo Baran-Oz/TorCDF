@@ -5,3 +5,4 @@
 *.hdf5
 .claude/worktrees/
 /docs/
+/installer/Output/
