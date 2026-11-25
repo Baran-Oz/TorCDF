@@ -10,13 +10,8 @@ $root = Split-Path -Parent $PSScriptRoot
 if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = 'C:\t\tc' }
 $exe = Join-Path $env:CARGO_TARGET_DIR 'release\torcdf.exe'
 
-# Version from [workspace.package] in Cargo.toml.
-$inPkg = $false; $version = $null
-foreach ($line in Get-Content (Join-Path $root 'Cargo.toml')) {
-    if ($line -match '^\[(.+)\]') { $inPkg = ($Matches[1] -eq 'workspace.package') }
-    elseif ($inPkg -and $line -match '^version\s*=\s*"([^"]+)"') { $version = $Matches[1]; break }
-}
-if (-not $version) { throw 'version not found in [workspace.package]' }
+$version = (& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'check-version.ps1') | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $version) { throw 'version not found in [workspace.package] of Cargo.toml' }
 
 Push-Location $root
 try {

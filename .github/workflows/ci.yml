@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      # Short target dir: HDF5's CMake build fails past MAX_PATH. Never set RUSTFLAGS (see BUILDING.md).
+      CARGO_TARGET_DIR: C:\t
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> C:\t'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Tests
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Third-party licences are complete and up to date
+        shell: powershell
+        run: .\installer\licences.ps1 -Check
+      - name: Install-script tests
+        shell: powershell
+        run: |
+          .\installer\test-install.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\installer\test-check-version.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
