@@ -39,6 +39,10 @@ impl Windows {
 }
 
 const LICENCES: &str = include_str!("../../assets/THIRD_PARTY_LICENSES.txt");
+/// Copyright and licence line shown in the About window.
+pub const NOTICE: &str = "Copyright (C) 2026 Baran Oz · Licensed under GPL-3.0-or-later · no warranty";
+/// The project page (the workspace's `repository`).
+pub const HOMEPAGE: &str = env!("CARGO_PKG_REPOSITORY");
 const RECENT_COUNTS: [usize; 4] = [0, 5, 10, 20];
 const PROJECTIONS: [Projection; 4] = [
     Projection::Equirectangular,
@@ -132,6 +136,9 @@ pub fn show_all(
                 ui.add_space(8.0);
                 ui.small("Uses netCDF-C (Unidata), HDF5 (The HDF Group), egui and wgpu.");
                 ui.small("Coastlines: Natural Earth (public domain).");
+                ui.add_space(4.0);
+                ui.small(NOTICE);
+                ui.hyperlink_to("github.com/Baran-Oz/TorCDF", HOMEPAGE);
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.link("Third-party licences…").clicked() {
@@ -270,4 +277,26 @@ fn settings_body(ui: &mut egui::Ui, s: &Settings, actions: &mut Vec<Action>, ope
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn about_names_licence_and_homepage() {
+        assert!(NOTICE.contains("Copyright (C) 2026 Baran Oz"));
+        assert!(NOTICE.contains("GPL-3.0-or-later"));
+        assert!(NOTICE.contains("no warranty"));
+        assert_eq!(HOMEPAGE, "https://github.com/Baran-Oz/TorCDF");
+    }
+
+    #[test]
+    fn licences_carry_full_crate_texts() {
+        assert!(LICENCES.contains("netCDF-C"));
+        assert!(LICENCES.contains("Natural Earth"));
+        assert!(LICENCES.contains("Permission is hereby granted, free of charge")); // MIT text
+        assert!(LICENCES.contains("Apache License"));
+        assert!(LICENCES.contains("eframe"));
+    }
 }

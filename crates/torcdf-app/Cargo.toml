@@ -2,6 +2,10 @@
 name = "torcdf-app"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
 
 [[bin]]
 name = "torcdf"

@@ -2,6 +2,10 @@
 name = "torcdf-bench"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
 
 [dependencies]
 netcdf = { version = "0.12", features = ["static"] }
