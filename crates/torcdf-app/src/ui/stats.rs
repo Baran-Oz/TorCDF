@@ -20,6 +20,8 @@ pub fn show(ctx: &egui::Context, form: &mut StatsForm, nc: Option<&NcFile>, slid
         .min_width(560.0)
         .resizable(true)
         .collapsible(false)
+        // Long results (many variables, the histogram) scroll instead of running off the screen.
+        .vscroll(true)
         .show(ctx, |ui| contents(ui, form, nc, sliders, actions));
     if shown.is_some_and(|r| r.response.contains_pointer()) && ctx.input(|i| i.pointer.any_pressed()) {
         actions.push(Action::TouchSelection(SelWin::Stats));
