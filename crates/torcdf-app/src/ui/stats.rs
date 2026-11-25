@@ -16,7 +16,9 @@ pub fn show(ctx: &egui::Context, form: &mut StatsForm, nc: Option<&NcFile>, slid
     let shown = egui::Window::new("Statistics")
         .id(egui::Id::NULL.with("statistics"))
         .open(&mut open)
-        .default_width(560.0)
+        .default_width(680.0)
+        .min_width(560.0)
+        .resizable(true)
         .collapsible(false)
         .show(ctx, |ui| contents(ui, form, nc, sliders, actions));
     if shown.is_some_and(|r| r.response.contains_pointer()) && ctx.input(|i| i.pointer.any_pressed()) {

@@ -9,17 +9,56 @@ use crate::app::{Action, SelWin};
 use crate::view::extract::ExtractForm;
 use crate::view::selection::SelectionForm;
 
-/// Variables offered: the file's (coordinate variables are kept
-/// automatically, so not listed) and its calculated ones.
-pub(crate) fn offered(nc: &NcFile, numeric_only: bool) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = nc
-        .meta
-        .all_vars()
+/// A variable offered for ticking.
+pub struct Offered {
+    pub path: String,
+    /// The name (calculated variables without their "ƒ").
+    pub name: String,
+    /// "time, height, y, x".
+    pub dims: String,
+    pub units: String,
+    pub long_name: String,
+    pub derived: bool,
+}
+
+/// The data variables a selection window offers: not coordinate variables,
+/// not scalars, and not variables other variables name in their
+/// `coordinates`, `bounds` or `grid_mapping` (those are coordinates and
+/// helpers, kept automatically when saving). Calculated variables last.
+pub(crate) fn offered(nc: &NcFile, numeric_only: bool) -> Vec<Offered> {
+    let all = nc.meta.all_vars();
+    let mut helpers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for v in &all {
+        for a in v.attrs.iter().filter(|a| matches!(a.name.as_str(), "coordinates" | "bounds" | "grid_mapping")) {
+            if let Some(text) = a.value.as_str() {
+                helpers.extend(text.split_whitespace().map(|t| t.trim_end_matches(':').to_string()));
+            }
+        }
+    }
+    let attr = |attrs: &[torcdf_core::Attr], n: &str| {
+        attrs.iter().find(|a| a.name == n).and_then(|a| a.value.as_str()).unwrap_or("").to_string()
+    };
+    let mut out: Vec<Offered> = all
         .into_iter()
-        .filter(|v| !(v.dims.len() == 1 && v.dims[0] == v.name) && (!numeric_only || v.dtype.is_numeric()))
-        .map(|v| (v.path.clone(), v.path.trim_start_matches('/').to_string()))
+        .filter(|v| !v.dims.is_empty() && !(v.dims.len() == 1 && v.dims[0] == v.name))
+        .filter(|v| !helpers.contains(&v.name) && (!numeric_only || v.dtype.is_numeric()))
+        .map(|v| Offered {
+            path: v.path.clone(),
+            name: v.name.clone(),
+            dims: v.dims.join(", "),
+            units: attr(&v.attrs, "units"),
+            long_name: attr(&v.attrs, "long_name"),
+            derived: false,
+        })
         .collect();
-    out.extend(nc.derived_vars().iter().map(|d| (d.path.clone(), format!("ƒ {}", d.path.trim_start_matches('/')))));
+    out.extend(nc.derived_vars().iter().map(|d| Offered {
+        path: d.path.clone(),
+        name: d.name.clone(),
+        dims: d.info.dims.join(", "),
+        units: d.units.clone().unwrap_or_default(),
+        long_name: d.formula.clone(),
+        derived: true,
+    }));
     out
 }
 
@@ -36,7 +75,9 @@ pub fn show(
     let shown = egui::Window::new("Extract")
         .id(egui::Id::NULL.with("extract"))
         .open(&mut open)
-        .default_width(560.0)
+        .default_width(680.0)
+        .min_width(560.0)
+        .resizable(true)
         .collapsible(false)
         .show(ctx, |ui| contents(ui, form, nc, sliders, actions));
     if shown.is_some_and(|r| r.response.contains_pointer()) && ctx.input(|i| i.pointer.any_pressed()) {
@@ -102,25 +143,53 @@ fn contents(ui: &mut egui::Ui, form: &mut ExtractForm, nc: Option<&NcFile>, slid
 pub fn selection_fields(
     ui: &mut egui::Ui,
     form: &mut SelectionForm,
-    offered: Vec<(String, String)>,
+    offered: Vec<Offered>,
     sliders: &[DimKey],
     win: SelWin,
     heading: &str,
     actions: &mut Vec<Action>,
 ) {
-    ui.label(heading);
-    egui::ScrollArea::vertical().id_salt(("selection vars", win)).max_height(140.0).show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            for (path, label) in offered {
-                let mut on = form.ticked.contains(&path);
-                if ui.checkbox(&mut on, label).changed() {
+    ui.horizontal(|ui| {
+        ui.label(heading);
+        if ui.small_button("All").clicked() {
+            form.ticked.extend(offered.iter().map(|o| o.path.clone()));
+            actions.push(Action::SelectionEdited(win));
+        }
+        if ui.small_button("None").clicked() {
+            form.ticked.clear();
+            actions.push(Action::SelectionEdited(win));
+        }
+    });
+    // A filter for files with many variables.
+    let filter_id = egui::Id::NULL.with(("selection filter", win));
+    let mut filter: String = ui.data(|d| d.get_temp(filter_id)).unwrap_or_default();
+    if offered.len() > 8 {
+        ui.add(egui::TextEdit::singleline(&mut filter).hint_text("filter variables").desired_width(220.0));
+        ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
+    }
+    let needle = filter.trim().to_lowercase();
+    let shown = offered.iter().filter(|o| {
+        needle.is_empty() || o.name.to_lowercase().contains(&needle) || o.long_name.to_lowercase().contains(&needle)
+    });
+    egui::ScrollArea::vertical().id_salt(("selection vars", win)).max_height(160.0).show(ui, |ui| {
+        egui::Grid::new(("selection var grid", win)).num_columns(3).spacing([12.0, 2.0]).striped(true).show(ui, |ui| {
+            for o in shown {
+                let mut on = form.ticked.contains(&o.path);
+                let label = if o.derived { format!("ƒ {}", o.name) } else { o.name.clone() };
+                let hover = format!("{}\n{}", o.path, o.long_name);
+                if ui.checkbox(&mut on, egui::RichText::new(label).strong()).on_hover_text(hover).changed() {
                     if on {
-                        form.ticked.insert(path);
+                        form.ticked.insert(o.path.clone());
                     } else {
-                        form.ticked.remove(&path);
+                        form.ticked.remove(&o.path);
                     }
                     actions.push(Action::SelectionEdited(win));
                 }
+                ui.weak(format!("({})", o.dims));
+                let units = if o.units.is_empty() { String::new() } else { format!("[{}]", o.units) };
+                let text = [units, o.long_name.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ");
+                ui.add(egui::Label::new(egui::RichText::new(text).weak()).truncate());
+                ui.end_row();
             }
         });
     });
@@ -135,14 +204,14 @@ pub fn selection_fields(
             for (end, text) in [(false, &mut row.from), (true, &mut row.to)] {
                 ui.horizontal(|ui| {
                     ui.label(if end { "To" } else { "From" });
-                    edited |= ui.add(egui::TextEdit::singleline(text).desired_width(130.0)).lost_focus();
+                    edited |= ui.add_sized([150.0, 20.0], egui::TextEdit::singleline(text)).lost_focus();
                     if slider && ui.small_button("◀ slider").on_hover_text("Use the slider's step").clicked() {
                         actions.push(Action::FromSlider { win, row: i, end });
                     }
                 });
             }
             match kept.get(i).copied().flatten() {
-                Some(n) => ui.weak(n.to_string()),
+                Some(n) => ui.weak(format!("{n} kept")),
                 None => ui.weak(""),
             };
             ui.end_row();
@@ -152,7 +221,7 @@ pub fn selection_fields(
             for (label, text) in [("From", &mut r.south), ("To", &mut r.north)] {
                 ui.horizontal(|ui| {
                     ui.label(label);
-                    edited |= ui.add(egui::TextEdit::singleline(text).desired_width(80.0)).lost_focus();
+                    edited |= ui.add_sized([100.0, 20.0], egui::TextEdit::singleline(text)).lost_focus();
                 });
             }
             ui.end_row();
@@ -160,7 +229,7 @@ pub fn selection_fields(
             for (label, text) in [("West", &mut r.west), ("East", &mut r.east)] {
                 ui.horizontal(|ui| {
                     ui.label(label);
-                    edited |= ui.add(egui::TextEdit::singleline(text).desired_width(80.0)).lost_focus();
+                    edited |= ui.add_sized([100.0, 20.0], egui::TextEdit::singleline(text)).lost_focus();
                 });
             }
             ui.end_row();
@@ -291,4 +360,29 @@ pub fn plot_span(
     shade(start, now, 0.25);
     ui.ctx().request_repaint();
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(v: &[Offered]) -> Vec<String> {
+        v.iter().map(|o| o.name.clone()).collect()
+    }
+
+    #[test]
+    fn only_data_variables_are_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let nc = NcFile::open(&torcdf_core::fixtures::vectors::write_arome_like(dir.path())).unwrap();
+        let v = offered(&nc, true);
+        assert_eq!(names(&v), ["wind_speed", "wind_direction"], "coordinates and time are not listed");
+        assert_eq!(v[0].dims, "time, height, y, x");
+        assert_eq!(v[0].units, "m/s");
+
+        let nc = NcFile::open(&torcdf_core::fixtures::write_nc4(dir.path())).unwrap();
+        nc.add_derived(nc.check_formula("s", "uo*2", None, None).unwrap());
+        assert_eq!(names(&offered(&nc, true)), ["uo", "vo", "s"]);
+        assert_eq!(names(&offered(&nc, false)), ["uo", "vo", "label", "s"]);
+        assert!(offered(&nc, true)[2].derived);
+    }
 }
