@@ -59,3 +59,36 @@ Windows SDK versions listed above; other versions are untested.
   view errors) to this file, written from a separate logger thread.
 - `TORCDF_SELECT=<variable path, e.g. /sst>`: only with `TORCDF_LOG`; selects that variable
   automatically when a file opens, so first-plot times can be measured without clicking.
+
+## Installer
+
+Needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) and `cargo-about`
+(`cargo install cargo-about --locked --features cli`).
+
+```
+powershell -ExecutionPolicy Bypass -File installer\build.ps1
+powershell -ExecutionPolicy Bypass -File installer\smoke.ps1 -Setup installer\Output\TorCDF-0.1.0-setup.exe
+```
+
+- `build.ps1` builds the release exe (in `CARGO_TARGET_DIR`, default `C:\t\tc`; `-SkipBuild` reuses it), checks the
+  third-party licences, and writes `installer\Output\TorCDF-<version>-setup.exe`. The version comes from
+  `[workspace.package]` in `Cargo.toml`.
+- `smoke.ps1` installs that setup silently for the current user into `C:\t\torcdf-smoke`, without the `.nc`
+  association. It checks the files and registry entries, then uninstalls and checks that nothing is left.
+- `installer\licences.ps1` regenerates `crates/torcdf-app/assets/THIRD_PARTY_LICENSES.txt` from
+  `c-libraries-licences.txt` (kept by hand: netCDF-C, HDF5, zlib, Natural Earth) plus the Rust crates (`about.toml`,
+  `about.hbs`). `-Check` fails if the committed file is out of date. `cargo about` fails on any licence not accepted
+  in `about.toml`. Accept only licences compatible with GPL-3.0.
+- Installers built locally are for testing. Installers for other people come from the release workflow.
+
+## Releases
+
+1. Set the new version in `[workspace.package]` of `Cargo.toml`, run `installer\licences.ps1`, and commit.
+2. Run the **Release** workflow by hand (Actions → Release → Run workflow). This dry run builds, tests and
+   smoke-tests the installer and keeps the files as an artifact, without publishing anything.
+3. When it passes, push an annotated tag: `git tag -a vX.Y.Z -m "TorCDF X.Y.Z"` and `git push origin vX.Y.Z`.
+   The workflow checks that the tag matches the version, then publishes the GitHub Release with
+   `TorCDF-X.Y.Z-setup.exe`, `TorCDF-setup.exe` (the same file under a fixed name, for the "latest" links),
+   `torcdf.exe`, `install.ps1` and `SHA256SUMS.txt`.
+4. If the repository secret `WINGET_TOKEN` (a classic personal access token with `public_repo`) exists, the
+   workflow also opens the winget update pull request for `Baran-Oz.TorCDF`.
