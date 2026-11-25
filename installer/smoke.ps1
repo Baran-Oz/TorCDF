@@ -44,3 +44,4 @@ Test-That ((Get-NcDefault) -eq $ncBefore) '.nc default unchanged after uninstall
 
 if ($failures.Count) { Write-Host "$($failures.Count) check(s) failed"; exit 1 }
 Write-Host 'smoke test passed'
+exit 0

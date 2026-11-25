@@ -44,3 +44,4 @@ Invoke-Case 'missing SHA256SUMS.txt is refused' {
 
 if ($failures) { Write-Host "$failures case(s) failed"; exit 1 }
 Write-Host 'install.ps1 tests passed'
+exit 0

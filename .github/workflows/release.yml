@@ -23,11 +23,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: '. -> C:\t'
+          # Absolute target dir: rust-cache's `workspaces` joins paths and would miss C:\t.
+          cache-directories: C:\t
           shared-key: release
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-about
+          tool: cargo-about@0.9.3
       - name: Version
         id: version
         shell: powershell
@@ -74,7 +75,7 @@ jobs:
 
   publish:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -104,7 +105,8 @@ jobs:
     steps:
       - name: Open the winget update pull request
         if: env.WINGET_TOKEN != ''
-        uses: vedantmgoyal9/winget-releaser@main
+        # Pinned to the v2 release commit: this action is given a token that can push to the owner's repos.
+        uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
         with:
           identifier: Baran-Oz.TorCDF
           installers-regex: 'TorCDF-[0-9.]+-setup\.exe$'

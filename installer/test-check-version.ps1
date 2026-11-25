@@ -16,3 +16,4 @@ foreach ($case in @(@("v$v", 0), @("v$v.9", 1), @("$v", 1), @('vX', 1))) {
 }
 if ($failures) { exit 1 }
 Write-Host 'check-version tests passed'
+exit 0

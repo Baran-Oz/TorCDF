@@ -25,10 +25,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: '. -> C:\t'
+          # Absolute target dir: rust-cache's `workspaces` joins paths and would miss C:\t.
+          cache-directories: C:\t
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-about
+          tool: cargo-about@0.9.3
       - name: Tests
         run: cargo test --workspace
       - name: Clippy

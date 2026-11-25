@@ -52,8 +52,9 @@ Notes:
 
 - The installer is not code-signed yet. Windows SmartScreen may say "Windows protected your PC": click
   **More info → Run anyway**.
-- The installer offers to open `.nc` files with TorCDF. If you already chose another app for `.nc` files, Windows
-  keeps your choice. Use **Open with → Choose another app** to switch. TorCDF also appears under "Open with" for
+- The installer offers to open `.nc` files with TorCDF (untick it to leave `.nc` files alone). If you picked another
+  app for `.nc` files with **Open with → Always**, Windows keeps that choice; use **Open with → Choose another app**
+  to switch to TorCDF. TorCDF also appears under "Open with" for
   `.nc4`, `.h5` and `.hdf5` files.
 - Uninstall from **Settings → Apps**. Your settings in `%APPDATA%\TorCDF` are kept.
 
